@@ -1,0 +1,35 @@
+name: Build and Push Docker Image to Snowflake Registry
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Snowflake Image Registry
+        run: |
+          docker login ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com \
+            -u ${{ secrets.SNOWFLAKE_USER }} \
+            -p ${{ secrets.SNOWFLAKE_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
+            ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:${{ github.sha }}
