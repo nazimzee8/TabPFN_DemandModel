@@ -12,14 +12,14 @@ written back to Snowflake.
 
 **Steps:**
 
-1. **Write `model.py` and `train.py`** on the local machine (DeepSet architecture + training loop).
-2. **Generate Parquet files** (`meta_train.parquet`, `meta_val.parquet`) via the local DGP script.
-3. **Upload Parquet files** to `@META_DATASET_STAGE` via `PUT`.
-4. **Build Docker image** (`docker build`) using the Dockerfile below; copies both `model.py` and `train.py`.
-5. **Push image** to the Snowflake Image Registry.
-6. **Create Compute Pool** (`GPU_NV_S`, 1 A10G node) if it does not already exist.
-7. **Deploy SPCS Service** with the stage volume mount so `/data/` maps to `@META_DATASET_STAGE`.
-8. **Container runs**: reads `/data/train/*.parquet` and `/data/val/*.parquet`, trains the DeepSet,
+1. **Write `model.py`, `train.py`, and `evaluate.py`** on the local machine (DeepSet architecture, training loop, and evaluation script).
+2. **Generate datasets locally** via `generate_dgp.py` (outputs `data/train/` 800 files, `data/val/` 100 files, `data/test/` 100 files).
+3. **Upload Parquet files** to `@META_DATASET_STAGE` using SnowSQL (`PUT` is not supported in the Snowsight web UI — see Data Storage section).
+5. **Build Docker image** (`docker build`) using the Dockerfile below; copies `model.py`, `train.py`, and `evaluate.py`.
+6. **Push image** to the Snowflake Image Registry (`TABPFN_REPO`), which stores versioned Docker images used by SPCS.
+7. **Create Compute Pool** (`GPU_NV_S`, 1 A10G node) if it does not already exist.
+8. **Deploy SPCS Service** with the stage volume mount so `/data/` maps to `@META_DATASET_STAGE`.
+9. **Container runs**: reads `/data/train/*.parquet` and `/data/val/*.parquet`, trains the DeepSet,
    writes `best.pt` to `@MODEL_STAGE/checkpoints/best.pt` on each validation improvement,
    and stops on early stopping (patience=10, monitored metric: val MSE).
 
@@ -58,22 +58,81 @@ Use an **internal named stage** with Parquet files:
 Each Parquet file contains: `X_train`, `y_train`, `X_test`, `betaX_test`,
 `n`, `p`, `prior_regime`, stored as nested arrays via VARIANT or PyArrow list types.
 
-Upload command (run from local machine or Snowpark session):
+### Generating datasets locally
+
+Prerequisites: `pip install numpy pyarrow`
+
+```bash
+cd /c/Documents/TabPFN_DemandModel
+python generate_dgp.py --n_datasets 1000 --out_dir data/
+# Writes: data/train/ (800 files), data/val/ (100), data/test/ (100)
+```
+
+### Uploading to Snowflake via SnowSQL
+
+> **Important**: `PUT` is a client-side command that streams files from your local disk
+> directly to Snowflake's internal stage. It is **not supported** in the Snowsight web UI
+> ("Unsupported feature 'unsupported_requested_format:snowflake'"). Use SnowSQL instead.
+
+Install SnowSQL: https://docs.snowflake.com/en/user-guide/snowsql-install-config
+
+Connect:
+
+```bash
+snowsql -a <your_account_identifier> -u <your_username>
+```
+
+Then run the three `PUT` commands inside SnowSQL:
 
 ```sql
-PUT file:///local/path/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE;
+USE DATABASE TABPFN_DB;
+USE SCHEMA TABPFN_SCHEMA;
+
+PUT file:///c/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE;
+PUT file:///c/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE;
+PUT file:///c/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE;
+```
+
+Verify the upload:
+
+```sql
+LIST @META_DATASET_STAGE/train/;
+LIST @META_DATASET_STAGE/val/;
+LIST @META_DATASET_STAGE/test/;
 ```
 
 ---
 
 ## Prerequisite SQL Objects
 
+Run these once in Snowsight (or SnowSQL) before any other step.
+
 ```sql
-CREATE DATABASE TABPFN_DB;
-CREATE SCHEMA TABPFN_SCHEMA;
-CREATE STAGE META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
-CREATE STAGE MODEL_STAGE        ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
-CREATE IMAGE REPOSITORY TABPFN_REPO;
+-- Dedicated database and schema that own all project objects
+-- (stages, image repository, compute pool, service, model registry entries).
+CREATE DATABASE IF NOT EXISTS TABPFN_DB;
+USE DATABASE TABPFN_DB;
+CREATE SCHEMA IF NOT EXISTS TABPFN_SCHEMA;
+USE SCHEMA TABPFN_SCHEMA;
+
+-- Internal stage for raw Parquet meta-datasets (train / val / test splits).
+-- The SPCS container mounts this stage as a read-only volume at /data/.
+CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
+-- Internal stage for model artifacts: best.pt checkpoint and evaluation results.
+-- train.py and evaluate.py write here via session.file.put() from inside the container.
+CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
+-- Snowflake-managed Docker image registry.
+-- The built Docker image is tagged and pushed here before SPCS can pull it.
+CREATE IMAGE REPOSITORY IF NOT EXISTS TABPFN_REPO;
+```
+
+Verify the image registry URL (needed for `docker tag` / `docker push`):
+
+```sql
+SHOW IMAGE REPOSITORIES IN SCHEMA TABPFN_SCHEMA;
+-- repository_url column: <account>.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo
 ```
 
 ---
