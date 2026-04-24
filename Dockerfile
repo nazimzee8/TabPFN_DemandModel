@@ -10,4 +10,5 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 COPY model.py .
 COPY train.py .
-CMD ["python", "train.py"]
+COPY evaluate.py .
+CMD ["bash", "-c", "python train.py && python evaluate.py --model_path best.pt --data_dir /data --results_dir results/"]
