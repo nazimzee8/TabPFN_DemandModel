@@ -10,6 +10,9 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    env:
+      SNOWFLAKE_REGISTRY_HOST: ${{ secrets.SNOWFLAKE_REGISTRY_HOST }}
+      SNOWFLAKE_REPOSITORY: tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer
 
     steps:
       - name: Checkout code
@@ -20,9 +23,9 @@ jobs:
 
       - name: Log in to Snowflake Image Registry
         run: |
-          docker login ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com \
+          docker login $SNOWFLAKE_REGISTRY_HOST \
             -u ${{ secrets.SNOWFLAKE_USER }} \
-            -p ${{ secrets.SNOWFLAKE_PASSWORD }}
+            --password-stdin <<< "${{ secrets.SNOWFLAKE_PASSWORD }}"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -31,5 +34,5 @@ jobs:
           push: true
           platforms: linux/amd64
           tags: |
-            ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
-            ${{ secrets.SNOWFLAKE_ACCOUNT }}.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:${{ github.sha }}
+            ${{ env.SNOWFLAKE_REGISTRY_HOST }}/${{ env.SNOWFLAKE_REPOSITORY }}:latest
+            ${{ env.SNOWFLAKE_REGISTRY_HOST }}/${{ env.SNOWFLAKE_REPOSITORY }}:${{ github.sha }}
