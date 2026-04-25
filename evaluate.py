@@ -101,11 +101,9 @@ def evaluate_test_split(model, test_dir):
         for path in files:
             X_train, y_train, X_test, betaX_test, prior_regime, n, p = load_parquet(path)
 
-            # Model predictions (one test row at a time, same as train.py)
-            preds = []
-            for k in range(X_test.shape[0]):
-                y_hat = model(X_train, y_train, X_test[k])
-                preds.append(y_hat.item())
+            # Batched forward — all m test rows in a single call
+            y_hat = model(X_train, y_train, X_test)       # (m,) output
+            preds = y_hat.tolist()
             preds_np   = np.array(preds)
             betaX_np   = betaX_test.numpy()
             model_mse  = float(np.mean((preds_np - betaX_np) ** 2))

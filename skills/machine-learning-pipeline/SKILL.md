@@ -35,13 +35,10 @@ Use this flow when summarizing the end-to-end pipeline:
 2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_DATASET_STAGE`.
 3. Build the container image so it includes `model.py`, `train.py`, and `evaluate.py`.
 4. Run the container in SPCS with `@META_DATASET_STAGE` mounted to `/data`.
-5. Let the container execute the Docker command:
-
-```bash
-python train.py && python evaluate.py --model_path best.pt --data_dir /data --results_dir results/
-```
-
-Note: the SPCS compute pool must use `GPU_NV_M` (not `GPU_NV_S`) to provide enough host RAM for 4 DataLoader worker processes. The training container uses a DataLoader with `num_workers=4, prefetch_factor=2` to overlap Parquet I/O with GPU computation, and `torch.compile(mode="reduce-overhead")` with BF16 autocast to maximize GPU utilization.
+5. Training and evaluation are submitted as Snowflake ML Jobs via `run_training_job.py`
+   (not via EXECUTE JOB SERVICE). The Container Runtime provides a managed GPU image;
+   no custom Docker image is required.
+   `PyTorchDistributor` splits the 800 training tasks across 2 GPU_NV_S nodes using DDP.
 
 6. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
 7. During evaluation, load `best.pt`, run permutation-invariance checks, evaluate on `/data/test`, write `results/test_report.csv`, and upload it to `@MODEL_STAGE/results/`.
@@ -73,12 +70,17 @@ When explaining the learned artifact, describe `best.pt` as the serialized state
 
 ### Performance Design
 
-The training container is configured for maximum GPU utilization on a single A10G:
+The training pipeline is configured for distributed GPU utilization across 2 nodes:
 
-- **GPU_NV_M compute pool** — 4× host RAM compared to `GPU_NV_S`, needed for 4 DataLoader
-  worker processes that prefetch Parquet files into page-locked host RAM.
-- **DataLoader workers** — `num_workers=4, prefetch_factor=2` overlaps disk I/O with GPU
-  computation so the A10G is never waiting for data.
+- **`GPU_NV_S` (2 nodes)** — 0.57 cr/node/hr ≈ $2.28–3.42/hr total; 1× A10G per node.
+- **`PyTorchDistributor`** with `num_nodes=2, num_workers_per_node=1` — handles Ray
+  cluster setup, DDP process group initialization, and result collection automatically.
+- **`DistributedSampler`** partitions 800 training tasks across 2 GPU processes
+  (~400 tasks/GPU/epoch); `set_epoch()` called each epoch for correct shuffling.
+- **`dist.all_reduce(val_tensor, AVG)`** — aggregates validation MSE across ranks before
+  the early-stop check; `dist.broadcast(stop, src=0)` propagates the stop signal.
+- **`num_workers=4`** per process (GPU_NV_S has ~12 vCPUs; 4 workers leaves headroom for
+  the main training process).
 - **Batched forward pass** — all m test rows are passed to the model in a single call; do
   not describe or implement row-by-row forward iteration.
 - **BF16 autocast + GradScaler** — halves tensor bandwidth and activates Tensor Cores.
@@ -157,12 +159,14 @@ Include these caveats when discussing the current evaluation:
 
 Prefer wording like:
 - "DeepSet is trained over many synthetic regression tasks stored as parquet meta-datasets."
-- "The same SPCS container first trains the model and then executes `evaluate.py` on held-out test tasks."
+- "Training is submitted as an ML Job via `run_training_job.py` using the Snowflake Container Runtime for ML."
+- "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
+- "HPO runs 20 Bayesian Optimization trials (30 epochs each) in parallel before full training."
+- "The compute pool uses `GPU_NV_S` (2 nodes) at ~$2.28–3.42/hr — within the $1–5/hr budget."
 - "Generalization is assessed by comparing DeepSet test MSE against a fixed ridge-regression baseline on unseen datasets."
 - "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for DeepSet than for the baseline."
 - "All m test rows are passed to the model in a single batched forward call; the model returns a vector of m scalar predictions."
 - "The DataLoader prefetches Parquet files across 4 worker processes so the A10G GPU is never waiting for data."
-- "The compute pool uses `GPU_NV_M` to provide enough host RAM for 4 DataLoader worker processes."
 - "phi maps each (y_i, x_ij, x_test_j) triple into a d_phi-dimensional embedding; d_phi must be at least as large as the number of features to preserve set information."
 - "PNA pooling (sum + mean + max + std) prevents multiset collisions that would cause distinct training contexts to share the same latent representation."
 - "SAB (Self-Attention Block) replaces the simple linear equivariance layer; features attend to each other before feature pooling, and samples attend to each other before sample pooling."
@@ -180,3 +184,7 @@ Avoid wording like:
 - Describing the equivariance as a "scalar linear layer" or "λ/γ scaling" — the model uses SAB by default (n_sab_feat=1, n_sab_samp=1).
 - Instantiating the model with flat kwargs `DeepSetModel(d_phi=128, ...)` in new code — always use `DeepSetModel(cfg=ModelConfig(...))`.
 - Describing "best.pt" as a plain state dict — it now stores {"state_dict": ..., "cfg": ...}.
+- Describing training as single-GPU after this change.
+- Referring to EXECUTE JOB SERVICE as the deployment mechanism.
+- Citing `GPU_NV_M` or `GPU_NV_L` as the required pool.
+- Describing Docker build/push as required for the Container Runtime path.

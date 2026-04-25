@@ -217,6 +217,66 @@ session.file.put(
 
 ---
 
+## Distributed Training & Hyperparameter Optimization
+
+### Container Runtime for ML
+
+Snowflake Container Runtime for ML provides a managed, GPU-enabled image with PyTorch,
+Ray, and `snowflake-ml-python` pre-installed.
+
+- No `docker build` or `docker push` needed — scripts are uploaded via `upload_dir` in
+  `MLJob.submit_job()`.
+- Runtime image: `snowflake/ml-runtime-gpu:latest` (Snowflake-managed).
+- Jobs submitted from the local machine via `run_training_job.py`.
+
+> The Dockerfile in this repo is retained for local/offline testing only.
+> It is **not** used in the Container Runtime path.
+
+### Distributed Training — PyTorchDistributor
+
+- Class: `snowflake.ml.modeling.distributors.pytorch.PyTorchDistributor`
+- Manages Ray cluster setup, DDP process group initialization, and result collection
+  internally — no manual `torchrun` or rank-environment setup required.
+- `PyTorchScalingConfig(num_nodes=2, num_workers_per_node=1, ...)` maps to
+  2× GPU_NV_S nodes (one A10G each).
+- `get_context()` inside `train_fn` provides `local_rank`, `rank`, and `world_size`.
+- `DistributedSampler` with `ctx.rank` / `ctx.world_size` splits the 800 training
+  tasks across 2 GPU processes (~400 tasks/GPU/epoch).
+- `dist.all_reduce(val_tensor, AVG)` aggregates validation MSE across ranks before
+  the early-stop check; `dist.broadcast(stop, src=0)` propagates the stop signal.
+
+### Hyperparameter Optimization — Tuner + BayesOpt
+
+- Class: `snowflake.ml.modeling.tune.Tuner`
+- Algorithm: `BayesOpt` (Gaussian-process surrogate; minimizes trials needed vs.
+  grid or random search).
+- Search space: `lr`, `weight_decay`, `d_phi`, `d_rho`, `dropout`, `pool`.
+- 20 trials, 30-epoch runs each; best config written to
+  `@MODEL_STAGE/hpo/best_config.json` on completion.
+- To use a simpler baseline, swap `BayesOpt()` → `RandomSearch()` in `hpo.py`.
+
+### Compute Pool & Cost
+
+| Configuration | Credits/node/hr | Nodes | Total cost/hr |
+|---|---|---|---|
+| GPU_NV_S (this design) | 0.57 | 2 | ~$2.28–3.42 |
+| GPU_NV_M (previous) | 2.68 | 1 | ~$5.36–8.04 |
+
+- 2-node GPU_NV_S pool: 1.14 cr/hr ≈ **$2.28–3.42/hr** (Standard/Enterprise) — ~80%
+  cheaper than the previous GPU_NV_M single-node configuration.
+- Pool suspends when idle; no charges in `SUSPENDED` state.
+
+### Estimated End-to-End Cost
+
+| Phase | Nodes | Cost/hr | Duration | Total |
+|---|---|---|---|---|
+| HPO (20 trials × 30 epochs) | 2 × GPU_NV_S | ~$2.28–3.42 | ~40–60 min | ~$1.52–3.42 |
+| Full training (DDP) | 2 × GPU_NV_S | ~$2.28–3.42 | ~15–25 min | ~$0.57–1.43 |
+| Evaluation | 1 × GPU_NV_S | ~$1.14–1.71 | ~5–10 min | ~$0.10–0.29 |
+| **Total** | | | **~60–95 min** | **~$2.19–5.14** |
+
+---
+
 ## Training Loop Adaptation
 
 Inside the container, `train.py` follows this loop:
@@ -631,3 +691,83 @@ def evaluate_ood(session):
 Expected output shape: one row per `(regime, p_quartile, n_quartile)` combination,
 with `mean_mse` and `std_mse` columns. Regime A should have the lowest `mean_mse`;
 Regimes C (heavy-tail noise) and D (correlated X) higher but not catastrophic.
+
+---
+
+## Downloading Results Locally
+
+`MODEL_STAGE` holds two artifacts written by the training and evaluation jobs:
+
+| Stage path | File | Written by |
+|---|---|---|
+| `@MODEL_STAGE/checkpoints/best.pt` | Model checkpoint | `train.py` (on each val MSE improvement) |
+| `@MODEL_STAGE/results/test_report.csv` | OOD evaluation results | `evaluate.py` |
+
+Use `download_results.py` to pull both files to your local machine.
+
+### Prerequisites
+
+```bash
+pip install snowflake-snowpark-python   # already in requirements.txt
+```
+
+### Set credentials
+
+```bash
+set SNOWFLAKE_ACCOUNT=<account-identifier>
+set SNOWFLAKE_USER=<user>
+set SNOWFLAKE_PASSWORD=<password>
+# Optional — defaults to COMPUTE_WH
+set SNOWFLAKE_WAREHOUSE=<warehouse>
+```
+
+### Run
+
+```bash
+cd C:/Documents/TabPFN_DemandModel
+python download_results.py
+```
+
+The script:
+1. Connects using the env-var credentials (same `TABPFN_DB` / `TABPFN_SCHEMA` / `COMPUTE_WH` defaults as the training job).
+2. Lists `@MODEL_STAGE` and prints every file found.
+3. Downloads `@MODEL_STAGE/checkpoints/` and `@MODEL_STAGE/results/` into the local `models/` directory (created automatically).
+
+### Expected output
+
+```
+Connected to Snowflake.
+Stage contents:
+  @model_stage/checkpoints/best.pt.gz
+  @model_stage/results/test_report.csv.gz
+
+Downloading @MODEL_STAGE/checkpoints/ ...
+Downloading @MODEL_STAGE/results/ ...
+
+Done. Files saved to ./models/
+  models/best.pt
+  models/test_report.csv
+```
+
+> **Note:** Snowflake automatically decompresses `.gz` files on `GET`/`session.file.get()`,
+> so the files land as `best.pt` and `test_report.csv` (not `.gz`).
+
+### Load the checkpoint
+
+```python
+import torch
+from model import DeepSetModel
+
+ckpt  = torch.load("models/best.pt", map_location="cpu")
+model = DeepSetModel(cfg=ckpt["cfg"])
+model.load_state_dict(ckpt["state_dict"])
+model.eval()
+```
+
+### Inspect evaluation results
+
+```python
+import pandas as pd
+df = pd.read_csv("models/test_report.csv")
+print(df)
+```

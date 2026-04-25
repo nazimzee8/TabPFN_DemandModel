@@ -14,14 +14,14 @@ USE SCHEMA TABPFN_SCHEMA;
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- ── Step 2: Create compute pool ────────────────────────────────────────────────
--- GPU_NV_M = 1× A10G GPU with 4× host RAM vs GPU_NV_S.
--- Required for 4 DataLoader worker processes; GPU_NV_S causes host-RAM OOM before GPU is used.
+-- GPU_NV_S: 1× A10G per node, 0.57 cr/hr → ~$1.14–1.71/node/hr (Standard/Enterprise).
+-- 2 nodes for training (DDP) or 2 parallel HPO trials = ~$2.28–3.42/hr total.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY — must drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 1
-  INSTANCE_FAMILY = GPU_NV_M;
+  MAX_NODES = 2
+  INSTANCE_FAMILY = GPU_NV_S;
 
 -- Verify the pool is ACTIVE before continuing (re-run until Status = ACTIVE):
 -- SHOW COMPUTE POOLS LIKE 'DEEPSET_GPU_POOL';
@@ -56,3 +56,14 @@ EXECUTE JOB SERVICE
 -- Confirms best.pt was uploaded on training completion:
 -- LIST @MODEL_STAGE/checkpoints/;
 -- LIST @MODEL_STAGE/results/;
+
+-- ── Download outputs (run in SnowSQL or Snowsight) ────────────────────────────
+-- Verify files exist first:
+LIST @MODEL_STAGE/checkpoints/;
+LIST @MODEL_STAGE/results/;
+
+-- GET to local path (SnowSQL only — adjust path for your OS):
+--   Windows:  file://C:/Users/<you>/Downloads/
+--   macOS:    file:///Users/<you>/Downloads/
+GET @MODEL_STAGE/checkpoints/best.pt   file://C:/Users/nazer/Downloads/;
+GET @MODEL_STAGE/results/test_report.csv file://C:/Users/nazer/Downloads/;

@@ -18,6 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pyarrow.parquet as pq
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from snowflake.ml.modeling.distributors.pytorch import (
+    PyTorchDistributor,
+    PyTorchScalingConfig,
+    WorkerResourceConfig,
+    get_context,
+)
 
 from model import DeepSetModel, ModelConfig
 
@@ -102,7 +109,7 @@ def make_loader(files, shuffle):
 # One-epoch helpers
 # ---------------------------------------------------------------------------
 
-def run_epoch(model, loader, optimizer, scaler, training: bool):
+def run_epoch(model, loader, optimizer, scaler, training: bool, device, use_amp):
     """
     Iterate over all meta-datasets in `loader`.  If training=True, backprop per dataset.
     Returns mean MSE across all test-row predictions in the epoch.
@@ -112,15 +119,15 @@ def run_epoch(model, loader, optimizer, scaler, training: bool):
     total_count = 0
 
     for X_train, y_train, X_test, betaX_test in loader:
-        X_train    = X_train.to(DEVICE)
-        y_train    = y_train.to(DEVICE)
-        X_test     = X_test.to(DEVICE)
-        betaX_test = betaX_test.to(DEVICE)
+        X_train    = X_train.to(device)
+        y_train    = y_train.to(device)
+        X_test     = X_test.to(device)
+        betaX_test = betaX_test.to(device)
 
         if training:
             optimizer.zero_grad()
 
-        with torch.autocast(device_type=DEVICE, dtype=torch.bfloat16, enabled=USE_AMP):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
             y_hat = model(X_train, y_train, X_test)          # batched: (m,)
             loss  = F.mse_loss(y_hat, betaX_test)
 
@@ -164,71 +171,115 @@ def upload_to_snowflake(local_path: str, stage_path: str):
 
 
 # ---------------------------------------------------------------------------
-# Main training loop
+# Distributed training function (invoked by PyTorchDistributor on each worker)
+# ---------------------------------------------------------------------------
+
+def train_fn(dataset_map, hyper_params):
+    """
+    Invoked by PyTorchDistributor on each worker.
+    DDP process group is initialized automatically by the distributor.
+    """
+    import torch.distributed as dist
+
+    ctx       = get_context()
+    device    = f"cuda:{ctx.local_rank}"
+    is_main   = (ctx.rank == 0)
+    use_amp   = True
+
+    lr           = float(hyper_params.get("lr",           LR))
+    weight_decay = float(hyper_params.get("weight_decay", WEIGHT_DECAY))
+    d_phi        = int(hyper_params.get("d_phi",          D_PHI))
+    d_rho        = int(hyper_params.get("d_rho",          D_RHO))
+    dropout      = float(hyper_params.get("dropout",      0.1))
+    pool         = hyper_params.get("pool",               POOL)
+    max_epochs   = int(hyper_params.get("max_epochs",     MAX_EPOCHS))
+
+    # --- DataLoader with DistributedSampler ---
+    train_files = sorted(glob.glob(os.path.join(DATA_DIR, "train", "*.parquet")))
+    val_files   = sorted(glob.glob(os.path.join(DATA_DIR, "val",   "*.parquet")))
+    train_dataset = ParquetMetaDataset(train_files)
+    val_dataset   = ParquetMetaDataset(val_files)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=ctx.world_size,
+                                       rank=ctx.rank, shuffle=True)
+    val_sampler   = DistributedSampler(val_dataset,   num_replicas=ctx.world_size,
+                                       rank=ctx.rank, shuffle=False)
+    train_loader  = DataLoader(train_dataset, batch_size=1, sampler=train_sampler,
+                               num_workers=4, prefetch_factor=2, pin_memory=True,
+                               collate_fn=identity_collate)
+    val_loader    = DataLoader(val_dataset,   batch_size=1, sampler=val_sampler,
+                               num_workers=4, prefetch_factor=2, pin_memory=True,
+                               collate_fn=identity_collate)
+
+    # --- Model (DDP wrapping handled by PyTorchDistributor) ---
+    cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool,
+                        n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
+                        norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout)
+    model = DeepSetModel(cfg=cfg).to(device)
+    model = torch.compile(model, mode="reduce-overhead")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scaler    = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    best_val_mse   = float("inf")
+    patience_count = 0
+
+    dist.init_process_group(backend="nccl")  # no-op if already initialized by distributor
+
+    for epoch in range(1, max_epochs + 1):
+        train_sampler.set_epoch(epoch)
+        train_mse = run_epoch(model, train_loader, optimizer, scaler, True,  device, use_amp)
+        with torch.no_grad():
+            val_mse = run_epoch(model, val_loader,   None,      scaler, False, device, use_amp)
+
+        val_t = torch.tensor(val_mse, device=device)
+        dist.all_reduce(val_t, op=dist.ReduceOp.AVG)
+        val_mse = val_t.item()
+
+        if is_main:
+            print(f"Epoch {epoch:3d}  val_mse={val_mse:.4f}")
+            if val_mse < best_val_mse:
+                best_val_mse   = val_mse
+                patience_count = 0
+                ckpt = model._orig_mod if hasattr(model, "_orig_mod") else model
+                torch.save({"state_dict": ckpt.state_dict(), "cfg": ckpt.cfg}, "best.pt")
+            else:
+                patience_count += 1
+
+        stop = torch.tensor(int(patience_count >= PATIENCE), device=device)
+        dist.broadcast(stop, src=0)
+        if stop.item():
+            if is_main:
+                print("Early stopping.")
+            break
+
+    if is_main:
+        upload_to_snowflake("best.pt", "@MODEL_STAGE/checkpoints/")
+
+    return {"val_mse": best_val_mse}
+
+
+# ---------------------------------------------------------------------------
+# Entry point — submits train_fn via PyTorchDistributor
 # ---------------------------------------------------------------------------
 
 def main():
-    # Discover split files
-    train_files = sorted(glob.glob(os.path.join(DATA_DIR, "train", "*.parquet")))
-    val_files   = sorted(glob.glob(os.path.join(DATA_DIR, "val",   "*.parquet")))
+    import json
+    hyper_params = json.loads(os.environ.get("BEST_CONFIG", "{}"))
 
-    print(f"Found {len(train_files)} train files, {len(val_files)} val files.")
-
-    if not train_files:
-        raise RuntimeError(
-            f"No training files found under {DATA_DIR}/train/. "
-            "Check that @META_DATASET_STAGE/train/ is populated and the stage volume is mounted correctly."
-        )
-    if not val_files:
-        raise RuntimeError(
-            f"No validation files found under {DATA_DIR}/val/. "
-            "Check that @META_DATASET_STAGE/val/ is populated."
-        )
-
-    # Build model, compile, optimizer, scaler
-    cfg = ModelConfig(
-        d_phi=D_PHI, d_rho=D_RHO, pool=POOL, n_heads=N_HEADS,
-        n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
-        norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=0.1,
+    distributor = PyTorchDistributor(
+        train_func=train_fn,
+        scaling_config=PyTorchScalingConfig(
+            num_nodes=2,
+            num_workers_per_node=1,   # 1 A10G per GPU_NV_S node
+            resource_requirements_per_worker=WorkerResourceConfig(
+                num_cpus=4,
+                num_gpus=1,
+            ),
+        ),
     )
-    model     = DeepSetModel(cfg=cfg).to(DEVICE)
-    torch._dynamo.config.suppress_errors = True
-    model     = torch.compile(model, mode="reduce-overhead")
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler    = torch.cuda.amp.GradScaler(enabled=USE_AMP)
-
-    train_loader = make_loader(train_files, shuffle=True)
-    val_loader   = make_loader(val_files,   shuffle=False)
-
-    best_val_mse     = float("inf")
-    patience_counter = 0
-
-    for epoch in range(1, MAX_EPOCHS + 1):
-        train_mse = run_epoch(model, train_loader, optimizer, scaler, training=True)
-
-        with torch.no_grad():
-            val_mse = run_epoch(model, val_loader, optimizer=None, scaler=scaler, training=False)
-
-        print(f"Epoch {epoch:3d}  train_mse={train_mse:.4f}  val_mse={val_mse:.4f}")
-
-        # Early stopping / checkpoint
-        if val_mse < best_val_mse:
-            best_val_mse     = val_mse
-            patience_counter = 0
-            # torch.compile wraps the module; _orig_mod holds the original state dict
-            ckpt_module = model._orig_mod if hasattr(model, "_orig_mod") else model
-            torch.save({"state_dict": ckpt_module.state_dict(), "cfg": ckpt_module.cfg}, "best.pt")
-        else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print(f"Early stopping triggered after {epoch} epochs "
-                      f"(no improvement for {PATIENCE} consecutive epochs).")
-                break
-
-    print(f"Training complete. Best val MSE: {best_val_mse:.4f}")
-
-    # Upload checkpoint to Snowflake (no-op if not in SPCS)
-    upload_to_snowflake("best.pt", "@MODEL_STAGE/checkpoints/")
+    result = distributor.run(hyper_params=hyper_params)
+    print("Training result:", result)
 
 
 if __name__ == "__main__":
