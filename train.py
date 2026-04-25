@@ -195,7 +195,7 @@ def main():
     torch._dynamo.config.suppress_errors = True
     model     = torch.compile(model, mode="reduce-overhead")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler    = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+    scaler    = torch.cuda.amp.GradScaler(enabled=USE_AMP)
 
     train_loader = make_loader(train_files, shuffle=True)
     val_loader   = make_loader(val_files,   shuffle=False)
