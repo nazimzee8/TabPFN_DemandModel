@@ -15,11 +15,9 @@ written back to Snowflake.
 1. **Write `model.py`, `train.py`, and `evaluate.py`** on the local machine (DeepSet architecture, training loop, and evaluation script).
 2. **Generate datasets locally** via `generate_dgp.py` (outputs `data/train/` 800 files, `data/val/` 100 files, `data/test/` 100 files).
 3. **Upload Parquet files** to `@META_DATASET_STAGE` using SnowSQL (`PUT` is not supported in the Snowsight web UI — see Data Storage section).
-5. **Build Docker image** (`docker build`) using the Dockerfile below; copies `model.py`, `train.py`, and `evaluate.py`.
-6. **Push image** to the Snowflake Image Registry (`TABPFN_REPO`), which stores versioned Docker images used by SPCS.
-7. **Create Compute Pool** (`GPU_NV_M`, 1 A10G node) if it does not already exist. `GPU_NV_M` provides 4× more host RAM than `GPU_NV_S`, which allows 4 DataLoader worker processes to prefetch Parquet files into page-locked host RAM without OOM-killing the training process.
-8. **Deploy SPCS Service** with the stage volume mount so `/data/` maps to `@META_DATASET_STAGE`.
-9. **Container runs**: reads `/data/train/*.parquet` and `/data/val/*.parquet`, trains the DeepSet,
+4. **Create Compute Pool** (`GPU_NV_M`, 1 A10G node) if it does not already exist. `GPU_NV_M` provides 4× more host RAM than `GPU_NV_S`, which allows 4 DataLoader worker processes to prefetch Parquet files into page-locked host RAM without OOM-killing the training process.
+5. **Deploy SPCS Service** with the stage volume mount so `/data/` maps to `@META_DATASET_STAGE`.
+6. **Container runs**: reads `/data/train/*.parquet` and `/data/val/*.parquet`, trains the DeepSet,
    writes `best.pt` to `@MODEL_STAGE/checkpoints/best.pt` on each validation improvement,
    and stops on early stopping (patience=10, monitored metric: val MSE).
 
@@ -27,8 +25,8 @@ written back to Snowflake.
 
 ```
 Local machine
-  ├── model.py ────────────────────────────→ Docker image → SPCS container
-  ├── train.py ────────────────────────────→ Docker image → SPCS container
+  ├── model.py ──upload_dir──────────────→ SPCS container
+  ├── train.py ──upload_dir──────────────→ SPCS container
   └── *.parquet ──PUT──→ @META_DATASET_STAGE ──vol mount──→ /data/
 
 SPCS container (A10G GPU — GPU_NV_M)
@@ -124,48 +122,13 @@ CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SS
 -- Internal stage for model artifacts: best.pt checkpoint and evaluation results.
 -- train.py and evaluate.py write here via session.file.put() from inside the container.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
-
--- Snowflake-managed Docker image registry.
--- The built Docker image is tagged and pushed here before SPCS can pull it.
-CREATE IMAGE REPOSITORY IF NOT EXISTS TABPFN_REPO;
-```
-
-Verify the image registry URL (needed for `docker tag` / `docker push`):
-
-```sql
-SHOW IMAGE REPOSITORIES IN SCHEMA TABPFN_SCHEMA;
--- repository_url column: <account>.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo
 ```
 
 ---
 
 ## Compute: Snowpark Container Services (SPCS)
 
-PyTorch training requires a custom container.
-
-### 1. Docker Image
-
-Base: `python:3.11-slim`. Add: `torch`, `numpy`, `pyarrow`, `snowflake-snowpark-python`.
-
-Example `Dockerfile`:
-
-```dockerfile
-FROM python:3.11-slim
-RUN pip install --no-cache-dir torch numpy pyarrow snowflake-snowpark-python
-WORKDIR /app
-COPY model.py .
-COPY train.py .
-CMD ["python", "train.py"]
-```
-
-### 2. Push to Snowflake Image Registry
-
-```bash
-docker tag deepset-trainer <account>.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:v1
-docker push <account>.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:v1
-```
-
-### 3. Compute Pool
+### 1. Compute Pool
 
 ```sql
 -- Drop and recreate if changing instance family (SPCS does not support ALTER COMPUTE POOL
@@ -176,7 +139,7 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
   INSTANCE_FAMILY = GPU_NV_M;   -- A10G with 4× host RAM; required for 4 DataLoader workers
 ```
 
-### 4. Service Spec
+### 2. Service Spec
 
 Mount the stage as a volume so the container can read Parquet files directly from disk:
 
@@ -184,7 +147,7 @@ Mount the stage as a volume so the container can read Parquet files directly fro
 spec:
   containers:
     - name: trainer
-      image: <account>.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:v1
+      image: snowflake/ml-runtime-gpu:latest
       volumeMounts:
         - name: data
           mountPath: /data
@@ -203,7 +166,7 @@ CREATE SERVICE DEEPSET_TRAINER_SVC
   $$;
 ```
 
-### 5. Checkpoint Output
+### 3. Checkpoint Output
 
 Write best checkpoint back to the model stage on improvement:
 
@@ -224,13 +187,13 @@ session.file.put(
 Snowflake Container Runtime for ML provides a managed, GPU-enabled image with PyTorch,
 Ray, and `snowflake-ml-python` pre-installed.
 
-- No `docker build` or `docker push` needed — scripts are uploaded via `upload_dir` in
+- No container image build or push needed — scripts are uploaded via `upload_dir` in
   `MLJob.submit_job()`.
 - Runtime image: `snowflake/ml-runtime-gpu:latest` (Snowflake-managed).
 - Jobs submitted from the local machine via `run_training_job.py`.
 
-> The Dockerfile in this repo is retained for local/offline testing only.
-> It is **not** used in the Container Runtime path.
+> Scripts are uploaded directly from the local directory via `upload_dir` in
+> `MLJob.submit_job()`. No Docker image is required or maintained.
 
 ### Distributed Training — PyTorchDistributor
 

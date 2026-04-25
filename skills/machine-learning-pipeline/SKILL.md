@@ -12,7 +12,6 @@ Use this skill to explain the research workflow implemented in this repo for tra
 Ground every explanation in the current code:
 - `generate_dgp.py` generates many single-task parquet files under `data/train`, `data/val`, and `data/test`.
 - `train.py` trains a `DeepSetModel` over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
-- `Dockerfile` starts one container process that runs training and then evaluation in sequence.
 - `evaluate.py` loads `best.pt`, runs permutation checks, evaluates only the held-out test split, writes `results/test_report.csv`, and uploads the report to `@MODEL_STAGE/results/` when running inside SPCS.
 
 ## Explain The Data Layout
@@ -33,15 +32,14 @@ Use this flow when summarizing the end-to-end pipeline:
 
 1. Generate synthetic datasets locally with `python generate_dgp.py --n_datasets 1000 --out_dir data/`.
 2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_DATASET_STAGE`.
-3. Build the container image so it includes `model.py`, `train.py`, and `evaluate.py`.
-4. Run the container in SPCS with `@META_DATASET_STAGE` mounted to `/data`.
-5. Training and evaluation are submitted as Snowflake ML Jobs via `run_training_job.py`
+3. Run the container in SPCS with `@META_DATASET_STAGE` mounted to `/data`.
+4. Training and evaluation are submitted as Snowflake ML Jobs via `run_training_job.py`
    (not via EXECUTE JOB SERVICE). The Container Runtime provides a managed GPU image;
    no custom Docker image is required.
    `PyTorchDistributor` splits the 800 training tasks across 2 GPU_NV_S nodes using DDP.
 
-6. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
-7. During evaluation, load `best.pt`, run permutation-invariance checks, evaluate on `/data/test`, write `results/test_report.csv`, and upload it to `@MODEL_STAGE/results/`.
+5. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
+6. During evaluation, load `best.pt`, run permutation-invariance checks, evaluate on `/data/test`, write `results/test_report.csv`, and upload it to `@MODEL_STAGE/results/`.
 
 When discussing outputs, be explicit:
 - Model artifact: `best.pt`
@@ -187,4 +185,4 @@ Avoid wording like:
 - Describing training as single-GPU after this change.
 - Referring to EXECUTE JOB SERVICE as the deployment mechanism.
 - Citing `GPU_NV_M` or `GPU_NV_L` as the required pool.
-- Describing Docker build/push as required for the Container Runtime path.
+- Referring to Docker or container image build/push commands — the pipeline uses the Snowflake Container Runtime; no custom image is built or maintained.
