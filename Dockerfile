@@ -1,6 +1,12 @@
 # ── Stage 1: builder ──────────────────────────────────────────────────────────
 FROM python:3.11-slim AS builder
 RUN pip install --no-cache-dir --upgrade pip
+
+# Heavy, stable: ~2.4 GB torch wheel — cache busts only when torch/numpy version changes
+COPY requirements-torch.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements-torch.txt
+
+# Light, mutable: pyarrow, snowpark — changes here do NOT bust the torch layer above
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 

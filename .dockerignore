@@ -1,7 +1,33 @@
-data/
+# Version control
 .git/
+.github/
+
+# Python artifacts
 __pycache__/
 *.pyc
-*.md
-subagents/
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data and outputs
+data/
 results/
+subagents/
+
+# Project files not needed in the container
+*.sql
+*.md
+*.ipynb
+notebooks/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/

@@ -7,12 +7,21 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write  # required to write GHCR build cache
+
     env:
       SNOWFLAKE_REGISTRY_HOST: ${{ secrets.SNOWFLAKE_REGISTRY_HOST }}
       SNOWFLAKE_REPOSITORY: tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer
+      CACHE_IMAGE: ghcr.io/${{ github.repository_owner }}/deepset-trainer-cache
 
     steps:
       - name: Checkout code
@@ -21,11 +30,18 @@ jobs:
       - name: Validate Snowflake registry configuration
         run: |
           test -n "$SNOWFLAKE_REGISTRY_HOST" || { echo "SNOWFLAKE_REGISTRY_HOST is not set"; exit 1; }
-          test -n "${{ secrets.SNOWFLAKE_USER }}" || { echo "SNOWFLAKE_USER is not set"; exit 1; }
+          test -n "${{ secrets.SNOWFLAKE_USER }}"     || { echo "SNOWFLAKE_USER is not set"; exit 1; }
           test -n "${{ secrets.SNOWFLAKE_PASSWORD }}" || { echo "SNOWFLAKE_PASSWORD is not set"; exit 1; }
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (build cache)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log in to Snowflake Image Registry
         uses: docker/login-action@v3
@@ -40,8 +56,9 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          provenance: false
+          cache-from: type=registry,ref=${{ env.CACHE_IMAGE }}:buildcache
+          cache-to:   type=registry,ref=${{ env.CACHE_IMAGE }}:buildcache,mode=max
           tags: |
             ${{ env.SNOWFLAKE_REGISTRY_HOST }}/${{ env.SNOWFLAKE_REPOSITORY }}:latest
             ${{ env.SNOWFLAKE_REGISTRY_HOST }}/${{ env.SNOWFLAKE_REPOSITORY }}:${{ github.sha }}
