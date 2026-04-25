@@ -1,16 +1,20 @@
 -- run_training_job.sql
--- Run in Snowsight or SnowSQL after the Docker image has been pushed to TABPFN_REPO.
+-- One-time environment setup + compute pool creation for the DeepSet training pipeline.
+-- Run in Snowsight or SnowSQL before executing run_training_job.py.
+-- The Docker image is NOT required — training uses the Snowflake Container Runtime for ML.
 
+-- ── Step 0: Create database and schema ────────────────────────────────────────
+CREATE DATABASE IF NOT EXISTS TABPFN_DB;
 USE DATABASE TABPFN_DB;
+CREATE SCHEMA IF NOT EXISTS TABPFN_SCHEMA;
 USE SCHEMA TABPFN_SCHEMA;
 
--- ── Step 0: Find your registry host ───────────────────────────────────────────
--- Run this query first, then copy the value from the repository_url column.
--- The host is the domain portion, e.g.: abc123.registry.snowflakecomputing.com
--- SHOW IMAGE REPOSITORIES IN SCHEMA TABPFN_SCHEMA;
+-- ── Step 1: Create stages ──────────────────────────────────────────────────────
+-- META_DATASET_STAGE: training data uploaded via PUT (see Snowflake_Training.md).
+-- The Container Runtime mounts this stage at /data/ inside the training container.
+CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
--- ── Step 1: Ensure output stage exists ────────────────────────────────────────
--- train.py uploads best.pt here via session.file.put("best.pt", "@MODEL_STAGE/checkpoints/")
+-- MODEL_STAGE: train.py writes best.pt here; evaluate.py writes test_report.csv here.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- ── Step 2: Create compute pool ────────────────────────────────────────────────
@@ -23,47 +27,47 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MAX_NODES = 2
   INSTANCE_FAMILY = GPU_NV_S;
 
--- Verify the pool is ACTIVE before continuing (re-run until Status = ACTIVE):
+-- Verify the pool reaches ACTIVE state before running the Python job (re-run until Status = ACTIVE):
 -- SHOW COMPUTE POOLS LIKE 'DEEPSET_GPU_POOL';
 
--- ── Step 3: Launch training job ───────────────────────────────────────────────
--- EXECUTE JOB SERVICE runs the container to completion then terminates.
--- The container CMD runs:  python train.py && python evaluate.py ...
-EXECUTE JOB SERVICE
-  IN COMPUTE POOL DEEPSET_GPU_POOL
-  NAME = TABPFN_TRAINING_JOB
-  FROM SPECIFICATION $$
-  spec:
-    containers:
-      - name: trainer
-        image: YOUR_REGISTRY_HOST/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
-        volumeMounts:
-          - name: data
-            mountPath: /data
-    volumes:
-      - name: data
-        source: "@META_DATASET_STAGE"
-  $$;
+-- ── Step 3: Upload training data ───────────────────────────────────────────────
+-- Run these PUT commands in SnowSQL (not supported in Snowsight web UI):
+--
+--   PUT file:///c/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE;
+--   PUT file:///c/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE;
+--   PUT file:///c/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE;
+--
+-- Verify:
+--   LIST @META_DATASET_STAGE/train/;
+--   LIST @META_DATASET_STAGE/val/;
+--   LIST @META_DATASET_STAGE/test/;
 
--- ── Step 4: Monitor ───────────────────────────────────────────────────────────
--- Check job status:
--- SHOW JOB SERVICES LIKE 'TABPFN_TRAINING_JOB';
-
--- Stream container logs (last 100 lines):
--- CALL SYSTEM$GET_SERVICE_LOGS('TABPFN_TRAINING_JOB', '0', 'trainer', 100);
+-- ── Step 4: Submit jobs ────────────────────────────────────────────────────────
+-- Training is submitted via run_training_job.py (Container Runtime for ML — no Docker build needed):
+--
+--   set SNOWFLAKE_ACCOUNT=<account-identifier>
+--   set SNOWFLAKE_USER=<user>
+--   set SNOWFLAKE_PASSWORD=<password>
+--   python run_training_job.py
+--
+-- The script runs three phases in sequence:
+--   1. HPO  — 20 BayesOpt trials × 30 epochs on 2 GPU_NV_S nodes
+--   2. Train — full DDP training on 2 GPU_NV_S nodes using the best HPO config
+--   3. Eval  — evaluation on 1 GPU_NV_S node; writes test_report.csv
 
 -- ── Step 5: Verify output ─────────────────────────────────────────────────────
--- Confirms best.pt was uploaded on training completion:
+-- Confirms artifacts were uploaded on completion:
+-- LIST @MODEL_STAGE/hpo/;
 -- LIST @MODEL_STAGE/checkpoints/;
 -- LIST @MODEL_STAGE/results/;
 
--- ── Download outputs (run in SnowSQL or Snowsight) ────────────────────────────
--- Verify files exist first:
+-- ── Step 6: Download outputs (SnowSQL only) ────────────────────────────────────
+-- Or use download_results.py for a Python-based alternative.
 LIST @MODEL_STAGE/checkpoints/;
 LIST @MODEL_STAGE/results/;
 
--- GET to local path (SnowSQL only — adjust path for your OS):
+-- GET to local path (adjust path for your OS):
 --   Windows:  file://C:/Users/<you>/Downloads/
 --   macOS:    file:///Users/<you>/Downloads/
-GET @MODEL_STAGE/checkpoints/best.pt   file://C:/Users/nazer/Downloads/;
+GET @MODEL_STAGE/checkpoints/best.pt    file://C:/Users/nazer/Downloads/;
 GET @MODEL_STAGE/results/test_report.csv file://C:/Users/nazer/Downloads/;
