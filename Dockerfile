@@ -8,6 +8,10 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 FROM python:3.11-slim
 COPY --from=builder /install /usr/local
 WORKDIR /app
+LABEL model.architecture="deepset-sab-v2" \
+      model.pooling="pna|sum|mean|max|learned|attn|multipool" \
+      model.attention="set-transformer-sab" \
+      model.normalization="per-context-feat-target"
 COPY model.py .
 COPY train.py .
 COPY evaluate.py .

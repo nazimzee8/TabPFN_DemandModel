@@ -17,14 +17,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-from model import DeepSetModel
-
-
-# ---------------------------------------------------------------------------
-# Constants — must match train.py
-# ---------------------------------------------------------------------------
-D_PHI = 64
-D_RHO = 64
+from model import DeepSetModel, ModelConfig, POOL_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -45,18 +38,22 @@ def load_parquet(path):
 
 
 # ---------------------------------------------------------------------------
-# Equivariant layer helpers (use model's learned scalars directly)
+# Dispatch helpers for equivariant layers
 # ---------------------------------------------------------------------------
 
-def equiv_feat(model, h):
-    """Feature-level equivariant op: (n, p, d) → (n, p, d)."""
-    mean_i = h.mean(dim=1, keepdim=True)          # (n, 1, d)
+def apply_feat_equiv(model, h):
+    """h: (n, p, d) → (n, p, d). Dispatches to SAB or linear equivariance."""
+    if model.cfg.n_sab_feat > 0:
+        return model.sab_feat(h)                    # SAB: (batch=n, set=p, d)
+    mean_i = h.mean(dim=1, keepdim=True)
     return model.lambda_feat * h + model.gamma_feat * mean_i
 
 
-def equiv_samp(model, r):
-    """Sample-level equivariant op: (n, d) → (n, d)."""
-    mean_j = r.mean(dim=0, keepdim=True)           # (1, d)
+def apply_samp_equiv(model, r):
+    """r: (n, d) → (n, d). Dispatches to SAB or linear equivariance."""
+    if model.cfg.n_sab_samp > 0:
+        return model.sab_samp(r.unsqueeze(0)).squeeze(0)   # (1,n,d) → (n,d)
+    mean_j = r.mean(dim=0, keepdim=True)
     return model.lambda_samp * r + model.gamma_samp * mean_j
 
 
@@ -65,8 +62,17 @@ def equiv_samp(model, r):
 # ---------------------------------------------------------------------------
 
 def load_model(model_path):
-    model = DeepSetModel(d_phi=D_PHI, d_rho=D_RHO)
-    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    ckpt = torch.load(model_path, map_location="cpu")
+    if isinstance(ckpt, dict) and "cfg" in ckpt:
+        cfg, state_dict = ckpt["cfg"], ckpt["state_dict"]
+    else:
+        # Legacy bare state_dict
+        cfg = ModelConfig(d_phi=128, d_rho=256, pool="pna", dropout=0.1,
+                          n_sab_feat=0, n_sab_samp=0,
+                          norm_feat=False, norm_target=False)
+        state_dict = ckpt
+    model = DeepSetModel(cfg=cfg)
+    model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded model from {model_path}")
     return model
@@ -194,83 +200,76 @@ def save_report_csv(rows, path):
 # ---------------------------------------------------------------------------
 
 def run_permutation_tests(model):
-    """
-    Run 7 permutation/equivariance tests on a small synthetic dataset.
-    Prints PASS/FAIL for each. Returns True iff all pass.
-    """
     torch.manual_seed(0)
-    n, p = 20, 5
+    n, p   = 20, 5
+    cfg    = model.cfg
+    D_PHI  = cfg.d_phi
+    D_RHO  = cfg.d_rho
 
     X_train = torch.randn(n, p)
     y_train = torch.randn(n)
     x_test  = torch.randn(p)
-
     model.eval()
     results = {}
 
     with torch.no_grad():
-        # ------------------------------------------------------------------
-        # Test 1: Permute rows of (X_train, y_train) → same ŷ
-        # ------------------------------------------------------------------
-        pi  = torch.randperm(n)
-        y1  = model(X_train,       y_train,       x_test)
-        y2  = model(X_train[pi],   y_train[pi],   x_test)
-        results["Test 1 (row permutation invariance)"] = torch.allclose(y1, y2, atol=1e-5)
+        # Test 1 — row permutation invariance (end-to-end)
+        pi = torch.randperm(n)
+        results["Test 1 (row permutation invariance)"] = torch.allclose(
+            model(X_train, y_train, x_test),
+            model(X_train[pi], y_train[pi], x_test), atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 2: Permute columns of X_train and x_test by same π → same ŷ
-        # ------------------------------------------------------------------
+        # Test 2 — column permutation invariance (end-to-end)
         pi_col = torch.randperm(p)
-        y1 = model(X_train,               y_train, x_test)
-        y2 = model(X_train[:, pi_col],    y_train, x_test[pi_col])
-        results["Test 2 (column permutation invariance)"] = torch.allclose(y1, y2, atol=1e-5)
+        results["Test 2 (column permutation invariance)"] = torch.allclose(
+            model(X_train, y_train, x_test),
+            model(X_train[:, pi_col], y_train, x_test[pi_col]), atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 3: equiv_j(r[π]) ≈ equiv_j(r)[π]  — sample-level equivariance
-        # ------------------------------------------------------------------
-        r   = torch.randn(n, D_RHO)
-        pi  = torch.randperm(n)
-        lhs = equiv_samp(model, r[pi])
-        rhs = equiv_samp(model, r)[pi]
-        results["Test 3 (sample equiv equivariance)"] = torch.allclose(lhs, rhs, atol=1e-5)
+        # Test 3 — sample equivariance: apply_samp_equiv(r[π]) == apply_samp_equiv(r)[π]
+        r, pi = torch.randn(n, D_RHO), torch.randperm(n)
+        results["Test 3 (sample equiv equivariance)"] = torch.allclose(
+            apply_samp_equiv(model, r[pi]),
+            apply_samp_equiv(model, r)[pi], atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 4: equiv_i(h[:,π,:]) ≈ equiv_i(h)[:,π,:]  — feat equivariance
-        # ------------------------------------------------------------------
-        h       = torch.randn(n, p, D_PHI)
-        pi_feat = torch.randperm(p)
-        lhs     = equiv_feat(model, h[:, pi_feat, :])
-        rhs     = equiv_feat(model, h)[:, pi_feat, :]
-        results["Test 4 (feature equiv equivariance)"] = torch.allclose(lhs, rhs, atol=1e-5)
+        # Test 4 — feature equivariance: apply_feat_equiv(h[:,π,:]) == apply_feat_equiv(h)[:,π,:]
+        h, pi_feat = torch.randn(n, p, D_PHI), torch.randperm(p)
+        results["Test 4 (feature equiv equivariance)"] = torch.allclose(
+            apply_feat_equiv(model, h[:, pi_feat, :]),
+            apply_feat_equiv(model, h)[:, pi_feat, :], atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 5: mean-pool after sample equiv is invariant to row permutation
-        # ------------------------------------------------------------------
-        r     = torch.randn(n, D_RHO)
-        pi    = torch.randperm(n)
-        pool1 = equiv_samp(model, r).mean(dim=0)
-        pool2 = equiv_samp(model, r[pi]).mean(dim=0)
-        results["Test 5 (sample invariance after pool)"] = torch.allclose(pool1, pool2, atol=1e-5)
+        # Test 5 — mean-pool after sample equiv is permutation invariant
+        r, pi = torch.randn(n, D_RHO), torch.randperm(n)
+        results["Test 5 (sample invariance after pool)"] = torch.allclose(
+            apply_samp_equiv(model, r).mean(dim=0),
+            apply_samp_equiv(model, r[pi]).mean(dim=0), atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 6: Θ matrix form: equiv_j(r) ≈ (λI + γ/n · 11ᵀ) @ r
-        # ------------------------------------------------------------------
-        r   = torch.randn(n, D_RHO)
-        lam = model.lambda_samp.item()
-        gam = model.gamma_samp.item()
-        theta = lam * torch.eye(n) + (gam / n) * torch.ones(n, n)
-        lhs   = equiv_samp(model, r)
-        rhs   = theta @ r
-        results["Test 6 (Theta matrix form)"] = torch.allclose(lhs, rhs, atol=1e-5)
+        if cfg.n_sab_samp == 0:
+            # Test 6 (linear mode) — Θ = λI + γ/n·11ᵀ matrix form
+            r   = torch.randn(n, D_RHO)
+            lam = model.lambda_samp.item()
+            gam = model.gamma_samp.item()
+            theta = lam * torch.eye(n) + (gam / n) * torch.ones(n, n)
+            results["Test 6 (Theta matrix form)"] = torch.allclose(
+                apply_samp_equiv(model, r), theta @ r, atol=1e-5)
 
-        # ------------------------------------------------------------------
-        # Test 7: equiv_j(r[π]).mean(0) ≈ equiv_j(r).mean(0)
-        # ------------------------------------------------------------------
-        r   = torch.randn(n, D_RHO)
-        pi  = torch.randperm(n)
-        lhs = equiv_samp(model, r[pi]).mean(dim=0)
-        rhs = equiv_samp(model, r).mean(dim=0)
-        results["Test 7 (mean after permuted equiv)"] = torch.allclose(lhs, rhs, atol=1e-5)
+            # Test 7 (linear mode) — mean after permuted equiv == mean after equiv
+            r, pi = torch.randn(n, D_RHO), torch.randperm(n)
+            results["Test 7 (mean after permuted equiv)"] = torch.allclose(
+                apply_samp_equiv(model, r[pi]).mean(dim=0),
+                apply_samp_equiv(model, r).mean(dim=0), atol=1e-5)
+        else:
+            # Test 6 (SAB mode) — SAB_samp equivariance via raw module
+            r, pi = torch.randn(n, D_RHO), torch.randperm(n)
+            rb    = r.unsqueeze(0)                  # (1, n, d_rho)
+            results["Test 6 (SAB sample equivariance)"] = torch.allclose(
+                model.sab_samp(rb[:, pi, :]).squeeze(0),
+                model.sab_samp(rb).squeeze(0)[pi], atol=1e-4)  # 1e-4: float32 reorder
+
+            # Test 7 (SAB mode) — SAB_feat equivariance via raw module
+            h, pi_feat = torch.randn(n, p, D_PHI), torch.randperm(p)
+            results["Test 7 (SAB feature equivariance)"] = torch.allclose(
+                model.sab_feat(h[:, pi_feat, :]),
+                model.sab_feat(h)[:, pi_feat, :], atol=1e-4)
 
     print("\nPermutation Invariance Tests:")
     all_pass = True
