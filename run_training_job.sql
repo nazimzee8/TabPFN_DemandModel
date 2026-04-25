@@ -37,8 +37,9 @@ EXECUTE JOB SERVICE
     containers:
       - name: trainer
         -- !! REPLACE YOUR_REGISTRY_HOST below with the repository_url host from Step 0 !!
-        -- e.g.: abc123.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
-        image: kcdgsut-mgb64096.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
+        -- Run: SHOW IMAGE REPOSITORIES IN SCHEMA TABPFN_SCHEMA;
+        -- Copy the repository_url value (e.g. abc123.registry.snowflakecomputing.com/...)
+        image: YOUR_REGISTRY_HOST/tabpfn_db/tabpfn_schema/tabpfn_repo/deepset-trainer:latest
         volumeMounts:
           - name: data
             mountPath: /data

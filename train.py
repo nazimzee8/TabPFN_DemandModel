@@ -174,6 +174,17 @@ def main():
 
     print(f"Found {len(train_files)} train files, {len(val_files)} val files.")
 
+    if not train_files:
+        raise RuntimeError(
+            f"No training files found under {DATA_DIR}/train/. "
+            "Check that @META_DATASET_STAGE/train/ is populated and the stage volume is mounted correctly."
+        )
+    if not val_files:
+        raise RuntimeError(
+            f"No validation files found under {DATA_DIR}/val/. "
+            "Check that @META_DATASET_STAGE/val/ is populated."
+        )
+
     # Build model, compile, optimizer, scaler
     cfg = ModelConfig(
         d_phi=D_PHI, d_rho=D_RHO, pool=POOL, n_heads=N_HEADS,
@@ -181,9 +192,10 @@ def main():
         norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=0.1,
     )
     model     = DeepSetModel(cfg=cfg).to(DEVICE)
+    torch._dynamo.config.suppress_errors = True
     model     = torch.compile(model, mode="reduce-overhead")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scaler    = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+    scaler    = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
     train_loader = make_loader(train_files, shuffle=True)
     val_loader   = make_loader(val_files,   shuffle=False)
