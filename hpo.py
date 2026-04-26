@@ -22,6 +22,18 @@ def train_for_hpo(dataset_map, hyper_params):
     return train_fn(dataset_map, hyper_params)
 
 
+# Create session first so Tuner never falls back to ~/.config.toml
+connection_params = {
+    "host":          os.environ["SNOWFLAKE_HOST"],
+    "account":       os.environ.get("SNOWFLAKE_ACCOUNT_OVERRIDE", ""),
+    "authenticator": "oauth",
+    "token":         open("/snowflake/session/token").read(),
+    "warehouse":     os.environ.get("SNOWFLAKE_WAREHOUSE", ""),
+    "database":      "TABPFN_DB",
+    "schema":        "TABPFN_SCHEMA",
+}
+session = Session.builder.configs(connection_params).create()
+
 tuner = Tuner(
     train_fn=train_for_hpo,
     param_space={
@@ -38,24 +50,14 @@ tuner = Tuner(
         mode="min",
         search_alg=BayesOpt(),
     ),
+    session=session,
 )
 
 results      = tuner.fit()
 best_config  = results.get_best_config()
 print("Best hyperparameters:", best_config)
 
-# Persist best config to stage for full training run
-connection_params = {
-    "host":          os.environ["SNOWFLAKE_HOST"],
-    "account":       os.environ.get("SNOWFLAKE_ACCOUNT_OVERRIDE", ""),
-    "authenticator": "oauth",
-    "token":         open("/snowflake/session/token").read(),
-    "warehouse":     os.environ.get("SNOWFLAKE_WAREHOUSE", ""),
-    "database":      "TABPFN_DB",
-    "schema":        "TABPFN_SCHEMA",
-}
-session = Session.builder.configs(connection_params).create()
-
+# Reuse the same session for upload
 with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
     json.dump(best_config, f)
     tmp = f.name
