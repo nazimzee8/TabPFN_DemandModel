@@ -14,28 +14,37 @@ written back to Snowflake.
 
 1. **Write `model.py`, `train.py`, and `evaluate.py`** on the local machine (DeepSet architecture, training loop, and evaluation script).
 2. **Generate datasets locally** via `generate_dgp.py` (outputs `data/train/` 800 files, `data/val/` 100 files, `data/test/` 100 files).
-3. **Upload Parquet files** to `@META_DATASET_STAGE` using SnowSQL (`PUT` is not supported in the Snowsight web UI — see Data Storage section).
-4. **Create Compute Pool** (`GPU_NV_M`, 1 A10G node) if it does not already exist. `GPU_NV_M` provides 4× more host RAM than `GPU_NV_S`, which allows 4 DataLoader worker processes to prefetch Parquet files into page-locked host RAM without OOM-killing the training process.
-5. **Deploy SPCS Service** with the stage volume mount so `/data/` maps to `@META_DATASET_STAGE`.
-6. **Container runs**: reads `/data/train/*.parquet` and `/data/val/*.parquet`, trains the DeepSet,
-   writes `best.pt` to `@MODEL_STAGE/checkpoints/best.pt` on each validation improvement,
-   and stops on early stopping (patience=10, monitored metric: val MSE).
+3. **Run `run_training_job.sql`** in Snowsight or SnowSQL — creates the database, schema, stages (`@META_DATASET_STAGE`, `@MODEL_STAGE`), and compute pool (`DEEPSET_GPU_POOL`, `GPU_NV_S`, MIN=1, MAX=2). Verify the pool reaches `ACTIVE` state before continuing.
+4. **Upload Parquet files** to `@META_DATASET_STAGE` via SnowSQL `PUT` (step 3 in the SQL file).
+5. **Upload Python scripts** to `@MODEL_STAGE/scripts/` via SnowSQL `PUT` (step 3b in the SQL file).
+6. **Run `CALL run_training_pipeline()`** (step 4 in `run_training_job.sql`) from Snowsight or SnowSQL —
+   executes the Snowpark stored procedure, which submits HPO, training, and evaluation as
+   sequential MLJob phases. No local Python environment or credentials are required beyond
+   the initial SQL session.
 
 **Data and artifact flow:**
 
 ```
 Local machine
-  ├── model.py ──upload_dir──────────────→ SPCS container
-  ├── train.py ──upload_dir──────────────→ SPCS container
   └── *.parquet ──PUT──→ @META_DATASET_STAGE ──vol mount──→ /data/
+  └── *.py ──PUT──→ @MODEL_STAGE/scripts/ ──vol mount──→ /opt/app/
 
-SPCS container (A10G GPU — GPU_NV_M)
+Snowsight / SnowSQL
+  └── CALL run_training_pipeline() ──→ Snowpark stored procedure
+        └── run_training_job.run_pipeline(session) submits:
+
+Container Runtime — Phase 1: HPO (2 nodes)
+  └── hpo.py → @MODEL_STAGE/hpo/best_config.json
+
+Container Runtime — Phase 2: Training (2 nodes, DDP)
   ├── DataLoader (4 workers, prefetch_factor=2) reads /data/train/*.parquet
   ├── trains DeepSet (phi, rho, psi + 4 equivariant scalars)
   │     BF16 autocast + GradScaler, batched forward over all m test rows
   │     torch.compile(mode="reduce-overhead") fuses GPU kernels
-  ├── writes best.pt ──PUT──→ @MODEL_STAGE/checkpoints/best.pt
-  └── stops on early stopping (patience=10, val MSE)
+  └── writes best.pt → @MODEL_STAGE/checkpoints/best.pt
+
+Container Runtime — Phase 3: Evaluation (1 node)
+  └── evaluate.py → @MODEL_STAGE/results/test_report.csv
 
 Model Registry
   └── DEEPSET_TABPFN_V1!PREDICT() ← loads from @MODEL_STAGE/checkpoints/best.pt
@@ -101,6 +110,23 @@ LIST @META_DATASET_STAGE/val/;
 LIST @META_DATASET_STAGE/test/;
 ```
 
+### Uploading Python scripts via SnowSQL
+
+Run once, and re-run whenever any script changes:
+
+```sql
+USE DATABASE TABPFN_DB;
+USE SCHEMA TABPFN_SCHEMA;
+
+PUT file://C:/Documents/TabPFN_DemandModel/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+Verify:
+
+```sql
+LIST @MODEL_STAGE/scripts/;
+```
+
 ---
 
 ## Prerequisite SQL Objects
@@ -116,7 +142,7 @@ CREATE SCHEMA IF NOT EXISTS TABPFN_SCHEMA;
 USE SCHEMA TABPFN_SCHEMA;
 
 -- Internal stage for raw Parquet meta-datasets (train / val / test splits).
--- The SPCS container mounts this stage as a read-only volume at /data/.
+-- The Container Runtime mounts this stage as a read-only volume at /data/.
 CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- Internal stage for model artifacts: best.pt checkpoint and evaluation results.
@@ -126,45 +152,51 @@ CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 ---
 
-## Compute: Snowpark Container Services (SPCS)
+## Compute: Container Runtime for ML
 
 ### 1. Compute Pool
 
 ```sql
--- Drop and recreate if changing instance family (SPCS does not support ALTER COMPUTE POOL
--- to change INSTANCE_FAMILY once the pool is created).
+-- GPU_NV_S: 1× A10G per node, 0.57 cr/hr. MAX_NODES=2 scales for DDP training and parallel HPO.
+-- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY — must drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
-  MIN_NODES = 1 MAX_NODES = 1
-  INSTANCE_FAMILY = GPU_NV_M;   -- A10G with 4× host RAM; required for 4 DataLoader workers
+  MIN_NODES = 1
+  MAX_NODES = 2
+  INSTANCE_FAMILY = GPU_NV_S;
 ```
 
-### 2. Service Spec
+### 2. Job Submission (MLJob)
 
-Mount the stage as a volume so the container can read Parquet files directly from disk:
+`run_training_job.py` is deployed as a Snowpark Python stored procedure. The procedure
+downloads scripts from `@MODEL_STAGE/scripts/` and submits HPO, training, and evaluation
+as sequential MLJob phases — all within Snowflake. No local Python environment is needed.
 
-```yaml
-spec:
-  containers:
-    - name: trainer
-      image: snowflake/ml-runtime-gpu:latest
-      volumeMounts:
-        - name: data
-          mountPath: /data
-  volumes:
-    - name: data
-      source: "@META_DATASET_STAGE"
-```
-
-Deploy the service:
+Create the procedure (re-run after uploading an updated `run_training_job.py`):
 
 ```sql
-CREATE SERVICE DEEPSET_TRAINER_SVC
-  IN COMPUTE POOL DEEPSET_GPU_POOL
-  FROM SPECIFICATION $$
-  <paste yaml above>
-  $$;
+CREATE OR REPLACE PROCEDURE run_training_pipeline()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
+  HANDLER = 'run_training_job.run_pipeline';
 ```
+
+Then call it:
+
+```sql
+CALL run_training_pipeline();
+```
+
+Each phase uses `runtime_image="snowflake/ml-runtime-gpu:latest"` and `compute_pool="DEEPSET_GPU_POOL"`:
+
+| Phase | Entrypoint | Instances | Output |
+|---|---|---|---|
+| HPO | `hpo.py` | 2 | `@MODEL_STAGE/hpo/best_config.json` |
+| Training | `train.py` | 2 (DDP) | `@MODEL_STAGE/checkpoints/best.pt` |
+| Evaluation | `evaluate.py` | 1 | `@MODEL_STAGE/results/test_report.csv` |
 
 ### 3. Checkpoint Output
 
@@ -223,10 +255,10 @@ Ray, and `snowflake-ml-python` pre-installed.
 | Configuration | Credits/node/hr | Nodes | Total cost/hr |
 |---|---|---|---|
 | GPU_NV_S (this design) | 0.57 | 2 | ~$2.28–3.42 |
-| GPU_NV_M (previous) | 2.68 | 1 | ~$5.36–8.04 |
+| previous single-node | 2.68 | 1 | ~$5.36–8.04 |
 
 - 2-node GPU_NV_S pool: 1.14 cr/hr ≈ **$2.28–3.42/hr** (Standard/Enterprise) — ~80%
-  cheaper than the previous GPU_NV_M single-node configuration.
+  cheaper than the previous single-node configuration.
 - Pool suspends when idle; no charges in `SUSPENDED` state.
 
 ### Estimated End-to-End Cost
@@ -399,19 +431,18 @@ residual add) into single fused kernels, reducing Python interpreter overhead an
 kernel launch latency. The compiled model is saved via `model._orig_mod` to avoid
 `torch.compile` wrapper artefacts in the checkpoint.
 
-### 5. GPU_NV_M Compute Pool
+### 5. GPU_NV_S Compute Pool
 
-`GPU_NV_M` provides 4× the host RAM of `GPU_NV_S` (same A10G GPU). The extra RAM is
-needed for 4 DataLoader worker processes — each worker holds a Parquet-file decode
-buffer in host RAM. On `GPU_NV_S`, 4 workers cause OOM at the OS level before the GPU
-is ever used.
+`GPU_NV_S` provides 1× A10G GPU per node and ~12 vCPUs. 4 DataLoader worker processes
+fit comfortably within available host RAM, leaving headroom for the main training
+process. 2 nodes are used for DDP training and parallel HPO trials.
 
 ### Cost Comparison
 
 | Configuration | Estimated wall-clock | Notes |
 |---|---|---|
 | GPU_NV_S, row-by-row, FP32 | ~4 hours | Original |
-| GPU_NV_M, batched, BF16, compile | ~25–40 minutes | Optimized |
+| GPU_NV_S × 2, batched, BF16, DDP, compile | ~15–25 minutes | Optimized |
 
 Estimates assume 800 training files × 200 epochs with early stopping at epoch ~100.
 
@@ -584,7 +615,7 @@ equivariant scalars λ_1, γ_1, λ_2, γ_2).
 **Key properties:**
 - Stored at `@MODEL_STAGE/checkpoints/best.pt`.
 - Created by `torch.save({"state_dict": ..., "cfg": ...}, "best.pt")` whenever val MSE improves.
-- Uploaded from the SPCS container via `session.file.put("best.pt", "@MODEL_STAGE/checkpoints/", overwrite=True)`.
+- Uploaded from the training container via `session.file.put("best.pt", "@MODEL_STAGE/checkpoints/", overwrite=True)`.
 
 **Used for inference on any new synthetic dataset without retraining:**
 
@@ -676,13 +707,14 @@ pip install snowflake-snowpark-python   # already in requirements.txt
 
 ### Set credentials
 
-```bash
-set SNOWFLAKE_ACCOUNT=<account-identifier>
-set SNOWFLAKE_USER=<user>
-set SNOWFLAKE_PASSWORD=<password>
-# Optional — defaults to COMPUTE_WH
-set SNOWFLAKE_WAREHOUSE=<warehouse>
-```
+Set the following environment variables before running `download_results.py`:
+
+| Variable | Required | Default |
+|---|---|---|
+| `SNOWFLAKE_ACCOUNT` | yes | — |
+| `SNOWFLAKE_USER` | yes | — |
+| `SNOWFLAKE_PASSWORD` | yes | — |
+| `SNOWFLAKE_WAREHOUSE` | no | `COMPUTE_WH` |
 
 ### Run
 

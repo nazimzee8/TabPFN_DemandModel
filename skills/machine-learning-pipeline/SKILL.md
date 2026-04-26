@@ -32,11 +32,11 @@ Use this flow when summarizing the end-to-end pipeline:
 
 1. Generate synthetic datasets locally with `python generate_dgp.py --n_datasets 1000 --out_dir data/`.
 2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_DATASET_STAGE`.
-3. Run the container in SPCS with `@META_DATASET_STAGE` mounted to `/data`.
-4. Training and evaluation are submitted as Snowflake ML Jobs via `run_training_job.py`
-   (not via EXECUTE JOB SERVICE). The Container Runtime provides a managed GPU image;
-   no custom Docker image is required.
-   `PyTorchDistributor` splits the 800 training tasks across 2 GPU_NV_S nodes using DDP.
+3. Upload Python scripts (`*.py`) to `@MODEL_STAGE/scripts/` via SnowSQL `PUT`.
+4. Create and call the `run_training_pipeline()` Snowpark stored procedure (step 4 in
+   `run_training_job.sql`). The procedure imports `run_training_job.py` from the stage,
+   downloads all scripts to `/tmp/scripts/`, and submits HPO, training, and evaluation
+   as sequential MLJob phases — all within Snowflake. No local Python environment is needed.
 
 5. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
 6. During evaluation, load `best.pt`, run permutation-invariance checks, evaluate on `/data/test`, write `results/test_report.csv`, and upload it to `@MODEL_STAGE/results/`.
@@ -157,7 +157,7 @@ Include these caveats when discussing the current evaluation:
 
 Prefer wording like:
 - "DeepSet is trained over many synthetic regression tasks stored as parquet meta-datasets."
-- "Training is submitted as an ML Job via `run_training_job.py` using the Snowflake Container Runtime for ML."
+- "The full pipeline — HPO, training, and evaluation — runs inside Snowflake via a Snowpark stored procedure; `run_training_job.run_pipeline(session)` submits each phase as an MLJob."
 - "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
 - "HPO runs 20 Bayesian Optimization trials (30 epochs each) in parallel before full training."
 - "The compute pool uses `GPU_NV_S` (2 nodes) at ~$2.28–3.42/hr — within the $1–5/hr budget."
@@ -183,6 +183,6 @@ Avoid wording like:
 - Instantiating the model with flat kwargs `DeepSetModel(d_phi=128, ...)` in new code — always use `DeepSetModel(cfg=ModelConfig(...))`.
 - Describing "best.pt" as a plain state dict — it now stores {"state_dict": ..., "cfg": ...}.
 - Describing training as single-GPU after this change.
-- Referring to EXECUTE JOB SERVICE as the deployment mechanism.
+- Running `run_training_job.py` from the local machine or describing it as a locally-executed script — it runs as a Snowpark stored procedure handler inside Snowflake.
 - Citing `GPU_NV_M` or `GPU_NV_L` as the required pool.
 - Referring to Docker or container image build/push commands — the pipeline uses the Snowflake Container Runtime; no custom image is built or maintained.
