@@ -45,13 +45,16 @@ best_config  = results.get_best_config()
 print("Best hyperparameters:", best_config)
 
 # Persist best config to stage for full training run
-session = Session.builder.configs({
-    "account":  os.environ["SNOWFLAKE_ACCOUNT"],
-    "user":     os.environ["SNOWFLAKE_USER"],
-    "password": os.environ["SNOWFLAKE_PASSWORD"],
-    "database": "TABPFN_DB", "schema": "TABPFN_SCHEMA",
-    "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-}).create()
+connection_params = {
+    "host":          os.environ["SNOWFLAKE_HOST"],
+    "account":       os.environ.get("SNOWFLAKE_ACCOUNT_OVERRIDE", ""),
+    "authenticator": "oauth",
+    "token":         open("/snowflake/session/token").read(),
+    "warehouse":     os.environ.get("SNOWFLAKE_WAREHOUSE", ""),
+    "database":      "TABPFN_DB",
+    "schema":        "TABPFN_SCHEMA",
+}
+session = Session.builder.configs(connection_params).create()
 
 with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
     json.dump(best_config, f)

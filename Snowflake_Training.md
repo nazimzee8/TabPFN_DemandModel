@@ -170,16 +170,16 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 ### 2. Job Submission (MLJob)
 
 `run_training_job.py` is deployed as a Snowpark Python stored procedure. The procedure
-downloads scripts from `@MODEL_STAGE/scripts/` and submits HPO, training, and evaluation
-as sequential MLJob phases — all within Snowflake. No local Python environment is needed.
+submits HPO, training, and evaluation as sequential MLJob phases using scripts already
+on `@MODEL_STAGE/scripts/` — all within Snowflake. No local Python environment is needed.
 
 #### What is an MLJob container?
 
-An MLJob container is a short-lived compute environment that Snowflake starts on one or
-more nodes in your GPU compute pool to run a single Python script. When
-`MLJob.submit_job()` is called, Snowflake pulls the managed ML runtime image onto the
-requested nodes, runs your entrypoint (e.g. `train.py`), writes outputs to the stage,
-then shuts the container down. PyTorch, Ray, and `snowflake-ml-python` are
+An MLJob container is a short-lived compute environment that Snowflake starts on
+one or more nodes in your GPU compute pool to run a single Python script. When
+`submit_from_stage()` is called, Snowflake pulls the managed ML runtime image onto
+the requested nodes, runs your entrypoint (e.g. `train.py`), writes outputs to the
+stage, then shuts the container down. PyTorch, Ray, and `snowflake-ml-python` are
 pre-installed — no Docker build or image management is required.
 
 Create the procedure (re-run after uploading an updated `run_training_job.py`):
@@ -200,7 +200,7 @@ Then call it:
 CALL run_training_pipeline();
 ```
 
-Each phase uses `runtime_image="snowflake/ml-runtime-gpu:latest"` and `compute_pool="DEEPSET_GPU_POOL"`:
+Each phase uses `compute_pool="DEEPSET_GPU_POOL"` with the Snowflake-managed GPU runtime image:
 
 | Phase | Entrypoint | Instances | Output |
 |---|---|---|---|
@@ -229,13 +229,13 @@ session.file.put(
 Snowflake Container Runtime for ML provides a managed, GPU-enabled image with PyTorch,
 Ray, and `snowflake-ml-python` pre-installed.
 
-- No container image build or push needed — scripts are uploaded via `upload_dir` in
-  `MLJob.submit_job()`.
+- No container image build or push needed — scripts are read directly from
+  `@MODEL_STAGE/scripts/` via `submit_from_stage()`.
 - Runtime image: `snowflake/ml-runtime-gpu:latest` (Snowflake-managed).
-- Jobs submitted from the local machine via `run_training_job.py`.
+- Jobs submitted from the stored procedure via `run_training_job.py`.
 
-> Scripts are uploaded directly from the local directory via `upload_dir` in
-> `MLJob.submit_job()`. No Docker image is required or maintained.
+> Scripts are referenced directly from the stage via `source=` in
+> `submit_from_stage()`. No Docker image is required or maintained.
 
 ### Distributed Training — PyTorchDistributor
 

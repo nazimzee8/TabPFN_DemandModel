@@ -5,33 +5,27 @@ Handler for the run_training_pipeline() Snowpark stored procedure.
 The Snowpark session is injected automatically by the stored procedure framework.
 """
 import json
-import os
 
-from snowflake.ml.jobs import MLJob   # Container Runtime ML Jobs API
+from snowflake.ml.jobs import submit_from_stage   # Container Runtime ML Jobs API
 
 COMPUTE_POOL  = "DEEPSET_GPU_POOL"
-RUNTIME_IMAGE = "snowflake/ml-runtime-gpu:latest"   # Snowflake-managed GPU image
 SCRIPTS_STAGE = "@MODEL_STAGE/scripts"
-SCRIPTS_LOCAL = "/tmp/scripts"
 
 
 def run_pipeline(session) -> str:
-    # Download scripts from stage to the stored procedure's local execution environment
-    # so MLJob can re-upload them into each job container.
-    os.makedirs(SCRIPTS_LOCAL, exist_ok=True)
-    session.file.get(SCRIPTS_STAGE, SCRIPTS_LOCAL)
-
     # ── Phase 1: HPO ──────────────────────────────────────────────────────────
     print("Submitting HPO job …")
-    hpo_job = MLJob.submit_job(
-        session=session,
+    hpo_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
         compute_pool=COMPUTE_POOL,
-        num_instances=2,          # 2 GPU_NV_S nodes → 2 parallel trials
-        runtime_image=RUNTIME_IMAGE,
-        upload_dir=SCRIPTS_LOCAL,
+        stage_name="@MODEL_STAGE",
+        target_instances=2,
+        session=session,
     )
     hpo_job.wait()
+    if hpo_job.status != "DONE":
+        raise RuntimeError(f"HPO job failed with status {hpo_job.status!r}")
     print("HPO complete.")
 
     # Read best config from stage
@@ -42,31 +36,35 @@ def run_pipeline(session) -> str:
 
     # ── Phase 2: Full Training ────────────────────────────────────────────────
     print("Submitting training job …")
-    train_job = MLJob.submit_job(
-        session=session,
+    train_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
         entrypoint="train.py",
         compute_pool=COMPUTE_POOL,
-        num_instances=4,          # DDP across 4 A10G GPUs
-        runtime_image=RUNTIME_IMAGE,
-        upload_dir=SCRIPTS_LOCAL,
+        stage_name="@MODEL_STAGE",
+        target_instances=4,
         env_vars={"BEST_CONFIG": json.dumps(best_config)},
+        session=session,
     )
     train_job.wait()
+    if train_job.status != "DONE":
+        raise RuntimeError(f"Training job failed with status {train_job.status!r}")
     print("Training complete.")
 
     # ── Phase 3: Evaluation ───────────────────────────────────────────────────
     print("Submitting evaluation job …")
-    eval_job = MLJob.submit_job(
-        session=session,
+    eval_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
         entrypoint="evaluate.py",
         compute_pool=COMPUTE_POOL,
-        num_instances=1,
-        runtime_image=RUNTIME_IMAGE,
-        upload_dir=SCRIPTS_LOCAL,
+        stage_name="@MODEL_STAGE",
+        target_instances=1,
         env_vars={"MODEL_PATH": "best.pt", "DATA_DIR": "/data",
                   "RESULTS_DIR": "results/"},
+        session=session,
     )
     eval_job.wait()
+    if eval_job.status != "DONE":
+        raise RuntimeError(f"Evaluation job failed with status {eval_job.status!r}")
     print("Evaluation complete.")
 
     # ── Verify stage ──────────────────────────────────────────────────────────
