@@ -7,8 +7,10 @@ Run before train.py to find the best config. Writes best_config.json to
 Usage (via run_training_job.py or directly):
     python hpo.py
 """
-import json, os, tempfile
+import os
+os.environ["HOME"] = "/tmp"   # SPCS: redirect ~ to writable path before connector import
 
+import json, tempfile
 from snowflake.ml.modeling.tune import Tuner, TunerConfig
 from snowflake.ml.modeling.tune.search import BayesOpt
 from snowflake.snowpark import Session

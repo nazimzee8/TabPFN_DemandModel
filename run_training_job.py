@@ -21,6 +21,7 @@ def run_pipeline(session) -> str:
         compute_pool=COMPUTE_POOL,
         stage_name="@MODEL_STAGE",
         target_instances=2,
+        env_vars={"HOME": "/tmp"},
         session=session,
     )
     hpo_job.wait()
@@ -42,7 +43,7 @@ def run_pipeline(session) -> str:
         compute_pool=COMPUTE_POOL,
         stage_name="@MODEL_STAGE",
         target_instances=4,
-        env_vars={"BEST_CONFIG": json.dumps(best_config)},
+        env_vars={"BEST_CONFIG": json.dumps(best_config), "HOME": "/tmp"},
         session=session,
     )
     train_job.wait()
@@ -59,7 +60,7 @@ def run_pipeline(session) -> str:
         stage_name="@MODEL_STAGE",
         target_instances=1,
         env_vars={"MODEL_PATH": "best.pt", "DATA_DIR": "/data",
-                  "RESULTS_DIR": "results/"},
+                  "RESULTS_DIR": "results/", "HOME": "/tmp"},
         session=session,
     )
     eval_job.wait()
