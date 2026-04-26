@@ -46,7 +46,7 @@ def run_pipeline(session) -> str:
         session=session,
         entrypoint="train.py",
         compute_pool=COMPUTE_POOL,
-        num_instances=2,          # DDP across 2 A10G GPUs
+        num_instances=4,          # DDP across 4 A10G GPUs
         runtime_image=RUNTIME_IMAGE,
         upload_dir=SCRIPTS_LOCAL,
         env_vars={"BEST_CONFIG": json.dumps(best_config)},

@@ -21,12 +21,12 @@ CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- ── Step 2: Create compute pool ────────────────────────────────────────────────
 -- GPU_NV_S: 1× A10G per node, 0.57 cr/hr → ~$1.14–1.71/node/hr (Standard/Enterprise).
--- 2 nodes for training (DDP) or 2 parallel HPO trials = ~$2.28–3.42/hr total.
+-- MAX_NODES=4: up to 4 nodes for DDP training; 2 nodes for parallel HPO trials.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY — must drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 2
+  MAX_NODES = 4          -- was 2; training now uses 4 nodes
   INSTANCE_FAMILY = GPU_NV_S;
 
 -- Verify the pool reaches ACTIVE state before submitting the job (re-run until Status = ACTIVE):

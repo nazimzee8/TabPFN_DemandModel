@@ -14,7 +14,7 @@ written back to Snowflake.
 
 1. **Write `model.py`, `train.py`, and `evaluate.py`** on the local machine (DeepSet architecture, training loop, and evaluation script).
 2. **Generate datasets locally** via `generate_dgp.py` (outputs `data/train/` 800 files, `data/val/` 100 files, `data/test/` 100 files).
-3. **Run `run_training_job.sql`** in Snowsight or SnowSQL — creates the database, schema, stages (`@META_DATASET_STAGE`, `@MODEL_STAGE`), and compute pool (`DEEPSET_GPU_POOL`, `GPU_NV_S`, MIN=1, MAX=2). Verify the pool reaches `ACTIVE` state before continuing.
+3. **Run `run_training_job.sql`** in Snowsight or SnowSQL — creates the database, schema, stages (`@META_DATASET_STAGE`, `@MODEL_STAGE`), and compute pool (`DEEPSET_GPU_POOL`, `GPU_NV_S`, MIN=1, MAX=4). Verify the pool reaches `ACTIVE` state before continuing.
 4. **Upload Parquet files** to `@META_DATASET_STAGE` via SnowSQL `PUT` (step 3 in the SQL file).
 5. **Upload Python scripts** to `@MODEL_STAGE/scripts/` via SnowSQL `PUT` (step 3b in the SQL file).
 6. **Run `CALL run_training_pipeline()`** (step 4 in `run_training_job.sql`) from Snowsight or SnowSQL —
@@ -36,7 +36,7 @@ Snowsight / SnowSQL
 Container Runtime — Phase 1: HPO (2 nodes)
   └── hpo.py → @MODEL_STAGE/hpo/best_config.json
 
-Container Runtime — Phase 2: Training (2 nodes, DDP)
+Container Runtime — Phase 2: Training (4 nodes, DDP)
   ├── DataLoader (4 workers, prefetch_factor=2) reads /data/train/*.parquet
   ├── trains DeepSet (phi, rho, psi + 4 equivariant scalars)
   │     BF16 autocast + GradScaler, batched forward over all m test rows
@@ -157,12 +157,13 @@ CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 ### 1. Compute Pool
 
 ```sql
--- GPU_NV_S: 1× A10G per node, 0.57 cr/hr. MAX_NODES=2 scales for DDP training and parallel HPO.
+-- GPU_NV_S: 1× A10G per node, 0.57 cr/hr. MAX_NODES=4: up to 4 nodes for DDP training,
+-- 2 nodes for parallel HPO trials.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY — must drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 2
+  MAX_NODES = 4
   INSTANCE_FAMILY = GPU_NV_S;
 ```
 
@@ -171,6 +172,15 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 `run_training_job.py` is deployed as a Snowpark Python stored procedure. The procedure
 downloads scripts from `@MODEL_STAGE/scripts/` and submits HPO, training, and evaluation
 as sequential MLJob phases — all within Snowflake. No local Python environment is needed.
+
+#### What is an MLJob container?
+
+An MLJob container is a short-lived compute environment that Snowflake starts on one or
+more nodes in your GPU compute pool to run a single Python script. When
+`MLJob.submit_job()` is called, Snowflake pulls the managed ML runtime image onto the
+requested nodes, runs your entrypoint (e.g. `train.py`), writes outputs to the stage,
+then shuts the container down. PyTorch, Ray, and `snowflake-ml-python` are
+pre-installed — no Docker build or image management is required.
 
 Create the procedure (re-run after uploading an updated `run_training_job.py`):
 
@@ -195,7 +205,7 @@ Each phase uses `runtime_image="snowflake/ml-runtime-gpu:latest"` and `compute_p
 | Phase | Entrypoint | Instances | Output |
 |---|---|---|---|
 | HPO | `hpo.py` | 2 | `@MODEL_STAGE/hpo/best_config.json` |
-| Training | `train.py` | 2 (DDP) | `@MODEL_STAGE/checkpoints/best.pt` |
+| Training | `train.py` | 4 (DDP) | `@MODEL_STAGE/checkpoints/best.pt` |
 | Evaluation | `evaluate.py` | 1 | `@MODEL_STAGE/results/test_report.csv` |
 
 ### 3. Checkpoint Output
@@ -266,9 +276,9 @@ Ray, and `snowflake-ml-python` pre-installed.
 | Phase | Nodes | Cost/hr | Duration | Total |
 |---|---|---|---|---|
 | HPO (20 trials × 30 epochs) | 2 × GPU_NV_S | ~$2.28–3.42 | ~40–60 min | ~$1.52–3.42 |
-| Full training (DDP) | 2 × GPU_NV_S | ~$2.28–3.42 | ~15–25 min | ~$0.57–1.43 |
+| Full training (DDP) | 4 × GPU_NV_S | ~$4.56–6.84 | ~8–13 min | ~$0.61–1.48 |
 | Evaluation | 1 × GPU_NV_S | ~$1.14–1.71 | ~5–10 min | ~$0.10–0.29 |
-| **Total** | | | **~60–95 min** | **~$2.19–5.14** |
+| **Total** | | | **~53–83 min** | **~$2.23–5.19** |
 
 ---
 
@@ -435,14 +445,15 @@ kernel launch latency. The compiled model is saved via `model._orig_mod` to avoi
 
 `GPU_NV_S` provides 1× A10G GPU per node and ~12 vCPUs. 4 DataLoader worker processes
 fit comfortably within available host RAM, leaving headroom for the main training
-process. 2 nodes are used for DDP training and parallel HPO trials.
+process. 4 nodes are used for DDP training; 2 nodes for parallel HPO trials.
 
 ### Cost Comparison
 
 | Configuration | Estimated wall-clock | Notes |
 |---|---|---|
 | GPU_NV_S, row-by-row, FP32 | ~4 hours | Original |
-| GPU_NV_S × 2, batched, BF16, DDP, compile | ~15–25 minutes | Optimized |
+| GPU_NV_S × 2, batched, BF16, DDP, compile | ~15–25 minutes | Previous optimized |
+| GPU_NV_S × 4, batched, BF16, DDP, compile | ~8–13 minutes | Current (4-node DDP) |
 
 Estimates assume 800 training files × 200 epochs with early stopping at epoch ~100.
 
