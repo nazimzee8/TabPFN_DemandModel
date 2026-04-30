@@ -14,7 +14,7 @@ from pathlib import Path
 from snowflake.snowpark import Session
 
 STAGE_CHECKPOINT = "@MODEL_STAGE/checkpoints/"
-STAGE_RESULTS    = "@MODEL_STAGE/results/"
+STAGE_RESULTS    = "@EVALUATION_RESULTS_STAGE/"
 LOCAL_DIR        = Path("models")
 
 def main():
@@ -33,8 +33,10 @@ def main():
         print("Connected to Snowflake.")
 
         print("Stage contents:")
-        for row in session.sql("LIST @MODEL_STAGE").collect():
-            print(f"  {row[0]}")
+        for stage in ("@MODEL_STAGE/checkpoints/", "@EVALUATION_RESULTS_STAGE/"):
+            print(f"{stage}:")
+            for row in session.sql(f"LIST {stage}").collect():
+                print(f"  {row[0]}")
         print()
 
         print(f"Downloading {STAGE_CHECKPOINT} ...")

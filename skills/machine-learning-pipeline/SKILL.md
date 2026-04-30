@@ -12,7 +12,10 @@ Use this skill to explain the research workflow implemented in this repo for tra
 Ground every explanation in the current code:
 - `generate_dgp.py` generates many single-task parquet files under `data/train`, `data/val`, and `data/test`.
 - `train.py` trains a `DeepSetModel` over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
-- `evaluate.py` loads `best.pt`, runs permutation checks, evaluates only the held-out test split, writes `results/test_report.csv`, and uploads the report to `@MODEL_STAGE/results/` when running inside SPCS.
+- `hpo.py` materializes the staged train/val parquet splits, scans only `p` and
+  `n_train` metadata, then runs cardinality-aware RandomSearch over DeepSet
+  dimensions and optimizer settings.
+- `evaluate.py` loads only `best.pt` from `@MODEL_STAGE/checkpoints/`, runs permutation checks, writes synthetic reports under `results/synthetic/`, writes per-method benchmark files under `results/benchmark_parts/`, aggregates `results/model_comparison.csv`, and uploads evaluation CSVs to `@EVALUATION_RESULTS_STAGE/` when running inside SPCS.
 
 ## Explain The Data Layout
 
@@ -24,7 +27,10 @@ State the generation contract from `generate_dgp.py`:
 - `betaX_test` is the noiseless target used for evaluation.
 - With `--n_datasets 1000`, the script writes 800 training tasks, 100 validation tasks, and 100 test tasks.
 
-When describing Snowflake execution, note that these parquet files are uploaded to `@META_DATASET_STAGE` and mounted into the container at `/data`.
+When describing Snowflake execution, note that these parquet files are uploaded to
+`@META_DATASET_STAGE` and are explicitly materialized by MLJobs into ephemeral
+container-local `DATA_DIR` (default `/tmp/data`). Do not describe local workstation
+downloads of `@META_DATASET_STAGE`.
 
 ## Explain The SPCS Execution Flow
 
@@ -34,26 +40,69 @@ Use this flow when summarizing the end-to-end pipeline:
 2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_DATASET_STAGE`.
 3. Upload Python scripts (`*.py`) to `@MODEL_STAGE/scripts/` via SnowSQL `PUT`.
 4. Create and call the `run_training_pipeline()` Snowpark stored procedure (step 4 in
-   `run_training_job.sql`). The procedure imports `run_training_job.py` from the stage,
-   downloads all scripts to `/tmp/scripts/`, and submits HPO, training, and evaluation
-   as sequential MLJob phases — all within Snowflake. No local Python environment is needed.
+   `run_training_job.sql`). The procedure imports `run_training_job.py` from the stage
+   and submits HPO plus training MLJobs. HPO writes `@MODEL_STAGE/hpo/best_config.json`;
+   training consumes that JSON through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
 
-5. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
-6. During evaluation, load `best.pt`, run permutation-invariance checks, evaluate on `/data/test`, write `results/test_report.csv`, and upload it to `@MODEL_STAGE/results/`.
+5. Verify `@MODEL_STAGE/checkpoints/best.pt`, then call `run_evaluation_pipeline()`.
+   Evaluation must not depend on `best_config.json`; `best.pt` is the handoff contract.
+6. During training, save the best checkpoint to `best.pt` using `model._orig_mod.state_dict()` (unwrapped from `torch.compile`) and upload it to `@MODEL_STAGE/checkpoints/`.
+7. During evaluation, load `best.pt`, run permutation-invariance checks, materialize
+   the held-out test split inside the Snowflake container, evaluate `/tmp/data/test`,
+   write `results/synthetic/test_report.csv`, write `results/synthetic/mc_report.csv`,
+   write per-method benchmark part files, aggregate `results/model_comparison.csv`,
+   and upload evaluation CSVs to `@EVALUATION_RESULTS_STAGE/`.
 
 When discussing outputs, be explicit:
 - Model artifact: `best.pt`
-- In-container report: `results/test_report.csv`
+- In-container synthetic reports: `results/synthetic/test_report.csv`, `results/synthetic/mc_report.csv`
 - Snowflake checkpoint stage: `@MODEL_STAGE/checkpoints/`
-- Snowflake evaluation stage: `@MODEL_STAGE/results/`
+- Snowflake evaluation stage: `@EVALUATION_RESULTS_STAGE/` for synthetic reports, `benchmark_parts/<method>_detailed.csv`, `model_comparison.csv`, and `model_comparison_summary.csv`
+- HPO artifact: `@MODEL_STAGE/hpo/best_config.json`
+
+### Snowflake Runtime Requirements
+
+When documenting or patching Snowflake execution, include these runtime constraints:
+- Stage uploads for JSON and checkpoint artifacts must use deterministic filenames and `auto_compress=False`; expected targets are `@MODEL_STAGE/hpo/best_config.json` and `@MODEL_STAGE/checkpoints/best.pt`.
+- `@MODEL_STAGE` owns scripts, HPO config, and checkpoints only. Evaluation CSVs, including the canonical `model_comparison.csv`, belong under `@EVALUATION_RESULTS_STAGE/`.
+- PyTorchDistributor context access must use getter methods such as `get_rank()`, `get_local_rank()`, and `get_world_size()`, not direct context attributes.
+- Training must wrap the model in `DistributedDataParallel` for real multi-worker gradient synchronization; samplers and collectives alone are not enough.
+- DDP training requires the train split count to be divisible by `world_size`; do not rely on padded duplicate train tasks to equalize backward steps.
+- Validation must not use padded `DistributedSampler` rows. Shard validation with a no-padding rank slice, reduce global `(sum_loss, total_count)`, and compute weighted validation MSE from those reduced totals.
+- Snowflake MLJobs explicitly materialize staged parquet into container-local
+  `/tmp/data`; `stage_name` is the payload stage, not a dataset mount.
+- `submit_from_stage(source=...)` points at `@MODEL_STAGE/scripts/`, but `stage_name` is the bare MLJob payload stage name `MLJOB_PAYLOAD_STAGE`, not `@MODEL_STAGE`.
+- Snowflake compute pools cannot use `MIN_NODES = 0`; set CPU pools to `MIN_NODES = 1` and use `AUTO_SUSPEND_SECS` and/or `INITIALLY_SUSPENDED` for cost control.
+- Kaggle benchmark `.npz` files persist in `@META_DATASET_STAGE/kaggle/`.
+- Kaggle MLJob secrets must use Snowflake service spec syntax under `spec.containers[].secrets[]` with `snowflakeSecret`, `secretKeyRef`, and `envVarName`; do not use Kubernetes-style `env.valueFrom`.
+- OpenML benchmark datasets are fetched at benchmark runtime inside Snowflake.
+- OpenML/Kaggle benchmark rows are OOD smoke/generalization evidence, not strict
+  TabPFN paper replication.
+- OpenML benchmark jobs require benchmark Python dependencies and external network
+  access through `external_access_integrations`; jobs should fail loudly when
+  dependencies are unavailable.
+- `fetch_tabpfn_datasets()` filters OpenML datasets with `max_cat_fraction=0.3` — datasets where more than 30% of features are categorical are skipped (after OneHot expansion they become high-d sparse matrices outside the model's numeric training distribution).
+- `fetch_staged_kaggle_datasets()` skips any `.npz` file where `categorical_indicator.any()` is True (`require_numeric_only=True`). s3e5 (Wine Quality, 11 numeric) and s3e9 (Concrete Strength, 8 numeric) are confirmed all-numeric and always pass this guard.
+- AutoGluon is a separate benchmark method named exactly `AutoGluon`. Its MLJob uses
+  `AUTOGLUON_CPU_POOL` (`CPU_X64_M`, MIN=1, MAX=1), installs
+  the shared benchmark dependencies plus `autogluon.tabular[all]==1.0.0`, sets
+  `AUTOGLUON_TIME_LIMIT=300`, fits
+  `TabularPredictor` with `presets="best_quality"`, `num_cpus=1`, `num_gpus=0`,
+  writes `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_detailed.csv`, and
+  cleans temporary model artifacts under `/tmp` after each fit.
+- Keep a tiny benchmark aggregation smoke test covering two methods, two datasets,
+  and two reps so `normalize_benchmark_columns()` and rank columns cannot silently
+  regress.
 
 ## Explain How DeepSet Is Trained
 
 Describe `train.py` as training across many tasks, not rows from one dataset.
 
 Call out these implementation details:
-- `DATA_DIR` defaults to `/data`.
-- Training reads every parquet file in `/data/train`; validation reads every parquet file in `/data/val`.
+- `DATA_DIR` defaults to `/tmp/data`.
+- Training materializes `@META_DATASET_STAGE/train/` and `@META_DATASET_STAGE/val/`
+  into `/tmp/data`, then reads every parquet file in `/tmp/data/train`; validation
+  reads every parquet file in `/tmp/data/val`.
 - Each parquet file is treated as one meta-dataset.
 - For each task, the model consumes `(X_train, y_train, X_test)` — all m test rows are passed in a single batched forward call. The model returns a vector of m scalar predictions.
 - The per-task loss is the mean squared error between the batched prediction vector and `betaX_test` across that task's m test rows.
@@ -66,17 +115,46 @@ Call out these implementation details:
 
 When explaining the learned artifact, describe `best.pt` as the serialized state dict of the DeepSet architecture (saved via `model._orig_mod` to unwrap `torch.compile`) that is later reused for held-out evaluation.
 
+### HPO Design
+
+Describe `hpo.py` as cardinality-aware RandomSearch, not as a fixed dimension
+grid that is always valid.
+
+Call out these implementation details:
+- HPO materializes only the train and validation splits from `@META_DATASET_STAGE`
+  into container-local `DATA_DIR`; it does not inspect held-out test metadata
+  during model selection.
+- Before constructing the `Tuner` search space, HPO reads only the scalar parquet
+  columns `p` and `n_train` from train/val task files.
+- It computes observed `max(p)` and `max(n_train)` across train/val tasks.
+- `d_phi` candidates are selected from `[64, 128, 256, 512]`, lower-bounded by
+  observed `max(p)`, and kept divisible by `N_HEADS`.
+- `d_rho` candidates are selected from `[128, 256, 512, 1024]`, lower-bounded by
+  observed `max(n_train)`, and kept divisible by `N_HEADS`.
+- HPO fails before launching trials if staged train/val metadata is missing,
+  non-positive, or if no candidate dimension satisfies the observed cardinality.
+- `best_config.json` still records the selected `d_phi` and `d_rho` and is
+  uploaded to `@MODEL_STAGE/hpo/` with `auto_compress=False`.
+
 ### Performance Design
 
-The training pipeline is configured for distributed GPU utilization across 2 nodes:
+The intended training configuration is distributed GPU utilization across 4 nodes:
 
-- **`GPU_NV_S` (2 nodes)** — 0.57 cr/node/hr ≈ $2.28–3.42/hr total; 1× A10G per node.
-- **`PyTorchDistributor`** with `num_nodes=2, num_workers_per_node=1` — handles Ray
+- **`GPU_NV_S` / `DEEPSET_GPU_POOL` (4 nodes)** — 1× A10G per node and may exceed the earlier $5/hr target.
+- **`PyTorchDistributor`** with `num_nodes=4, num_workers_per_node=1` — handles Ray
   cluster setup, DDP process group initialization, and result collection automatically.
-- **`DistributedSampler`** partitions 800 training tasks across 2 GPU processes
-  (~400 tasks/GPU/epoch); `set_epoch()` called each epoch for correct shuffling.
-- **`dist.all_reduce(val_tensor, AVG)`** — aggregates validation MSE across ranks before
-  the early-stop check; `dist.broadcast(stop, src=0)` propagates the stop signal.
+- **`DistributedDataParallel` wrapping** is required so gradients synchronize across workers.
+- **DDP split accounting** requires 800 training tasks / 4 ranks = 200 backward
+  steps per rank. Future train split sizes must be audited for divisibility by
+  `world_size`; do not let train samplers pad duplicate tasks.
+- **No-padding validation sharding** partitions the current 100 validation tasks across
+  4 ranks exactly enough for evaluation, then reduces `(sum_loss, total_count)` so
+  the early-stop metric is an exact global weighted MSE.
+- **`DistributedSampler`** partitions 800 training tasks across 4 GPU processes
+  (~200 tasks/GPU/epoch); `set_epoch()` called each epoch for correct shuffling.
+- **Validation reduction** uses a no-padding rank slice and all-reduces
+  `(sum_loss, total_count)` before computing exact weighted global MSE;
+  `dist.broadcast(stop, src=0)` propagates the stop signal.
 - **`num_workers=4`** per process (GPU_NV_S has ~12 vCPUs; 4 workers leaves headroom for
   the main training process).
 - **Batched forward pass** — all m test rows are passed to the model in a single call; do
@@ -89,8 +167,11 @@ The training pipeline is configured for distributed GPU utilization across 2 nod
 When discussing the model architecture, note:
 - `d_phi` (default 128) must be >= p (feature count) for the feature-level aggregation
   to be expressive enough to distinguish all multisets of feature vectors.
-- `d_rho` (default 256) must be >= n (training-set size) for the sample-level
+- `d_rho` (default 256) must be >= n_train (training-set size) for the sample-level
   aggregation to be expressive enough to distinguish all training contexts.
+- HPO enforces these expressivity constraints by scanning staged train/val
+  metadata and lower-bounding the searched `d_phi` and `d_rho` candidates by
+  observed `max(p)` and `max(n_train)`.
 - **SAB (Self-Attention Block)** from Set Transformer replaces the simple linear
   equivariance layer. At the feature level, features within each sample attend to
   each other before feature pooling. At the sample level, training samples attend
@@ -119,7 +200,8 @@ Describe `evaluate.py` as the unseen-data evaluation step for the trained DeepSe
 State the evaluation contract clearly:
 - It loads `best.pt`.
 - It runs permutation-invariance checks as architecture sanity tests.
-- It evaluates only the held-out test tasks in `/data/test`.
+- It materializes the held-out test split inside the Snowflake container and evaluates
+  only `/tmp/data/test`.
 - It produces per-task records and then aggregates them by `prior_regime` and across all test tasks.
 
 Use the repo's current metric names, but explain their meaning precisely:
@@ -157,10 +239,10 @@ Include these caveats when discussing the current evaluation:
 
 Prefer wording like:
 - "DeepSet is trained over many synthetic regression tasks stored as parquet meta-datasets."
-- "The full pipeline — HPO, training, and evaluation — runs inside Snowflake via a Snowpark stored procedure; `run_training_job.run_pipeline(session)` submits each phase as an MLJob."
+- "`run_training_pipeline()` submits only HPO and training; `run_evaluation_pipeline()` separately consumes `@MODEL_STAGE/checkpoints/best.pt` for synthetic evaluation and benchmarks."
 - "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
-- "HPO runs 20 Bayesian Optimization trials (30 epochs each) in parallel before full training."
-- "The compute pool uses `GPU_NV_S` (2 nodes) at ~$2.28–3.42/hr — within the $1–5/hr budget."
+- "HPO runs cardinality-aware RandomSearch: it scans staged train/val parquet metadata, lower-bounds `d_phi` by observed `max(p)` and `d_rho` by observed `max(n_train)`, then runs 40 trials (30 epochs each, 4 concurrent trials on 4 GPU nodes) before full training."
+- "The compute pool uses `DEEPSET_GPU_POOL` with `MAX_NODES = 4` for 4-node DDP training; this can exceed the earlier $5/hr budget cap."
 - "Generalization is assessed by comparing DeepSet test MSE against a fixed ridge-regression baseline on unseen datasets."
 - "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for DeepSet than for the baseline."
 - "All m test rows are passed to the model in a single batched forward call; the model returns a vector of m scalar predictions."
