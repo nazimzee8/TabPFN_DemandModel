@@ -25,7 +25,7 @@ written back to Snowflake.
    `weight_decay`, and `dropout`, and writes `@MODEL_STAGE/hpo/best_config.json`.
 10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
 11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
-12. **Call `run_evaluation_pipeline()`**. Evaluation reads `best.pt`, runs synthetic evaluation, prepares benchmark datasets if needed, launches prepared-dataset benchmark shards, then aggregates CSV outputs to `@EVALUATION_RESULTS_STAGE`.
+12. **Call `run_evaluation_pipeline()`**. Evaluation reads `best.pt`, preflights compute pools and runtime images, validates prepared benchmark manifest/index metadata, launches prepared-dataset benchmark shards, then aggregates CSV outputs to `@EVALUATION_RESULTS_STAGE`.
 13. **Download results locally** from the client with SnowSQL `GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';`.
 
 ## Current Snowflake Guardrails
@@ -48,15 +48,24 @@ written back to Snowflake.
   `AUTOGLUON_RUNTIME_ENVIRONMENT`, set
   `BENCHMARK_METHOD=AutoGluon`, `AUTOGLUON_TIME_LIMIT=300`, and write unique part
   CSVs under `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_shard{i}_of_{n}_detailed.csv`.
+  The AutoGluon runtime probe (`AUTOGLUON_REQUIRED_IMPORTS`) checks:
+  `autogluon.tabular`, `numpy`, `pandas`, `sklearn`, `scipy`, `pyarrow`,
+  `torch`, and `snowflake.snowpark`. It intentionally excludes `xgboost`,
+  `lightgbm`, and `catboost`, which are not required for AutoGluon shards.
+  `scipy`, `pyarrow`, and `torch` must be present because `evaluate.py`
+  hard-imports them at module startup regardless of selected benchmark method.
 - DeepSet benchmark shard jobs run `DeepSetModel-MC bounded-context ensemble`, not
   exact full-context DeepSet inference. The OOM boundary was forwarding the full
   90% processed training split against the full test split inside MC dropout on
   Snowflake GPU nodes. The remediation preserves dataset, seed, split, and test-row
-  coverage by splitting 90/10 first, fitting preprocessing on train only, sampling
-  five deterministic 200-row train-only contexts, predicting the same processed
-  full test split in 128-row chunks, averaging the five prediction vectors, and
-  computing metrics once. First stable full benchmark runs use `MC_K=8`; move to
-  `MC_K=16` only after memory and runtime stability are proven.
+  coverage by splitting 90/10 first, fitting preprocessing on train only, applying
+  deterministic train-only `train_f_regression` feature selection capped by
+  `BENCHMARK_DEEPSET_FEATURE_CAP` (default `model.cfg.d_phi`), sampling five
+  deterministic non-overlapping train-only context windows capped at 200 rows,
+  predicting the same capped processed full test split in 128-row chunks,
+  averaging the five prediction vectors, and computing metrics once. First stable
+  full benchmark runs use `MC_K=8`; move to `MC_K=16` only after memory and
+  runtime stability are proven.
 
 Recommended smoke order: compile the Python scripts, create Snowflake objects with
 `run_training_job.sql`, run `CALL build_meta_dataset_index()`, optionally run
@@ -294,10 +303,11 @@ GRANT USAGE ON INTEGRATION benchmark_external_access TO ROLE <job_submitter_role
 `KAGGLE_USERNAME` and `KAGGLE_KEY` through MLJob `spec_overrides`, not read by the
 script through `snowflake.snowpark.secrets`.
 
-`run_evaluation_pipeline()` first checks
-`@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json`. It submits the
-benchmark dataset preparation job only when that manifest is absent. The prep job
-uses `external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"]`; benchmark
+`run_evaluation_pipeline()` always submits the benchmark dataset preparation job
+before benchmark shards as a lightweight manifest and `BENCHMARK_DATASET_INDEX`
+validation step. Existing valid manifests exit early inside
+`prepare_benchmark_datasets.py`; invalid or incomplete manifests are rebuilt. The
+prep job uses `external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"]`; benchmark
 shard jobs do not receive that integration. `openml` is not a shard dependency,
 and `evaluate.py` must remain OpenML-free. Creating the
 environment objects only makes the route available; jobs will not use it unless
@@ -316,8 +326,17 @@ calling `run_evaluation_pipeline()`:
 `run_evaluation_test.py` passes these values to
 `submit_from_stage(runtime_environment=...)` and does not pass
 `pip_requirements` for evaluation or prep submissions. It fails fast with a
-`RuntimeError` if any required runtime image env var is missing. Verify available
-runtime image names in the target account. Snowflake documents the argument on the
+`RuntimeError` if any required runtime image env var is missing. It also exposes
+the selected runtime inside each container as `EVAL_RUNTIME_ENVIRONMENT` and runs
+`runtime_probe.py` before expensive jobs on the benchmark GPU pool, benchmark CPU
+pool, prep CPU pool, and AutoGluon CPU pool. The probe requires runtime-specific
+imports: benchmark images need `torch`, `pyarrow`, `pandas`, `scipy`,
+`sklearn`, XGBoost, LightGBM, CatBoost, Snowpark, and Snowflake ML jobs; prep
+needs `openml`, `numpy`, and Snowpark; AutoGluon needs `autogluon.tabular`,
+`numpy`, `pandas`, `sklearn`, `scipy`, `pyarrow`, `torch`, and Snowpark.
+AutoGluon intentionally excludes XGBoost, LightGBM, and CatBoost. `scipy`,
+`pyarrow`, and `torch` are required because AutoGluon shards still execute
+`evaluate.py`, which imports those modules at startup. Verify available runtime image names in the target account. Snowflake documents the argument on the
 [`submit_from_stage` API reference](https://docs.snowflake.com/en/developer-guide/snowpark-ml/reference/latest/api/jobs/snowflake.ml.jobs.submit_from_stage).
 
 After uploading scripts, optionally run the raw Kaggle setup procedure, then run
@@ -349,8 +368,14 @@ CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_S
 Resource split:
 
 - GPU (`DEEPSET_GPU_POOL`): 5-node HPO, 10-node DDP training, synthetic DeepSet evaluation, and DeepSet-MC benchmark (10 single-node GPU shard jobs).
-- CPU_X64_XS (`DEEPSET_CPU_POOL`): Kaggle download, 3 single-node combined baseline dataset shard jobs, and aggregation. Each baseline shard receives `BENCHMARK_METHODS=<all 9 baseline methods>`, owns a dataset subset, and runs all baseline methods inside the dataset-first loop.
+- CPU_X64_M (`DEEPSET_CPU_POOL`): Kaggle download, 3 single-node combined baseline dataset shard jobs, and aggregation. Each baseline shard receives `BENCHMARK_METHODS=<all 9 baseline methods>`, owns a dataset subset, and runs all baseline methods inside the dataset-first loop.
 - CPU_X64_M (`AUTOGLUON_CPU_POOL`): AutoGluon benchmark shards (30 single-node jobs).
+
+Evaluation dependency checks are method-aware. The shared prepared-benchmark
+path requires scikit-learn for splitting, preprocessing, and metrics for
+DeepSet, CPU baselines, and AutoGluon. XGBoost, LightGBM, and CatBoost are
+required only when their exact baseline methods are selected, so AutoGluon
+runtime images do not need those three baseline packages.
 
 ```sql
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
@@ -364,7 +389,7 @@ DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
   MAX_NODES = 3
-  INSTANCE_FAMILY = CPU_X64_XS
+  INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
 
@@ -684,7 +709,7 @@ CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_S
 -- one-GPU trials, 1 round) and 10-node DDP training (world_size=40).
 -- Evaluation: synthetic=1 GPU node; DeepSet benchmark=10 GPU dataset shard jobs;
 --   baselines=3 CPU dataset shard jobs, each running all 9 baseline methods;
---   AutoGluon=30 CPU shard jobs. CPU_X64_XS: MAX_NODES=3 supports the combined
+--   AutoGluon=30 CPU shard jobs. CPU_X64_M: MAX_NODES=3 supports the combined
 --   baseline shard topology.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
@@ -698,7 +723,7 @@ DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
   MAX_NODES = 3
-  INSTANCE_FAMILY = CPU_X64_XS
+  INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
 
@@ -811,7 +836,7 @@ Procedure responsibilities:
 - `run_model_training()` imports `run_model_training_job.py`, reads `@MODEL_STAGE/hpo/best_config.json`, passes it to `train.py` as `BEST_CONFIG`, and submits only the training MLJob/container.
 - `run_training_pipeline()` imports `run_training_job.py` and remains a one-call convenience wrapper for HPO plus training.
 - `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_DATASET_STAGE/benchmark_prepared/`.
-- `run_evaluation_pipeline()` imports `run_evaluation_test.py`, runs single-node GPU synthetic evaluation, skips dataset preparation when the prepared benchmark manifest already exists, then launches prepared benchmark shards and aggregation.
+- `run_evaluation_pipeline()` imports `run_evaluation_test.py`, verifies `best.pt`, `runtime_probe.py`, compute pools, and runtime-image imports, runs single-node GPU synthetic evaluation, always submits benchmark preparation as manifest/index validation, then launches prepared benchmark shards and aggregation.
 
 Then optionally stage raw Kaggle data once, prepare benchmark datasets, run HPO,
 inspect the HPO artifact, run training, verify the checkpoint, and run evaluation:
@@ -957,6 +982,11 @@ separate stacked-ensemble benchmark shard jobs on `AUTOGLUON_CPU_POOL` with
 `AUTOGLUON_TIME_LIMIT=300`, `num_cpus=BENCHMARK_NUM_CPUS` (default `1`),
 `num_gpus=0`, and temporary model
 artifacts under `/tmp` cleaned after each fit:
+the AutoGluon runtime probe requires `autogluon.tabular`, `numpy`, `pandas`,
+`sklearn`, `scipy`, `pyarrow`, `torch`, and `snowflake.snowpark`. It
+intentionally excludes XGBoost, LightGBM, and CatBoost. `scipy`, `pyarrow`, and
+`torch` are required because AutoGluon shards still execute `evaluate.py`, which
+imports those modules at startup.
 
 Benchmark shard jobs are dataset-first: a shard owns a subset of manifest
 datasets, loads one prepared `.npz`, evaluates all seeds for that dataset,
@@ -974,11 +1004,12 @@ releases it, and then continues to the next owned dataset.
 | AutoGluon benchmark | `evaluate.py` | 30 CPU_X64_M shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_shard{i}_of_{n}_detailed.csv` |
 | Aggregate comparison | `evaluate.py` | 1 CPU | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` and `model_comparison_summary.csv` |
 
-When benchmark preparation is skipped because the prepared manifest/index and
-staged `.npz` payloads already exist, the expected evaluation MLJob count drops
-from about 70 to about 46 when counting the orchestration job: synthetic
-evaluation, 10 DeepSet benchmark shards, 3 combined baseline shards, 30 AutoGluon
-shards, aggregate comparison, and the parent submission/orchestration job.
+Benchmark preparation is always submitted before shards. When the prepared
+manifest/index and staged `.npz` payloads already exist, the prep job validates
+and exits early, so the expected evaluation work is: runtime probes, synthetic
+evaluation, prep validation, 10 DeepSet benchmark shards, 3 combined baseline
+shards, 30 AutoGluon shards, aggregate comparison, and the parent
+submission/orchestration job.
 
 #### Evaluation Runtime Reduction Plan
 
@@ -1012,6 +1043,17 @@ Keep the dependency invariant:
 - Baseline and DeepSet benchmark shards should not load API/data-fetch dependencies.
 - `run_evaluation_test.py` must submit prep and evaluation MLJobs with
   `runtime_environment`, never per-job `pip_requirements`.
+- DeepSet benchmark rows include `raw_features`, `processed_features`,
+  `selected_features`, `feature_selector`, and `feature_cap`. Feature capping is
+  DeepSet-only; baseline and AutoGluon comparison inputs remain the full processed
+  train/test matrices.
+- CPU baseline and AutoGluon rows do not cap comparison inputs. If
+  `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` or `BENCHMARK_CPU_MAX_MATRIX_BYTES` is
+  exceeded, they emit NaN result rows with `skip_reason` before model
+  construction. AutoGluon also checks `/tmp` free space with
+  `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES` before creating DataFrames or temp
+  model directories. DeepSet feature selection applies the same matrix-risk
+  guard before calling `f_regression`.
 
 ### 3. Checkpoint Output
 
@@ -1750,15 +1792,23 @@ Training/HPO/runtime-probe submissions still use the account-managed default
 unless explicitly changed. Evaluation submissions are different:
 `run_evaluation_test.py` requires `PREP_RUNTIME_ENVIRONMENT`,
 `BENCHMARK_RUNTIME_ENVIRONMENT`, and `AUTOGLUON_RUNTIME_ENVIRONMENT` and passes
-those values as `runtime_environment` without per-job `pip_requirements`.
+those values as `runtime_environment` without per-job `pip_requirements`. It
+verifies staged `runtime_probe.py`, preflights compute pools, and preflights
+those images with lightweight `runtime_probe.py` jobs before launching synthetic,
+prep, benchmark shard, or aggregate work.
 
 ### Operational change notes
 
 - 2026-05-09: Evaluation runtime reduction: required prebuilt runtime images via
   [`submit_from_stage(runtime_environment=...)`](https://docs.snowflake.com/en/developer-guide/snowpark-ml/reference/latest/api/jobs/snowflake.ml.jobs.submit_from_stage),
-  prep-skip preflight, 27 baseline jobs consolidated to 3 multi-method dataset
+  manifest/index validation preflight, 27 baseline jobs consolidated to 3 multi-method dataset
   shards, and single-node CPU parallelism via `BENCHMARK_NUM_CPUS`. Architecture
   remains dataset-first and single-node shard based.
+- 2026-05-09: DeepSet evaluation hardening: runtime image probe jobs now run
+  before expensive work; bounded contexts are deterministic non-overlapping
+  train-only windows; DeepSet-only `train_f_regression` feature selection is
+  capped by `model.cfg.d_phi` unless overridden; benchmark rows record feature
+  cap metadata.
 
 ### Runtime probe workflow
 

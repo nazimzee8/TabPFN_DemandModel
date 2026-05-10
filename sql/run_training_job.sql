@@ -39,10 +39,10 @@ CREATE STAGE IF NOT EXISTS EPOCH_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 -- GPU_NV_M: 4 A10G GPUs per node. MAX_NODES=10 supports 5-node HPO
 -- (20 concurrent one-GPU trials, 1 round of 20 trials) and 10-node DDP training
 -- (40 DDP workers via num_workers_per_node=4).
--- CPU_X64_XS: MAX_NODES=27 supports all baseline benchmark shard jobs in parallel:
--- 9 methods × 3 independent single-node shard jobs = 27 concurrent jobs.
--- Each shard owns a deterministic dataset subset and evaluates each owned
--- dataset across all configured seeds.
+-- CPU_X64_M: MAX_NODES=3 supports the three combined CPU baseline shard jobs.
+-- Each shard owns a deterministic dataset subset and evaluates all configured
+-- baseline methods across all configured seeds. Oversized CPU rows emit NaN
+-- skip rows instead of exhausting container memory.
 -- AUTOGLUON_CPU_POOL uses CPU_X64_M for AutoGluon shard jobs:
 -- 30 independent single-node shard jobs, each loading one owned dataset at a time.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
@@ -57,8 +57,8 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 27
-  INSTANCE_FAMILY = CPU_X64_XS
+  MAX_NODES = 3
+  INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
 
@@ -78,8 +78,9 @@ SHOW COMPUTE POOLS LIKE 'AUTOGLUON_CPU_POOL';
 -- Step 2b: Allow benchmark jobs to fetch datasets from inside Snowflake
 -- Run with a role that can create network rules in TABPFN_SCHEMA.
 -- OpenML hosts are required for evaluation. Kaggle API/www and Google storage hosts are
--- required for the one-off Kaggle download job. PyPI hosts are needed when MLJobs
--- install packages at runtime through pip_requirements.
+-- required for the one-off Kaggle download job. Evaluation MLJobs do not install
+-- packages at runtime through pip_requirements; runtime images must already
+-- contain their required dependencies.
 USE ROLE SYSADMIN;
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
@@ -282,6 +283,8 @@ LIMIT 20;
 -- PUT file://C:/Documents/TabPFN_DemandModel/scripts/run_evaluation_test.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- New: prepare_benchmark_datasets.py is the benchmark dataset prep handler (covered by src/*.py wildcard above).
 -- PUT file://C:/Documents/TabPFN_DemandModel/src/prepare_benchmark_datasets.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- Evaluation runtime preflight uses runtime_probe.py (covered by src/*.py wildcard above).
+-- PUT file://C:/Documents/TabPFN_DemandModel/src/runtime_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 --
 -- Verify:
 -- LIST @MODEL_STAGE/scripts/;
@@ -420,9 +423,12 @@ CREATE OR REPLACE PROCEDURE prepare_benchmark_datasets()
   IMPORTS = ('@MODEL_STAGE/scripts/prepare_benchmark_datasets.py')
   HANDLER = 'prepare_benchmark_datasets.prepare_datasets';
 
--- run_evaluation_pipeline() requires @MODEL_STAGE/checkpoints/best.pt, then runs
--- (concurrently) synthetic evaluation and benchmark dataset preparation, then all
--- benchmark shard jobs, then the aggregate comparison job.
+-- run_evaluation_pipeline() requires @MODEL_STAGE/checkpoints/best.pt and
+-- @MODEL_STAGE/scripts/runtime_probe.py. It preflights compute pools and
+-- configured evaluation runtime images with runtime-specific REQUIRED_IMPORTS,
+-- then runs synthetic evaluation and benchmark dataset preparation. The prep
+-- job always runs as a lightweight manifest/BENCHMARK_DATASET_INDEX validation
+-- step before shard submission, even when benchmark_manifest.json already exists.
 CREATE OR REPLACE PROCEDURE run_evaluation_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON

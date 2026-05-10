@@ -28,11 +28,13 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
   full-context DeepSet inference. Snowflake OOM occurred when MC dropout forwarded
   the full 90% processed train split with the full test split. The fixed evaluation
   path still evaluates every assigned dataset, seed, and test row: 90/10 split
-  first, train-only preprocessing, five deterministic 200-row contexts sampled
-  only from processed train, same processed full test split per context, 128-row
-  test chunks for memory only, average prediction vectors, then compute metrics
-  once. Use `MC_K=8` for the first stable full run; upgrade to `MC_K=16` only after
-  memory/runtime stability is proven.
+  first, train-only preprocessing, train-only feature selection capped by
+  `BENCHMARK_DEEPSET_FEATURE_CAP` (default `model.cfg.d_phi`), five deterministic
+  non-overlapping train-only context windows capped at 200 rows, same capped
+  processed full test split per context, 128-row test chunks for memory only,
+  average prediction vectors, then compute metrics once. Use `MC_K=8` for the
+  first stable full run; upgrade to `MC_K=16` only after memory/runtime stability
+  is proven.
 - Upload scripts with `PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;` and `PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;`.
 - `@EPOCH_STAGE` is not a code source. Epoch calibration MLJobs also load code from `@MODEL_STAGE/scripts/`.
 
@@ -204,7 +206,30 @@ Training/HPO/runtime-probe submissions use the account default unless explicitly
 changed. Evaluation submissions are intentionally pinned through required env
 vars: `PREP_RUNTIME_ENVIRONMENT`, `BENCHMARK_RUNTIME_ENVIRONMENT`, and
 `AUTOGLUON_RUNTIME_ENVIRONMENT`. `run_evaluation_test.py` must pass those values
-as `runtime_environment` and must not use per-job `pip_requirements`.
+as `runtime_environment`, expose the selected value in container env vars as
+`EVAL_RUNTIME_ENVIRONMENT`, and must not use per-job `pip_requirements`. Before
+expensive evaluation/prep work, it verifies `@MODEL_STAGE/checkpoints/best.pt`,
+requires `@MODEL_STAGE/scripts/runtime_probe.py`, preflights compute pools
+(`DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, `AUTOGLUON_CPU_POOL`), and submits
+`runtime_probe.py` on benchmark GPU, benchmark CPU, prep CPU, and AutoGluon CPU
+with runtime-specific `REQUIRED_IMPORTS`.
+
+Evaluation dependency guardrail: never add a global benchmark dependency gate
+that requires every baseline package for every shard. Dependency validation must
+follow the selected `BENCHMARK_METHOD`/`BENCHMARK_METHODS`: scikit-learn is the
+shared prepared-benchmark dependency for DeepSet, CPU baselines, and AutoGluon;
+XGBoost, LightGBM, and CatBoost are required only for those exact methods.
+`autogluon.tabular` stays lazily imported inside `predict_autogluon()`.
+
+AutoGluon runtime probe required imports: `autogluon.tabular`, `numpy`, `pandas`,
+`sklearn`, `scipy`, `pyarrow`, `torch`, and `snowflake.snowpark`. `xgboost`,
+`lightgbm`, and `catboost` are intentionally excluded — AutoGluon shards run
+`BENCHMARK_METHOD=AutoGluon`, which has no code path through those packages.
+The probe must include `scipy`, `pyarrow`, and `torch` because `evaluate.py`
+hard-imports them at module startup (not inside benchmark method branches), and
+AutoGluon shards execute `evaluate.py`. If `evaluate.py` is later refactored to
+lazy-import those modules, the AutoGluon probe list should be revisited.
+Method-aware dependency validation in `evaluate.py` must remain intact regardless.
 
 ### Runtime probe workflow
 
@@ -261,9 +286,11 @@ diagnostics are broken.
 - Benchmark datasets (OpenML + Kaggle) must be fetched and staged exactly once before
   any model shard job runs. Run `CALL prepare_benchmark_datasets()` or let
   `run_evaluation_pipeline()` handle it automatically.
-- `run_evaluation_pipeline()` must preflight
-  `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` before
-  submitting prep and must skip the prep MLJob when that manifest already exists.
+- `run_evaluation_pipeline()` must always submit the prep MLJob before benchmark
+  shards as a lightweight manifest and `BENCHMARK_DATASET_INDEX` validation
+  step. Existing valid manifests exit early inside `prepare_benchmark_datasets.py`;
+  the orchestrator must not skip prep solely because `benchmark_manifest.json`
+  exists.
 - `prepare_benchmark_datasets.py` is the only production code path that may fetch
   OpenML datasets or normalize raw staged Kaggle data. It writes
   `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
@@ -290,6 +317,17 @@ diagnostics are broken.
   Dependency boundary still applies inside those runtime images: `openml`
   belongs only to prep; benchmark shard runtimes must not need OpenML/Kaggle
   fetch APIs.
+- DeepSet benchmark detail rows must include `raw_features`,
+  `processed_features`, `selected_features`, `feature_selector`, and
+  `feature_cap`. The selector is deterministic train-only
+  `train_f_regression`; CPU baselines and AutoGluon continue receiving the full
+  processed matrices.
+- CPU baselines, AutoGluon, and DeepSet feature selection must skip oversized
+  processed rows instead of capping CPU comparison inputs or crashing. Defaults:
+  `BENCHMARK_CPU_MAX_PROCESSED_FEATURES=2000`,
+  `BENCHMARK_CPU_MAX_MATRIX_BYTES=536870912`, and
+  `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES=5368709120`. Skips must emit NaN
+  benchmark rows with a machine-readable `skip_reason`.
 - Prefer method-specific lazy imports in `evaluate.py` so an unrelated model
   package failure does not break a shard for another method.
 - `BENCHMARK_EXTERNAL_ACCESS` is required for dataset preparation and optional

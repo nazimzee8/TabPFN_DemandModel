@@ -553,7 +553,8 @@ def prepare_datasets(session=None):
             except ImportError:
                 raise RuntimeError(
                     "openml package is not installed. "
-                    "Add 'openml' to pip_requirements in _submit_dataset_prep()."
+                    "PREP_RUNTIME_ENVIRONMENT must include openml; evaluation "
+                    "jobs do not submit pip_requirements."
                 )
             openml_datasets = _fetch_openml_datasets(target_n=OPENML_TARGET_N)
 

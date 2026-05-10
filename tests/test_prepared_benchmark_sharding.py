@@ -111,7 +111,7 @@ def _patch_fast_benchmark(monkeypatch, n_datasets):
     monkeypatch.setattr(evaluate, "load_prepared_dataset", fake_load_dataset)
     monkeypatch.setattr(evaluate, "train_test_split", fake_split)
     monkeypatch.setattr(evaluate, "preprocess_split", lambda X_train, X_test, cat: (X_train, X_test))
-    monkeypatch.setattr(evaluate, "get_baselines", lambda seed: {"Ridge": _MeanRegressor()})
+    monkeypatch.setattr(evaluate, "get_baselines", lambda seed, methods=None: {"Ridge": _MeanRegressor()})
     monkeypatch.setattr(
         evaluate,
         "compute_metrics",
@@ -369,6 +369,131 @@ def test_autogluon_fit_receives_configured_benchmark_num_cpus(tmp_path, monkeypa
     assert fit_kwargs["num_cpus"] == 6
 
 
+def test_missing_benchmark_dependency_message_names_modules(monkeypatch):
+    monkeypatch.setattr(evaluate, "MISSING_BENCHMARK_DEPS", ["xgboost (xgboost)", "catboost (catboost)"])
+
+    msg = evaluate.benchmark_dependency_error_message()
+
+    assert "BENCHMARK_RUNTIME_ENVIRONMENT" in msg
+    assert "xgboost (xgboost)" in msg
+    assert "catboost (catboost)" in msg
+
+
+def test_dependency_validation_allows_autogluon_without_tree_baselines(monkeypatch):
+    monkeypatch.setattr(
+        evaluate,
+        "BENCHMARK_DEP_IMPORT_ERRORS",
+        {
+            "xgboost": ImportError("No module named xgboost"),
+            "lightgbm": ImportError("No module named lightgbm"),
+            "catboost": ImportError("No module named catboost"),
+        },
+    )
+
+    evaluate.validate_benchmark_dependencies(["AutoGluon"])
+
+
+def test_dependency_validation_allows_sklearn_baselines_without_tree_boosters(monkeypatch):
+    monkeypatch.setattr(
+        evaluate,
+        "BENCHMARK_DEP_IMPORT_ERRORS",
+        {
+            "xgboost": ImportError("No module named xgboost"),
+            "lightgbm": ImportError("No module named lightgbm"),
+            "catboost": ImportError("No module named catboost"),
+        },
+    )
+
+    evaluate.validate_benchmark_dependencies(["Ridge", "RandomForest"])
+
+
+@pytest.mark.parametrize(
+    ("method", "missing_dep", "message"),
+    [
+        ("XGBoost", "xgboost", "xgboost"),
+        ("LightGBM", "lightgbm", "lightgbm"),
+        ("CatBoost", "catboost", "catboost"),
+    ],
+)
+def test_dependency_validation_fails_for_selected_missing_optional_baseline(
+    monkeypatch,
+    method,
+    missing_dep,
+    message,
+):
+    monkeypatch.setattr(
+        evaluate,
+        "BENCHMARK_DEP_IMPORT_ERRORS",
+        {missing_dep: ImportError(f"No module named {missing_dep}")},
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        evaluate.validate_benchmark_dependencies([method])
+
+
+@pytest.mark.parametrize("method", ["DeepSetModel-MC", "Ridge", "AutoGluon"])
+def test_dependency_validation_requires_sklearn_for_shared_benchmark_path(monkeypatch, method):
+    monkeypatch.setattr(
+        evaluate,
+        "BENCHMARK_DEP_IMPORT_ERRORS",
+        {"sklearn": ImportError("No module named sklearn")},
+    )
+
+    with pytest.raises(RuntimeError, match="scikit-learn"):
+        evaluate.validate_benchmark_dependencies([method])
+
+
+def test_make_baseline_model_only_constructs_selected_method(monkeypatch):
+    class FakeRidge:
+        def __init__(self, alpha):
+            self.alpha = alpha
+
+    monkeypatch.setattr(evaluate, "BENCHMARK_DEP_IMPORT_ERRORS", {})
+    monkeypatch.setattr(evaluate, "Ridge", FakeRidge)
+    monkeypatch.setattr(
+        evaluate,
+        "xgb",
+        types.SimpleNamespace(XGBRegressor=lambda *args, **kwargs: pytest.fail("xgboost touched")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "lgb",
+        types.SimpleNamespace(LGBMRegressor=lambda *args, **kwargs: pytest.fail("lightgbm touched")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "CatBoostRegressor",
+        lambda *args, **kwargs: pytest.fail("catboost touched"),
+        raising=False,
+    )
+
+    baselines = evaluate.get_baselines(3, ["Ridge"])
+
+    assert list(baselines) == ["Ridge"]
+    assert baselines["Ridge"].alpha == 1.0
+
+
+def test_missing_autogluon_dependency_reports_runtime_requirement(monkeypatch):
+    real_autogluon = sys.modules.pop("autogluon", None)
+    real_tabular = sys.modules.pop("autogluon.tabular", None)
+    monkeypatch.setitem(sys.modules, "autogluon.tabular", None)
+    try:
+        with pytest.raises(RuntimeError, match="AUTOGLUON_RUNTIME_ENVIRONMENT"):
+            evaluate.predict_autogluon(
+                np.ones((4, 2)),
+                np.arange(4, dtype=float),
+                np.ones((2, 2)),
+            )
+    finally:
+        sys.modules.pop("autogluon.tabular", None)
+        if real_autogluon is not None:
+            sys.modules["autogluon"] = real_autogluon
+        if real_tabular is not None:
+            sys.modules["autogluon.tabular"] = real_tabular
+
+
 def test_deepset_benchmark_uses_train_only_contexts_and_averages_predictions(monkeypatch):
     manifest = _manifest(1)
     calls = {"preprocess": [], "contexts": [], "metrics": []}
@@ -401,10 +526,12 @@ def test_deepset_benchmark_uses_train_only_contexts_and_averages_predictions(mon
         calls["preprocess"].append((X_train.copy(), X_test.copy()))
         return X_train + 1000.0, X_test + 2000.0
 
-    def fake_select(n_train, context_size, seed, context_index):
+    def fake_select(n_train, context_size, seed, context_index, dataset_identity="benchmark", context_ensembles=5):
         assert n_train == 18
         assert context_size == 200
         assert seed == 7
+        assert dataset_identity == "unit:task-0:dataset-0"
+        assert context_ensembles == 5
         return context_indices[context_index]
 
     def fake_stream(model, X_train_np, y_train_np, X_test_np, K, test_batch_size, device):
@@ -447,24 +574,202 @@ def test_deepset_benchmark_uses_train_only_contexts_and_averages_predictions(mon
     assert len(calls["preprocess"]) == 1
     assert len(calls["metrics"]) == 1
     assert detailed_df["method"].tolist() == ["DeepSetModel-MC"]
+    row = detailed_df.iloc[0]
+    assert row["raw_features"] == 3
+    assert row["processed_features"] == 3
+    assert row["selected_features"] == 3
+    assert row["feature_selector"] == "train_f_regression"
+    assert row["feature_cap"] == 128
 
 
-def test_deepset_context_selection_is_deterministic_and_bounded_to_train_rows():
-    first = evaluate.select_deepset_context_indices(
-        n_train=300, context_size=200, seed=11, context_index=2
+def test_deepset_context_selection_is_deterministic_non_overlapping_and_train_only():
+    windows = [
+        evaluate.select_deepset_context_indices(
+            n_train=1200,
+            context_size=200,
+            seed=11,
+            context_index=i,
+            dataset_identity="dataset-a",
+            context_ensembles=5,
+        )
+        for i in range(5)
+    ]
+    repeated = evaluate.select_deepset_context_indices(
+        n_train=1200,
+        context_size=200,
+        seed=11,
+        context_index=2,
+        dataset_identity="dataset-a",
+        context_ensembles=5,
     )
-    second = evaluate.select_deepset_context_indices(
-        n_train=300, context_size=200, seed=11, context_index=2
-    )
-    other = evaluate.select_deepset_context_indices(
-        n_train=300, context_size=200, seed=11, context_index=3
+    other_dataset = evaluate.select_deepset_context_indices(
+        n_train=1200,
+        context_size=200,
+        seed=11,
+        context_index=2,
+        dataset_identity="dataset-b",
+        context_ensembles=5,
     )
 
-    assert len(first) == 200
-    assert first.min() >= 0
-    assert first.max() < 300
-    np.testing.assert_array_equal(first, second)
-    assert not np.array_equal(first, other)
+    assert [len(w) for w in windows] == [200, 200, 200, 200, 200]
+    combined = np.concatenate(windows)
+    assert combined.min() >= 0
+    assert combined.max() < 1200
+    assert len(np.unique(combined)) == 1000
+    np.testing.assert_array_equal(windows[2], repeated)
+    assert not np.array_equal(windows[2], other_dataset)
+
+
+def test_deepset_context_selection_splits_small_train_sets_and_rejects_too_small():
+    windows = [
+        evaluate.select_deepset_context_indices(
+            n_train=7,
+            context_size=200,
+            seed=3,
+            context_index=i,
+            dataset_identity="small-dataset",
+            context_ensembles=5,
+        )
+        for i in range(5)
+    ]
+
+    assert sorted(len(w) for w in windows) == [1, 1, 1, 2, 2]
+    combined = np.concatenate(windows)
+    assert len(np.unique(combined)) == 7
+    assert combined.min() >= 0
+    assert combined.max() < 7
+
+    with pytest.raises(ValueError, match="at least one training row per non-overlapping context"):
+        evaluate.select_deepset_context_indices(
+            n_train=4,
+            context_size=200,
+            seed=3,
+            context_index=0,
+            dataset_identity="too-small",
+            context_ensembles=5,
+        )
+
+
+def test_deepset_too_few_train_rows_emits_nan_with_feature_metadata(monkeypatch):
+    manifest = _manifest(1)
+
+    def fake_load_dataset(ds_meta):
+        X = np.arange(15, dtype=float).reshape(5, 3)
+        y = np.arange(5, dtype=float)
+        return {
+            "task_id": "task-0",
+            "name": "dataset-0",
+            "X": X,
+            "y": y,
+            "categorical_indicator": [False, False, False],
+            "source": "unit",
+        }
+
+    monkeypatch.setattr(evaluate, "load_prepared_benchmark_manifest", lambda stage_path=None: manifest)
+    monkeypatch.setattr(evaluate, "load_prepared_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        evaluate,
+        "train_test_split",
+        lambda X, y, test_size, random_state: (X[:4], X[4:], y[:4], y[4:]),
+    )
+    monkeypatch.setattr(evaluate, "preprocess_split", lambda X_train, X_test, cat: (X_train, X_test))
+    monkeypatch.setattr(evaluate, "deepset_inference_device", lambda: "cpu")
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=object(),
+        seeds=[0],
+        methods=["DeepSetModel-MC"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "DeepSetModel-MC"
+    assert np.isnan(row["mse"])
+    assert row["raw_features"] == 3
+    assert row["processed_features"] == 3
+    assert row["selected_features"] == 3
+    assert row["feature_selector"] == "train_f_regression"
+    assert row["feature_cap"] == 128
+
+
+def test_deepset_feature_selection_is_train_only_once_and_applied_to_train_and_test(monkeypatch):
+    manifest = _manifest(1)
+    calls = {"feature": [], "stream": []}
+
+    class ModelWithCfg:
+        class Cfg:
+            d_phi = 2
+        cfg = Cfg()
+
+    def fake_load_dataset(ds_meta):
+        X = np.array(
+            [
+                [0.0, 10.0, 100.0, 1000.0],
+                [1.0, 10.0, 90.0, 1000.0],
+                [2.0, 10.0, 80.0, 1000.0],
+                [3.0, 10.0, 70.0, 1000.0],
+                [4.0, 10.0, 60.0, 1000.0],
+                [5.0, 10.0, 50.0, 1000.0],
+                [6.0, 10.0, 40.0, 1000.0],
+                [7.0, 10.0, 30.0, 1000.0],
+                [8.0, 99.0, 20.0, 1111.0],
+                [9.0, 99.0, 10.0, 1111.0],
+            ],
+            dtype=float,
+        )
+        y = np.arange(10, dtype=float)
+        return {
+            "task_id": "task-0",
+            "name": "dataset-0",
+            "X": X,
+            "y": y,
+            "categorical_indicator": [False, False, False, False],
+            "source": "unit",
+        }
+
+    def fake_f_regression(X_train, y_train):
+        calls["feature"].append((X_train.copy(), y_train.copy()))
+        np.testing.assert_array_equal(X_train[:, 1], np.full(8, 10.0))
+        assert 99.0 not in X_train
+        return np.array([5.0, 100.0, 100.0, 1.0]), None
+
+    def fake_stream(model, X_train_np, y_train_np, X_test_np, K, test_batch_size, device):
+        calls["stream"].append((X_train_np.copy(), X_test_np.copy()))
+        np.testing.assert_array_equal(X_train_np, fake_load_dataset({})["X"][:5, [1, 2]])
+        np.testing.assert_array_equal(y_train_np, fake_load_dataset({})["y"][:5])
+        np.testing.assert_array_equal(X_test_np, fake_load_dataset({})["X"][8:, [1, 2]])
+        return np.zeros(X_test_np.shape[0])
+
+    monkeypatch.setattr(evaluate, "load_prepared_benchmark_manifest", lambda stage_path=None: manifest)
+    monkeypatch.setattr(evaluate, "load_prepared_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        evaluate,
+        "train_test_split",
+        lambda X, y, test_size, random_state: (X[:8], X[8:], y[:8], y[8:]),
+    )
+    monkeypatch.setattr(evaluate, "preprocess_split", lambda X_train, X_test, cat: (X_train, X_test))
+    monkeypatch.setattr(evaluate, "f_regression", fake_f_regression)
+    monkeypatch.setattr(evaluate, "select_deepset_context_indices", lambda *args, **kwargs: np.array([0, 1, 2, 3, 4]))
+    monkeypatch.setattr(evaluate, "predict_deepset_mc_streamed", fake_stream)
+    monkeypatch.setattr(evaluate, "deepset_inference_device", lambda: "cpu")
+    monkeypatch.setattr(evaluate, "compute_metrics", lambda y_true, y_pred: {"mse": 0.0, "rmse": 0.0, "r2": 1.0})
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=ModelWithCfg(),
+        seeds=[0],
+        methods=["DeepSetModel-MC"],
+        rank=0,
+        world_size=1,
+    )
+
+    assert len(calls["feature"]) == 1
+    assert len(calls["stream"]) == 5
+    row = detailed_df.iloc[0]
+    assert row["raw_features"] == 4
+    assert row["processed_features"] == 4
+    assert row["selected_features"] == 2
+    assert row["feature_cap"] == 2
 
 
 def test_deepset_streamed_mc_chunking_preserves_test_order_and_length():
@@ -489,6 +794,71 @@ def test_deepset_streamed_mc_chunking_preserves_test_order_and_length():
     np.testing.assert_array_equal(preds, np.arange(7, dtype=float))
 
 
+def test_deepset_requires_cuda_fails_when_unavailable(monkeypatch):
+    monkeypatch.setattr(evaluate, "BENCHMARK_REQUIRE_CUDA", True)
+    monkeypatch.setattr(evaluate.torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="BENCHMARK_REQUIRE_CUDA=true"):
+        evaluate.deepset_inference_device()
+
+
+def test_deepset_gpu_memory_budget_skip_happens_before_inference(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 999)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_MATRIX_BYTES", 999999999)
+    monkeypatch.setattr(evaluate, "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES", 10)
+    monkeypatch.setattr(evaluate, "deepset_inference_device", lambda: torch.device("cuda"))
+    monkeypatch.setattr(
+        evaluate,
+        "predict_deepset_bounded_context_ensemble",
+        lambda *args, **kwargs: pytest.fail("DeepSet inference should not run after GPU budget skip"),
+    )
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=object(),
+        seeds=[0],
+        methods=["DeepSetModel-MC"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "DeepSetModel-MC"
+    assert np.isnan(row["mse"])
+    assert "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES" in row["skip_reason"]
+    assert row["estimated_gpu_inference_bytes"] > 10
+
+
+def test_deepset_cuda_oom_emits_nan_and_clears_cache(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    cache_calls = []
+
+    def raise_oom(*args, **kwargs):
+        raise evaluate.torch.cuda.OutOfMemoryError("unit test oom")
+
+    monkeypatch.setattr(evaluate, "deepset_inference_device", lambda: torch.device("cuda"))
+    monkeypatch.setattr(evaluate, "deepset_gpu_memory_skip_reason", lambda *args, **kwargs: (None, 1234))
+    monkeypatch.setattr(evaluate, "predict_deepset_bounded_context_ensemble", raise_oom)
+    monkeypatch.setattr(evaluate, "BENCHMARK_DEEPSET_EMPTY_CACHE", True)
+    monkeypatch.setattr(evaluate.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(evaluate.torch.cuda, "empty_cache", lambda: cache_calls.append(True))
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=object(),
+        seeds=[0],
+        methods=["DeepSetModel-MC"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "DeepSetModel-MC"
+    assert np.isnan(row["mse"])
+    assert row["skip_reason"] == "cuda_oom"
+    assert row["estimated_gpu_inference_bytes"] == 1234
+    assert cache_calls == [True]
+
+
 def test_baselines_still_receive_full_processed_training_split(monkeypatch):
     tracker = _patch_fast_benchmark(monkeypatch, n_datasets=1)
     fit_shapes = []
@@ -501,7 +871,7 @@ def test_baselines_still_receive_full_processed_training_split(monkeypatch):
         def predict(self, X):
             return np.zeros(X.shape[0])
 
-    monkeypatch.setattr(evaluate, "get_baselines", lambda seed: {"Ridge": ShapeRegressor()})
+    monkeypatch.setattr(evaluate, "get_baselines", lambda seed, methods=None: {"Ridge": ShapeRegressor()})
 
     evaluate.run_prepared_benchmark(
         model=None,
@@ -518,6 +888,11 @@ def test_baselines_still_receive_full_processed_training_split(monkeypatch):
 def test_autogluon_still_receives_full_processed_training_split(monkeypatch):
     tracker = _patch_fast_benchmark(monkeypatch, n_datasets=1)
     ag_shapes = []
+    monkeypatch.setattr(
+        evaluate.shutil,
+        "disk_usage",
+        lambda path: types.SimpleNamespace(free=10 * 1024 ** 3),
+    )
 
     def fake_autogluon(X_train_np, y_train_np, X_test_np):
         ag_shapes.append((X_train_np.shape, y_train_np.shape, X_test_np.shape))
@@ -535,3 +910,136 @@ def test_autogluon_still_receives_full_processed_training_split(monkeypatch):
 
     assert tracker["seeds"] == [6]
     assert ag_shapes == [((16, 3), (16,), (4, 3))]
+
+
+def test_cpu_baseline_skips_oversized_processed_features(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 2)
+    monkeypatch.setattr(
+        evaluate,
+        "get_baselines",
+        lambda seed: pytest.fail("oversized CPU baseline should not instantiate models"),
+    )
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=None,
+        seeds=[0],
+        methods=["Ridge"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "Ridge"
+    assert np.isnan(row["mse"])
+    assert "processed_features=3 exceeds" in row["skip_reason"]
+
+
+def test_cpu_baseline_skips_oversized_matrix_bytes(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 999)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_MATRIX_BYTES", 8)
+    monkeypatch.setattr(
+        evaluate,
+        "get_baselines",
+        lambda seed: pytest.fail("oversized CPU baseline should not instantiate models"),
+    )
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=None,
+        seeds=[0],
+        methods=["Ridge"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "Ridge"
+    assert np.isnan(row["mse"])
+    assert "processed_matrix_bytes=" in row["skip_reason"]
+
+
+def test_autogluon_skips_oversized_matrix_before_temp_artifacts(monkeypatch, tmp_path):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 999)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_MATRIX_BYTES", 8)
+    monkeypatch.setattr(
+        evaluate,
+        "predict_autogluon",
+        lambda *args, **kwargs: pytest.fail("oversized AutoGluon should not run"),
+    )
+    monkeypatch.setattr(
+        evaluate.tempfile,
+        "mkdtemp",
+        lambda *args, **kwargs: pytest.fail("oversized AutoGluon should not create temp dirs"),
+    )
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=None,
+        seeds=[0],
+        methods=["AutoGluon"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "AutoGluon"
+    assert np.isnan(row["mse"])
+    assert "processed_matrix_bytes=" in row["skip_reason"]
+
+
+def test_autogluon_skips_when_tmp_free_space_is_low(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 999)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_MATRIX_BYTES", 999999999)
+    monkeypatch.setattr(
+        evaluate.shutil,
+        "disk_usage",
+        lambda path: types.SimpleNamespace(free=1),
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "predict_autogluon",
+        lambda *args, **kwargs: pytest.fail("AutoGluon should not run with low /tmp"),
+    )
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=None,
+        seeds=[0],
+        methods=["AutoGluon"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "AutoGluon"
+    assert np.isnan(row["mse"])
+    assert "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES" in row["skip_reason"]
+
+
+def test_deepset_skips_selector_when_processed_matrix_is_risky(monkeypatch):
+    _patch_fast_benchmark(monkeypatch, n_datasets=1)
+    monkeypatch.setattr(evaluate, "BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 2)
+    monkeypatch.setattr(
+        evaluate,
+        "f_regression",
+        lambda *args, **kwargs: pytest.fail("DeepSet risk skip should happen before f_regression"),
+    )
+
+    class ModelWithCfg:
+        class Cfg:
+            d_phi = 1
+        cfg = Cfg()
+
+    detailed_df, _, _ = evaluate.run_prepared_benchmark(
+        model=ModelWithCfg(),
+        seeds=[0],
+        methods=["DeepSetModel-MC"],
+        rank=0,
+        world_size=1,
+    )
+
+    row = detailed_df.iloc[0]
+    assert row["method"] == "DeepSetModel-MC"
+    assert np.isnan(row["mse"])
+    assert "processed_features=3 exceeds" in row["skip_reason"]

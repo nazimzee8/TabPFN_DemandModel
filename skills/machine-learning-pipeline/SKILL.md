@@ -102,6 +102,12 @@ When documenting or patching Snowflake execution, include these runtime constrai
 - Keep a tiny benchmark aggregation smoke test covering two methods, two datasets,
   and two reps so `normalize_benchmark_columns()` and rank columns cannot silently
   regress.
+- Evaluation MLJobs require `PREP_RUNTIME_ENVIRONMENT`,
+  `BENCHMARK_RUNTIME_ENVIRONMENT`, and `AUTOGLUON_RUNTIME_ENVIRONMENT`.
+  `run_evaluation_test.py` passes them as `runtime_environment`, exposes the
+  selected value as `EVAL_RUNTIME_ENVIRONMENT`, avoids per-job
+  `pip_requirements`, and preflights configured runtime/compute-pool pairs with
+  `runtime_probe.py` before expensive work.
 
 ## Explain How DeepSet Is Trained
 
@@ -248,6 +254,15 @@ State the evaluation contract clearly:
 - It materializes the held-out test split inside the Snowflake container and evaluates
   only `/tmp/data/test`.
 - It produces per-task records and then aggregates them by `prior_regime` and across all test tasks.
+- Prepared benchmark DeepSet rows use `DeepSetModel-MC bounded-context ensemble`,
+  not exact full-context inference: 90/10 split first, train-only preprocessing,
+  DeepSet-only train-only `train_f_regression` feature selection capped by
+  `BENCHMARK_DEEPSET_FEATURE_CAP` (default `model.cfg.d_phi`), five deterministic
+  non-overlapping train-only context windows capped at 200 rows, prediction-level
+  averaging over the full capped test split, then one metric computation.
+- DeepSet benchmark detail rows include `raw_features`, `processed_features`,
+  `selected_features`, `feature_selector`, and `feature_cap`; CPU baselines and
+  AutoGluon still receive the full processed matrices.
 
 Use the repo's current metric names, but explain their meaning precisely:
 - `model_mse`: mean squared error between DeepSet predictions and `betaX_test` on unseen test tasks.

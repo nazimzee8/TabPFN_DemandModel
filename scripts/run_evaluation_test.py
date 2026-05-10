@@ -17,6 +17,7 @@ instead of dist.init_process_group().
 """
 
 import os
+import time
 
 from snowflake.ml.jobs import submit_from_stage
 
@@ -31,7 +32,7 @@ EVAL_RESULTS_STAGE = "@EVALUATION_RESULTS_STAGE"
 BENCHMARK_PREPARED_STAGE      = "@META_DATASET_STAGE/benchmark_prepared/"
 BENCHMARK_MANIFEST_STAGE_PATH = f"{BENCHMARK_PREPARED_STAGE}benchmark_manifest.json"
 
-# Shard counts â€” match compute pool MAX_NODES capacities.
+# Shard counts â€" match compute pool MAX_NODES capacities.
 GPU_BENCHMARK_SHARDS          = 10   # DeepSet benchmark: 10 GPU shard jobs (DEEPSET_GPU_POOL MAX_NODES=10)
 CPU_BASELINE_BENCHMARK_SHARDS = 3    # Combined baselines: 3 CPU shard jobs (DEEPSET_CPU_POOL MAX_NODES=3)
 AUTOGLUON_BENCHMARK_SHARDS    = 30   # AutoGluon: 30 CPU shard jobs (AUTOGLUON_CPU_POOL MAX_NODES=30)
@@ -52,6 +53,40 @@ BASELINE_METHODS = [
 ]
 AUTOGLUON_METHOD = "AutoGluon"
 
+BENCHMARK_REQUIRED_IMPORTS = (
+    "torch,pyarrow,pandas,scipy,sklearn,xgboost,lightgbm,catboost,"
+    "snowflake.snowpark,snowflake.ml.jobs"
+)
+PREP_REQUIRED_IMPORTS = "openml,numpy,snowflake.snowpark"
+AUTOGLUON_REQUIRED_IMPORTS = (
+    "autogluon.tabular,numpy,pandas,sklearn,scipy,pyarrow,torch,"
+    "snowflake.snowpark"
+)
+
+COMPUTE_POOL_USABLE_STATES = {"ACTIVE", "IDLE"}
+COMPUTE_POOL_RESUMABLE_STATES = {"SUSPENDED"}
+COMPUTE_POOL_FAILED_STATES = {
+    "FAILED",
+    "ERROR",
+    "DELETING",
+    "STOPPING",
+    "UNKNOWN",
+}
+COMPUTE_POOL_POLL_SECONDS = int(os.environ.get("EVAL_COMPUTE_POOL_POLL_SECONDS", "10"))
+COMPUTE_POOL_MAX_POLLS = int(os.environ.get("EVAL_COMPUTE_POOL_MAX_POLLS", "60"))
+
+
+def _resolve_runtime_environments():
+    runtimes = {
+        "PREP_RUNTIME_ENVIRONMENT": _required_runtime_environment("PREP_RUNTIME_ENVIRONMENT"),
+        "BENCHMARK_RUNTIME_ENVIRONMENT": _required_runtime_environment("BENCHMARK_RUNTIME_ENVIRONMENT"),
+        "AUTOGLUON_RUNTIME_ENVIRONMENT": _required_runtime_environment("AUTOGLUON_RUNTIME_ENVIRONMENT"),
+    }
+    print("Evaluation runtime environments:", flush=True)
+    for name, runtime in runtimes.items():
+        print(f"  {name}={runtime}", flush=True)
+    return runtimes
+
 
 def _required_runtime_environment(env_var_name):
     runtime_environment = os.environ.get(env_var_name)
@@ -70,11 +105,12 @@ def _wait_done(job, label, session):
     except Exception as exc:
         if "300002" in str(exc) or "000603" in str(exc):
             raise RuntimeError(
-                f"{label} job terminated with Snowflake internal error 300002 "
-                "(service status unavailable â€” container likely crashed before reaching "
-                "a terminal state). Check @MODEL_STAGE/hpo/hpo_failure.json for the "
-                "Python traceback. If that file is absent, inspect container logs in "
-                "Snowsight for OOM or pre-Python crash details."
+                f"{label} MLJob terminated with Snowflake internal error 300002 / "
+                "service status unavailable. The container likely crashed before "
+                "reaching a clean terminal state. Inspect the current evaluation "
+                "job's container logs in Snowsight. If the failure occurs after "
+                "Python starts, check stdout for evaluate.py or runtime_probe.py "
+                "diagnostics."
             ) from exc
         raise
     if job.status == "DONE":
@@ -92,8 +128,7 @@ def _wait_done(job, label, session):
     raise RuntimeError(f"{label} failed with status {job.status!r}\n--- logs ---\n{logs}")
 
 
-def _submit_eval(session, label, compute_pool, env_vars, target_instances=1):
-    print(f"Submitting {label} ...")
+def _runtime_for_eval(env_vars, runtimes):
     selected_methods = {
         method.strip()
         for method in env_vars.get("BENCHMARK_METHODS", "").split(",")
@@ -104,19 +139,26 @@ def _submit_eval(session, label, compute_pool, env_vars, target_instances=1):
         if env_vars.get("BENCHMARK_METHOD") == AUTOGLUON_METHOD or AUTOGLUON_METHOD in selected_methods
         else "BENCHMARK_RUNTIME_ENVIRONMENT"
     )
+    return runtimes[runtime_env_var]
+
+
+def _submit_eval(session, label, compute_pool, env_vars, runtimes, target_instances=1):
+    print(f"Submitting {label} ...")
+    runtime_environment = _runtime_for_eval(env_vars, runtimes)
     job_kwargs = {
         "source": SCRIPTS_STAGE,
         "entrypoint": "evaluate.py",
         "compute_pool": compute_pool,
         "stage_name": MLJOB_PAYLOAD_STAGE,
         "target_instances": target_instances,
-        "runtime_environment": _required_runtime_environment(runtime_env_var),
+        "runtime_environment": runtime_environment,
         "env_vars": {
             "MODEL_PATH": "best.pt",
             "DATA_DIR": "/tmp/data",
             "RESULTS_DIR": "results/",
             "EVAL_RESULTS_STAGE": EVAL_RESULTS_STAGE,
             "HOME": "/tmp",
+            "EVAL_RUNTIME_ENVIRONMENT": runtime_environment,
             **env_vars,
         },
         "session": session,
@@ -141,8 +183,129 @@ def _stage_manifest_exists(session):
     return _stage_file_exists(session, BENCHMARK_PREPARED_STAGE, "benchmark_manifest.json")
 
 
-def _submit_dataset_prep(session):
+def _row_as_dict(row):
+    if hasattr(row, "as_dict"):
+        try:
+            return {str(k).lower(): v for k, v in row.as_dict().items()}
+        except TypeError:
+            pass
+    if isinstance(row, dict):
+        return {str(k).lower(): v for k, v in row.items()}
+    return {}
+
+
+def _row_get(row, field_names, fallback_indices=()):
+    row_dict = _row_as_dict(row)
+    for field in field_names:
+        if field.lower() in row_dict:
+            return row_dict[field.lower()]
+    for index in fallback_indices:
+        try:
+            return row[index]
+        except Exception:
+            continue
+    return None
+
+
+def _show_compute_pool(session, compute_pool):
+    rows = session.sql(f"SHOW COMPUTE POOLS LIKE '{compute_pool}'").collect()
+    for row in rows:
+        name = _row_get(row, ("name", "compute_pool_name"), fallback_indices=(0,))
+        if str(name).upper() == compute_pool.upper():
+            state = _row_get(row, ("state", "status"), fallback_indices=(1, 2))
+            return str(state).upper() if state is not None else ""
+    return None
+
+
+def _ensure_compute_pool_usable(session, compute_pool):
+    state = _show_compute_pool(session, compute_pool)
+    if state is None:
+        raise RuntimeError(f"Compute pool {compute_pool} does not exist.")
+    if state in COMPUTE_POOL_FAILED_STATES:
+        raise RuntimeError(f"Compute pool {compute_pool} is unusable: state={state}.")
+    if state in COMPUTE_POOL_USABLE_STATES:
+        print(f"Compute pool {compute_pool} is {state}.", flush=True)
+        return
+    if state not in COMPUTE_POOL_RESUMABLE_STATES:
+        raise RuntimeError(f"Compute pool {compute_pool} is not usable: state={state}.")
+
+    print(f"Compute pool {compute_pool} is SUSPENDED; resuming ...", flush=True)
+    session.sql(f"ALTER COMPUTE POOL {compute_pool} RESUME").collect()
+    for _ in range(COMPUTE_POOL_MAX_POLLS):
+        state = _show_compute_pool(session, compute_pool)
+        if state in COMPUTE_POOL_USABLE_STATES:
+            print(f"Compute pool {compute_pool} is {state}.", flush=True)
+            return
+        if state in COMPUTE_POOL_FAILED_STATES:
+            raise RuntimeError(f"Compute pool {compute_pool} failed while resuming: state={state}.")
+        time.sleep(COMPUTE_POOL_POLL_SECONDS)
+    raise RuntimeError(
+        f"Compute pool {compute_pool} did not become usable after "
+        f"{COMPUTE_POOL_MAX_POLLS * COMPUTE_POOL_POLL_SECONDS} seconds; last state={state}."
+    )
+
+
+def _preflight_compute_pools(session):
+    for compute_pool in (GPU_POOL, CPU_POOL, AUTOGLUON_CPU_POOL):
+        _ensure_compute_pool_usable(session, compute_pool)
+
+
+def _submit_runtime_probe(
+    session,
+    label,
+    compute_pool,
+    runtime_environment,
+    required_imports,
+    require_cuda=False,
+):
+    print(f"Submitting runtime preflight probe for {label} ...")
+    return submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="runtime_probe.py",
+        compute_pool=compute_pool,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        runtime_environment=runtime_environment,
+        env_vars={
+            "HOME": "/tmp",
+            "EVAL_RUNTIME_ENVIRONMENT": runtime_environment,
+            "RUNTIME_PROBE_LABEL": label,
+            "REQUIRED_IMPORTS": required_imports,
+            "REQUIRE_CUDA": "true" if require_cuda else "false",
+        },
+        session=session,
+    )
+
+
+def _preflight_runtime_environments(session, runtimes):
+    probe_specs = [
+        ("benchmark GPU runtime", GPU_POOL, runtimes["BENCHMARK_RUNTIME_ENVIRONMENT"], BENCHMARK_REQUIRED_IMPORTS, True),
+        ("benchmark CPU runtime", CPU_POOL, runtimes["BENCHMARK_RUNTIME_ENVIRONMENT"], BENCHMARK_REQUIRED_IMPORTS, False),
+        ("prep CPU runtime", CPU_POOL, runtimes["PREP_RUNTIME_ENVIRONMENT"], PREP_REQUIRED_IMPORTS, False),
+        ("AutoGluon CPU runtime", AUTOGLUON_CPU_POOL, runtimes["AUTOGLUON_RUNTIME_ENVIRONMENT"], AUTOGLUON_REQUIRED_IMPORTS, False),
+    ]
+
+    probes = [
+        (
+            label,
+            _submit_runtime_probe(
+                session,
+                label,
+                compute_pool,
+                runtime_environment,
+                required_imports,
+                require_cuda=require_cuda,
+            ),
+        )
+        for label, compute_pool, runtime_environment, required_imports, require_cuda in probe_specs
+    ]
+    for label, job in probes:
+        _wait_done(job, f"Runtime preflight probe ({label})", session)
+
+
+def _submit_dataset_prep(session, runtimes):
     """Submit the benchmark dataset preparation job (single CPU node)."""
+    runtime_environment = runtimes["PREP_RUNTIME_ENVIRONMENT"]
     print("Submitting benchmark dataset preparation job ...")
     return submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -150,39 +313,45 @@ def _submit_dataset_prep(session):
         compute_pool=CPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=1,
-        runtime_environment=_required_runtime_environment("PREP_RUNTIME_ENVIRONMENT"),
+        runtime_environment=runtime_environment,
         external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"],
         env_vars={
             "BENCHMARK_PREPARED_STAGE": BENCHMARK_PREPARED_STAGE,
             "EVAL_RESULTS_STAGE": EVAL_RESULTS_STAGE,
             "HOME": "/tmp",
+            "EVAL_RUNTIME_ENVIRONMENT": runtime_environment,
         },
         session=session,
     )
 
 
 def run_evaluation_pipeline(session) -> str:
-    # Phase 0: Preflight â€” verify best.pt exists before submitting anything.
+    # Phase 0: Preflight - verify required staged artifacts before submitting anything.
     if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "best.pt"):
         raise FileNotFoundError(f"{MODEL_STAGE}/checkpoints/best.pt is required before evaluation.")
+    if not _stage_file_exists(session, SCRIPTS_STAGE, "runtime_probe.py"):
+        raise FileNotFoundError(
+            f"{SCRIPTS_STAGE}runtime_probe.py is required before evaluation runtime preflight."
+        )
 
-    benchmark_manifest_exists = _stage_manifest_exists(session)
+    runtimes = _resolve_runtime_environments()
+    _preflight_compute_pools(session)
+    _preflight_runtime_environments(session, runtimes)
 
-    # Phase 1 + 2: Submit concurrently when prep is needed. Synthetic eval does
-    # not depend on benchmark prep and always runs as a single GPU-node job.
+    # Phase 1 + 2: Submit concurrently. Synthetic eval does not depend on
+    # benchmark prep. Prep is always submitted as a lightweight manifest/index
+    # validation step and exits early when the staged manifest is already valid.
     synthetic_job = _submit_eval(
         session, "synthetic evaluation job", GPU_POOL,
         {"EVAL_MODE": "synthetic", "EVAL_NUM_NODES": "1", "EVAL_WORKERS_PER_NODE": "1"},
+        runtimes,
         target_instances=1,
     )
-    prep_job = None if benchmark_manifest_exists else _submit_dataset_prep(session)
+    prep_job = _submit_dataset_prep(session, runtimes)
 
-    # Wait for synthetic and, only when submitted, prep before launching shards.
+    # Wait for synthetic and prep validation before launching shards.
     _wait_done(synthetic_job, "Synthetic evaluation", session)
-    if prep_job is None:
-        print(f"Benchmark dataset preparation skipped; found {BENCHMARK_MANIFEST_STAGE_PATH}.")
-    else:
-        _wait_done(prep_job, "Benchmark dataset preparation", session)
+    _wait_done(prep_job, "Benchmark dataset preparation", session)
 
     # Manifest env vars passed to every benchmark shard.
     manifest_env = {
@@ -191,7 +360,7 @@ def run_evaluation_pipeline(session) -> str:
         "BENCHMARK_SHARD_STRATEGY": "balanced",
     }
 
-    # Phase 3: DeepSet benchmark â€” GPU_BENCHMARK_SHARDS independent single-node GPU shard jobs.
+    # Phase 3: DeepSet benchmark â€" GPU_BENCHMARK_SHARDS independent single-node GPU shard jobs.
     deepset_shard_jobs = []
     for shard_idx in range(GPU_BENCHMARK_SHARDS):
         label = f"DeepSetModel-MC benchmark shard {shard_idx + 1}/{GPU_BENCHMARK_SHARDS}"
@@ -201,11 +370,17 @@ def run_evaluation_pipeline(session) -> str:
             "BENCHMARK_DEEPSET_CONTEXT_SIZE": "200",
             "BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES": "5",
             "BENCHMARK_DEEPSET_TEST_BATCH_SIZE": "128",
+            "BENCHMARK_DEEPSET_FEATURE_SELECTOR": "train_f_regression",
+            "BENCHMARK_REQUIRE_CUDA": "true",
+            "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES": "268435456",
+            "BENCHMARK_DEEPSET_GPU_MEMORY_SAFETY_FACTOR": "4.0",
+            "BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION": "0.80",
+            "BENCHMARK_DEEPSET_EMPTY_CACHE": "true",
             "EVAL_NUM_NODES": "1", "EVAL_WORKERS_PER_NODE": "1",
             "BENCHMARK_NUM_SHARDS": str(GPU_BENCHMARK_SHARDS),
             "BENCHMARK_SHARD_INDEX": str(shard_idx),
             **manifest_env,
-        }, target_instances=1)
+        }, runtimes, target_instances=1)
         deepset_shard_jobs.append((label, job))
 
     # Phase 4: CPU baselines - CPU_BASELINE_BENCHMARK_SHARDS combined baseline shard jobs.
@@ -220,10 +395,10 @@ def run_evaluation_pipeline(session) -> str:
             "BENCHMARK_NUM_SHARDS": str(CPU_BASELINE_BENCHMARK_SHARDS),
             "BENCHMARK_SHARD_INDEX": str(shard_idx),
             **manifest_env,
-        }, target_instances=1)
+        }, runtimes, target_instances=1)
         baseline_shard_jobs.append((label, job))
 
-    # Phase 5: AutoGluon â€” AUTOGLUON_BENCHMARK_SHARDS independent single-node CPU shard jobs.
+    # Phase 5: AutoGluon â€" AUTOGLUON_BENCHMARK_SHARDS independent single-node CPU shard jobs.
     autogluon_shard_jobs = []
     for shard_idx in range(AUTOGLUON_BENCHMARK_SHARDS):
         label = f"AutoGluon benchmark shard {shard_idx + 1}/{AUTOGLUON_BENCHMARK_SHARDS}"
@@ -234,7 +409,7 @@ def run_evaluation_pipeline(session) -> str:
             "BENCHMARK_NUM_SHARDS": str(AUTOGLUON_BENCHMARK_SHARDS),
             "BENCHMARK_SHARD_INDEX": str(shard_idx),
             **manifest_env,
-        }, target_instances=1)
+        }, runtimes, target_instances=1)
         autogluon_shard_jobs.append((label, job))
 
     # Wait for all shards.
@@ -247,7 +422,7 @@ def run_evaluation_pipeline(session) -> str:
 
     # Phase 6: Aggregate.
     aggregate_job = _submit_eval(session, "benchmark aggregate job", CPU_POOL,
-                                 {"EVAL_MODE": "aggregate"})
+                                 {"EVAL_MODE": "aggregate"}, runtimes)
     _wait_done(aggregate_job, "Benchmark aggregate", session)
 
     checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")

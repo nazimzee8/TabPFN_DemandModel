@@ -30,9 +30,11 @@ import csv
 import gc
 import os
 import glob
+import math
 import shutil
 import tempfile
 import warnings
+import hashlib
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -52,6 +54,8 @@ os.environ.setdefault("HOME", "/tmp")
 # Optional benchmark dependencies
 # ---------------------------------------------------------------------------
 
+BENCHMARK_DEP_IMPORT_ERRORS = {}
+
 try:
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_squared_error, r2_score
@@ -61,19 +65,74 @@ try:
     from sklearn.svm import SVR
     from sklearn.neural_network import MLPRegressor
     from sklearn.compose import ColumnTransformer
+    from sklearn.feature_selection import f_regression
     from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
     from sklearn.impute import SimpleImputer
     from sklearn.pipeline import Pipeline
+except ImportError as exc:
+    BENCHMARK_DEP_IMPORT_ERRORS["sklearn"] = exc
+
+try:
     import xgboost as xgb
+except ImportError as exc:
+    BENCHMARK_DEP_IMPORT_ERRORS["xgboost"] = exc
+
+try:
     import lightgbm as lgb
+except ImportError as exc:
+    BENCHMARK_DEP_IMPORT_ERRORS["lightgbm"] = exc
+
+try:
     from catboost import CatBoostRegressor
-    BENCHMARK_DEPS_AVAILABLE = True
-except ImportError:
-    BENCHMARK_DEPS_AVAILABLE = False
+except ImportError as exc:
+    BENCHMARK_DEP_IMPORT_ERRORS["catboost"] = exc
+
+BENCHMARK_DEP_PACKAGE_NAMES = {
+    "sklearn": "scikit-learn",
+    "xgboost": "xgboost",
+    "lightgbm": "lightgbm",
+    "catboost": "catboost",
+}
+
+MISSING_BENCHMARK_DEPS = [
+    f"{BENCHMARK_DEP_PACKAGE_NAMES[name]} ({getattr(exc, 'name', None) or exc})"
+    for name, exc in BENCHMARK_DEP_IMPORT_ERRORS.items()
+]
+BENCHMARK_DEPS_AVAILABLE = not MISSING_BENCHMARK_DEPS
+
+
+def _benchmark_dep_label(dep_name):
+    exc = BENCHMARK_DEP_IMPORT_ERRORS.get(dep_name)
+    package_name = BENCHMARK_DEP_PACKAGE_NAMES.get(dep_name, dep_name)
+    if exc is None:
+        return package_name
+    return f"{package_name} ({getattr(exc, 'name', None) or exc})"
+
+
+def benchmark_dependency_error_message(missing_deps=None, selected_methods=None):
+    if missing_deps is None:
+        missing = ", ".join(MISSING_BENCHMARK_DEPS) or "unknown"
+    else:
+        missing = ", ".join(_benchmark_dep_label(dep) for dep in missing_deps) or "unknown"
+    method_text = ""
+    if selected_methods:
+        method_text = f" Selected method(s): {', '.join(selected_methods)}."
+    return (
+        "Selected benchmark dependencies are not available in the runtime image. "
+        "Check BENCHMARK_RUNTIME_ENVIRONMENT/AUTOGLUON_RUNTIME_ENVIRONMENT. "
+        f"Missing module(s): {missing}.{method_text} Install/validate only the "
+        "packages required by the selected method(s): scikit-learn for shared "
+        "benchmark preprocessing/metrics; xgboost, lightgbm, or catboost only "
+        "when those exact baseline methods are selected."
+    )
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+def _env_flag(name, default="false"):
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 N_REPS            = 10
 SEEDS             = list(range(10))          # [0, 1, ..., 9]
@@ -84,6 +143,21 @@ N_MC_DROPOUT      = 32
 BENCHMARK_DEEPSET_CONTEXT_SIZE = int(os.environ.get("BENCHMARK_DEEPSET_CONTEXT_SIZE", "200"))
 BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES = int(os.environ.get("BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES", "5"))
 BENCHMARK_DEEPSET_TEST_BATCH_SIZE = int(os.environ.get("BENCHMARK_DEEPSET_TEST_BATCH_SIZE", "128"))
+BENCHMARK_DEEPSET_FEATURE_CAP = os.environ.get("BENCHMARK_DEEPSET_FEATURE_CAP")
+BENCHMARK_DEEPSET_FEATURE_SELECTOR = os.environ.get(
+    "BENCHMARK_DEEPSET_FEATURE_SELECTOR", "train_f_regression"
+)
+BENCHMARK_REQUIRE_CUDA = _env_flag("BENCHMARK_REQUIRE_CUDA")
+BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES = int(
+    os.environ.get("BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES", "268435456")
+)
+BENCHMARK_DEEPSET_GPU_MEMORY_SAFETY_FACTOR = float(
+    os.environ.get("BENCHMARK_DEEPSET_GPU_MEMORY_SAFETY_FACTOR", "4.0")
+)
+BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION = float(
+    os.environ.get("BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION", "0.80")
+)
+BENCHMARK_DEEPSET_EMPTY_CACHE = _env_flag("BENCHMARK_DEEPSET_EMPTY_CACHE", "true")
 EVAL_RESULTS_STAGE = os.environ.get("EVAL_RESULTS_STAGE", "@EVALUATION_RESULTS_STAGE")
 CHECKPOINT_STAGE = os.environ.get("CHECKPOINT_STAGE", "@MODEL_STAGE/checkpoints/")
 ALL_BENCHMARK_METHODS = [
@@ -99,6 +173,33 @@ ALL_BENCHMARK_METHODS = [
     "MLP",
     "AutoGluon",
 ]
+CPU_BASELINE_METHODS = [
+    "XGBoost",
+    "LightGBM",
+    "CatBoost",
+    "RandomForest",
+    "KNN",
+    "LinearRegression",
+    "Ridge",
+    "SVR",
+    "MLP",
+]
+BASELINE_METHOD_DEPS = {
+    "XGBoost": ("sklearn", "xgboost"),
+    "LightGBM": ("sklearn", "lightgbm"),
+    "CatBoost": ("sklearn", "catboost"),
+    "RandomForest": ("sklearn",),
+    "KNN": ("sklearn",),
+    "LinearRegression": ("sklearn",),
+    "Ridge": ("sklearn",),
+    "SVR": ("sklearn",),
+    "MLP": ("sklearn",),
+}
+BENCHMARK_METHOD_DEPS = {
+    "DeepSetModel-MC": ("sklearn",),
+    **BASELINE_METHOD_DEPS,
+    "AutoGluon": ("sklearn",),
+}
 
 
 def parse_benchmark_methods(benchmark_method=None, benchmark_methods=None):
@@ -118,8 +219,40 @@ def parse_benchmark_methods(benchmark_method=None, benchmark_methods=None):
     return list(ALL_BENCHMARK_METHODS)
 
 
+def validate_benchmark_dependencies(selected_methods):
+    """Fail fast when selected methods require packages missing from this runtime."""
+    selected_methods = list(selected_methods or ALL_BENCHMARK_METHODS)
+    unknown_methods = sorted(set(selected_methods) - set(ALL_BENCHMARK_METHODS))
+    if unknown_methods:
+        raise ValueError(f"Unknown benchmark method(s): {unknown_methods}")
+
+    required_deps = []
+    for method in selected_methods:
+        required_deps.extend(BENCHMARK_METHOD_DEPS.get(method, ()))
+    missing_deps = sorted(
+        {dep for dep in required_deps if dep in BENCHMARK_DEP_IMPORT_ERRORS},
+        key=required_deps.index,
+    )
+    if missing_deps:
+        raise RuntimeError(
+            benchmark_dependency_error_message(
+                missing_deps=missing_deps,
+                selected_methods=selected_methods,
+            )
+        )
+
+
 AUTOGLUON_TIME_LIMIT = int(os.environ.get("AUTOGLUON_TIME_LIMIT", "300"))
 BENCHMARK_NUM_CPUS = int(os.environ.get("BENCHMARK_NUM_CPUS", "1"))
+BENCHMARK_CPU_MAX_PROCESSED_FEATURES = int(
+    os.environ.get("BENCHMARK_CPU_MAX_PROCESSED_FEATURES", "2000")
+)
+BENCHMARK_CPU_MAX_MATRIX_BYTES = int(
+    os.environ.get("BENCHMARK_CPU_MAX_MATRIX_BYTES", "536870912")
+)
+BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES = int(
+    os.environ.get("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", "5368709120")
+)
 BENCHMARK_PREPARED_STAGE = os.environ.get(
     "BENCHMARK_PREPARED_STAGE", "@META_DATASET_STAGE/benchmark_prepared/"
 )
@@ -714,7 +847,7 @@ def run_permutation_tests(model):
 # Section D2 — Baselines and shared metric helpers
 # ---------------------------------------------------------------------------
 
-def get_baselines(seed):
+def _legacy_get_baselines_all(seed):
     """Return 9 sklearn-compatible regressors (tree, linear, SVM, neural)."""
     if not BENCHMARK_DEPS_AVAILABLE:
         return {}
@@ -739,6 +872,57 @@ def get_baselines(seed):
     }
 
 
+def make_baseline_model(method, seed):
+    """Construct one selected baseline without touching unrelated optional packages."""
+    if method not in BASELINE_METHOD_DEPS:
+        raise ValueError(f"Unknown CPU baseline method: {method}")
+    missing_deps = [
+        dep for dep in BASELINE_METHOD_DEPS[method]
+        if dep in BENCHMARK_DEP_IMPORT_ERRORS
+    ]
+    if missing_deps:
+        raise RuntimeError(
+            benchmark_dependency_error_message(
+                missing_deps=missing_deps,
+                selected_methods=[method],
+            )
+        )
+
+    if method == "XGBoost":
+        return xgb.XGBRegressor(n_estimators=200, random_state=seed,
+                                verbosity=0, n_jobs=1)
+    if method == "LightGBM":
+        return lgb.LGBMRegressor(n_estimators=200, random_state=seed,
+                                 verbose=-1, n_jobs=1)
+    if method == "CatBoost":
+        return CatBoostRegressor(iterations=200, random_state=seed,
+                                 verbose=0, allow_writing_files=False)
+    if method == "RandomForest":
+        return RandomForestRegressor(n_estimators=200, random_state=seed,
+                                     n_jobs=1)
+    if method == "KNN":
+        return KNeighborsRegressor(n_neighbors=5, n_jobs=1)
+    if method == "LinearRegression":
+        return LinearRegression(n_jobs=1)
+    if method == "Ridge":
+        return Ridge(alpha=1.0)
+    if method == "SVR":
+        # SVR and MLP need feature scaling - wrap in Pipeline with StandardScaler.
+        return Pipeline([("scaler", StandardScaler()), ("svr", SVR())])
+    if method == "MLP":
+        return Pipeline([("scaler", StandardScaler()),
+                         ("mlp", MLPRegressor(hidden_layer_sizes=(256, 128),
+                                              max_iter=300,
+                                              random_state=seed))])
+    raise AssertionError(f"Unhandled CPU baseline method: {method}")
+
+
+def get_baselines(seed, methods=None):
+    """Return selected sklearn-compatible baseline regressors."""
+    methods = CPU_BASELINE_METHODS if methods is None else list(methods)
+    return {method: make_baseline_model(method, seed) for method in methods}
+
+
 def predict_deepset_mc(model, X_train_np, y_train_np, X_test_np, K=32):
     """Convert numpy float64 → float32 tensors, then run MC dropout inference."""
     Xtr = torch.tensor(X_train_np, dtype=torch.float32)
@@ -748,23 +932,153 @@ def predict_deepset_mc(model, X_train_np, y_train_np, X_test_np, K=32):
     return mean_preds   # np.ndarray (m,)
 
 
-def select_deepset_context_indices(n_train, context_size, seed, context_index):
+def _stable_u64(*parts):
+    payload = "\x1f".join(str(part) for part in parts).encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+
+
+def select_deepset_context_indices(
+    n_train,
+    context_size,
+    seed,
+    context_index,
+    dataset_identity="benchmark",
+    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+):
     """
-    Deterministically select one bounded DeepSet context from processed train rows.
-    Rows are sampled without replacement from the already-split training set only.
+    Select one deterministic, non-overlapping DeepSet context window.
+
+    A single train-only permutation is keyed by stable dataset identity and
+    benchmark seed. Contexts are contiguous windows from that permutation, so
+    the five default contexts never overlap.
     """
     n_train = int(n_train)
     context_size = int(context_size)
+    context_index = int(context_index)
+    context_ensembles = int(context_ensembles)
     if n_train <= 0:
         raise ValueError("DeepSet context selection requires at least one training row.")
     if context_size <= 0:
         raise ValueError("BENCHMARK_DEEPSET_CONTEXT_SIZE must be positive.")
-    if n_train <= context_size:
-        return np.arange(n_train, dtype=np.int64)
+    if context_ensembles <= 0:
+        raise ValueError("BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES must be positive.")
+    if context_index < 0 or context_index >= context_ensembles:
+        raise ValueError("context_index must be within the configured ensemble count.")
+    if n_train < context_ensembles:
+        raise ValueError(
+            "DeepSet bounded-context ensemble requires at least one training row "
+            "per non-overlapping context."
+        )
 
-    rng_seed = (int(seed) + 1) * 1_000_003 + int(context_index) * 97_003
+    effective_context_size = min(context_size, 200)
+    max_rows = context_ensembles * effective_context_size
+    rng_seed = _stable_u64(dataset_identity, int(seed), "deepset_context_permutation")
     rng = np.random.default_rng(rng_seed)
-    return np.sort(rng.choice(n_train, size=context_size, replace=False)).astype(np.int64)
+    permuted = rng.permutation(n_train)
+    if n_train >= max_rows:
+        permuted = permuted[:max_rows]
+
+    windows = np.array_split(permuted, context_ensembles)
+    window = windows[context_index]
+    if len(window) > effective_context_size:
+        window = window[:effective_context_size]
+    return window.astype(np.int64)
+
+
+def resolve_deepset_feature_cap(model, feature_cap=BENCHMARK_DEEPSET_FEATURE_CAP):
+    """Resolve the DeepSet feature cap, defaulting to checkpoint cfg.d_phi."""
+    if feature_cap not in (None, ""):
+        cap = int(feature_cap)
+    else:
+        cfg = getattr(model, "cfg", None)
+        cap = int(getattr(cfg, "d_phi", default_model_config().d_phi))
+    if cap <= 0:
+        raise ValueError("BENCHMARK_DEEPSET_FEATURE_CAP must be positive.")
+    return cap
+
+
+def select_deepset_features_train_only(
+    X_train_p,
+    y_train,
+    X_test_p,
+    feature_cap,
+    feature_selector=BENCHMARK_DEEPSET_FEATURE_SELECTOR,
+):
+    """
+    Apply the DeepSet-only train-fit feature cap to processed matrices.
+
+    Selection is fit once per dataset seed using only X_train_p and y_train.
+    Baseline and AutoGluon callers should continue using the original matrices.
+    """
+    if feature_selector != "train_f_regression":
+        raise ValueError(
+            "Unsupported BENCHMARK_DEEPSET_FEATURE_SELECTOR "
+            f"{feature_selector!r}; expected 'train_f_regression'."
+        )
+
+    processed_features = int(X_train_p.shape[1])
+    feature_cap = int(feature_cap)
+    selected_features = min(processed_features, feature_cap)
+    metadata = {
+        "processed_features": processed_features,
+        "selected_features": selected_features,
+        "feature_selector": feature_selector,
+        "feature_cap": feature_cap,
+    }
+
+    if processed_features <= feature_cap:
+        return X_train_p, X_test_p, metadata
+
+    f_stats, _ = f_regression(X_train_p, y_train)
+    scores = np.asarray(f_stats, dtype=np.float64)
+    scores[~np.isfinite(scores)] = -np.inf
+    column_indices = np.arange(processed_features)
+    selected_by_rank = np.lexsort((column_indices, -scores))[:feature_cap]
+    selected_columns = np.sort(selected_by_rank)
+    return X_train_p[:, selected_columns], X_test_p[:, selected_columns], metadata
+
+
+def dense_matrix_bytes(*arrays):
+    """Return dense in-memory bytes for numpy-like arrays."""
+    total = 0
+    for arr in arrays:
+        total += int(getattr(arr, "nbytes", np.asarray(arr).nbytes))
+    return total
+
+
+def cpu_matrix_skip_reason(processed_features, matrix_bytes):
+    if int(processed_features) > BENCHMARK_CPU_MAX_PROCESSED_FEATURES:
+        return (
+            f"processed_features={int(processed_features)} exceeds "
+            f"BENCHMARK_CPU_MAX_PROCESSED_FEATURES={BENCHMARK_CPU_MAX_PROCESSED_FEATURES}"
+        )
+    if int(matrix_bytes) > BENCHMARK_CPU_MAX_MATRIX_BYTES:
+        return (
+            f"processed_matrix_bytes={int(matrix_bytes)} exceeds "
+            f"BENCHMARK_CPU_MAX_MATRIX_BYTES={BENCHMARK_CPU_MAX_MATRIX_BYTES}"
+        )
+    return None
+
+
+def tmp_free_space_skip_reason(tmp_dir="/tmp"):
+    check_dir = tmp_dir if os.path.exists(tmp_dir) else tempfile.gettempdir()
+    free_bytes = shutil.disk_usage(check_dir).free
+    if int(free_bytes) < BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES:
+        return (
+            f"{check_dir} free_bytes={int(free_bytes)} below "
+            "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES="
+            f"{BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES}"
+        )
+    return None
+
+
+def skipped_benchmark_row(nan_row, method, skip_reason, **extra):
+    return {
+        **nan_row,
+        "method": method,
+        "skip_reason": skip_reason,
+        **extra,
+    }
 
 
 def deepset_inference_device():
@@ -779,8 +1093,92 @@ def deepset_inference_device():
         )
         return device
 
+    if BENCHMARK_REQUIRE_CUDA:
+        raise RuntimeError(
+            "BENCHMARK_REQUIRE_CUDA=true but CUDA is unavailable for DeepSet benchmark inference."
+        )
     print("DeepSet benchmark inference device: cpu (CUDA unavailable)", flush=True)
     return torch.device("cpu")
+
+
+def estimate_deepset_gpu_inference_bytes(
+    n_train_rows,
+    n_test_rows,
+    n_features,
+    context_size=None,
+    test_batch_size=None,
+    safety_factor=None,
+):
+    """Estimate peak explicit GPU tensors for one streamed DeepSet context."""
+    context_size = BENCHMARK_DEEPSET_CONTEXT_SIZE if context_size is None else context_size
+    test_batch_size = BENCHMARK_DEEPSET_TEST_BATCH_SIZE if test_batch_size is None else test_batch_size
+    safety_factor = (
+        BENCHMARK_DEEPSET_GPU_MEMORY_SAFETY_FACTOR
+        if safety_factor is None
+        else safety_factor
+    )
+    effective_context_rows = min(int(n_train_rows), int(context_size), 200)
+    effective_test_batch_rows = min(int(n_test_rows), int(test_batch_size))
+    n_features = int(n_features)
+    float32_bytes = 4
+    tensor_elements = (
+        effective_context_rows * n_features
+        + effective_context_rows
+        + effective_test_batch_rows * n_features
+        + (2 * effective_test_batch_rows)
+    )
+    return int(math.ceil(tensor_elements * float32_bytes * float(safety_factor)))
+
+
+def _cuda_free_bytes(device):
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    except TypeError:
+        free_bytes, _ = torch.cuda.mem_get_info()
+    return int(free_bytes)
+
+
+def deepset_gpu_memory_skip_reason(
+    X_train_np,
+    X_test_np,
+    device,
+    max_inference_bytes=None,
+    max_memory_fraction=None,
+):
+    if device is None or getattr(device, "type", str(device)) != "cuda":
+        return None, None
+
+    max_inference_bytes = (
+        BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES
+        if max_inference_bytes is None
+        else max_inference_bytes
+    )
+    max_memory_fraction = (
+        BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION
+        if max_memory_fraction is None
+        else max_memory_fraction
+    )
+    estimate = estimate_deepset_gpu_inference_bytes(
+        n_train_rows=X_train_np.shape[0],
+        n_test_rows=X_test_np.shape[0],
+        n_features=X_train_np.shape[1],
+    )
+    if int(max_inference_bytes) > 0 and estimate > int(max_inference_bytes):
+        return (
+            f"estimated_gpu_inference_bytes={estimate} exceeds "
+            "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES="
+            f"{int(max_inference_bytes)}"
+        ), estimate
+
+    free_budget = int(_cuda_free_bytes(device) * float(max_memory_fraction))
+    if estimate > free_budget:
+        return (
+            f"estimated_gpu_inference_bytes={estimate} exceeds available CUDA "
+            "memory budget "
+            f"{free_budget} (BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION="
+            f"{float(max_memory_fraction)})"
+        ), estimate
+    return None, estimate
 
 
 def predict_deepset_mc_streamed(
@@ -830,6 +1228,7 @@ def predict_deepset_bounded_context_ensemble(
     y_train_np,
     X_test_np,
     seed,
+    dataset_identity="benchmark",
     K=32,
     context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
     context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
@@ -849,7 +1248,12 @@ def predict_deepset_bounded_context_ensemble(
     context_preds = []
     for context_index in range(int(context_ensembles)):
         idx = select_deepset_context_indices(
-            X_train_np.shape[0], context_size, seed, context_index
+            X_train_np.shape[0],
+            context_size,
+            seed,
+            context_index,
+            dataset_identity=dataset_identity,
+            context_ensembles=context_ensembles,
         )
         if len(idx) > context_size:
             raise AssertionError("DeepSet context exceeded configured context size.")
@@ -991,7 +1395,9 @@ def predict_autogluon(X_train_np, y_train_np, X_test_np):
         from autogluon.tabular import TabularPredictor
     except ImportError as exc:
         raise RuntimeError(
-            "AutoGluon is not available. Install autogluon.tabular[all]==1.0.0."
+            "AutoGluon is not available in AUTOGLUON_RUNTIME_ENVIRONMENT. "
+            "Use autogluon.tabular[all]==1.0.0 or the validated compatible "
+            "AutoGluon package set for this runtime image."
         ) from exc
 
     feature_cols = [f"f{i}" for i in range(X_train_np.shape[1])]
@@ -1144,9 +1550,11 @@ def aggregate_benchmark_results(detailed_df):
 
             rank_mat = rank_methods(mat, higher_is_better=hib[metric])
             for i, method in enumerate(methods):
-                rep_rank_means[metric][method].append(
-                    float(np.nanmean(rank_mat[i, :]))
-                )
+                method_ranks = rank_mat[i, :]
+                if np.isnan(method_ranks).all():
+                    rep_rank_means[metric][method].append(float("nan"))
+                else:
+                    rep_rank_means[metric][method].append(float(np.nanmean(method_ranks)))
 
     rank_rows = []
     for method in methods:
@@ -1459,6 +1867,11 @@ def run_prepared_benchmark(
 
     Returns (detailed_df, rank_summary_df, metric_summary_df).
     """
+    selected_methods = methods or ALL_BENCHMARK_METHODS
+    validate_benchmark_dependencies(selected_methods)
+    if "DeepSetModel-MC" in selected_methods and model is None:
+        raise ValueError("DeepSetModel-MC benchmark requires a loaded model.")
+
     manifest = load_prepared_benchmark_manifest(manifest_stage_path)
     datasets_meta = manifest["datasets"]
     manifest_dataset_count = len(datasets_meta)
@@ -1503,12 +1916,6 @@ def run_prepared_benchmark(
         flush=True,
     )
 
-    selected_methods = methods or ALL_BENCHMARK_METHODS
-    unknown_methods = sorted(set(selected_methods) - set(ALL_BENCHMARK_METHODS))
-    if unknown_methods:
-        raise ValueError(f"Unknown benchmark method(s): {unknown_methods}")
-    if "DeepSetModel-MC" in selected_methods and model is None:
-        raise ValueError("DeepSetModel-MC benchmark requires a loaded model.")
     deepset_device = (
         deepset_inference_device()
         if "DeepSetModel-MC" in selected_methods
@@ -1531,6 +1938,7 @@ def run_prepared_benchmark(
                 rng = np.random.default_rng(seed)
                 print(f"  seed={seed}", flush=True)
                 X_seed, y_seed = X, y
+                raw_features = int(X_seed.shape[1])
 
                 # Subsample
                 if X_seed.shape[0] > MAX_SAMPLES:
@@ -1551,43 +1959,159 @@ def run_prepared_benchmark(
 
                 nan_row = {"task_id": task_id, "name": name, "rep": seed, "source": source,
                            "mse": float("nan"), "rmse": float("nan"), "r2": float("nan")}
+                processed_features = int(X_train_p.shape[1])
+                processed_matrix_bytes = dense_matrix_bytes(X_train_p, X_test_p)
+                cpu_skip_reason = cpu_matrix_skip_reason(
+                    processed_features,
+                    processed_matrix_bytes,
+                )
 
                 if "DeepSetModel-MC" in selected_methods:
-                    try:
-                        preds = predict_deepset_bounded_context_ensemble(
-                            model,
-                            X_train_p,
-                            y_train,
-                            X_test_p,
-                            seed=seed,
-                            K=mc_K,
-                            context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
-                            context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
-                            test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
-                            device=deepset_device,
+                    feature_cap = resolve_deepset_feature_cap(model)
+                    deepset_feature_meta = {
+                        "raw_features": raw_features,
+                        "processed_features": processed_features,
+                        "selected_features": min(processed_features, feature_cap),
+                        "feature_selector": BENCHMARK_DEEPSET_FEATURE_SELECTOR,
+                        "feature_cap": feature_cap,
+                        "processed_matrix_bytes": processed_matrix_bytes,
+                    }
+                    if cpu_skip_reason:
+                        print(
+                            f"  [SKIP DeepSetModel-MC] {name}: {cpu_skip_reason}",
+                            flush=True,
                         )
-                        m     = compute_metrics(y_test, preds)
-                        all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                          "source": source, "method": "DeepSetModel-MC", **m})
-                    except Exception as exc:
-                        print(f"  [FAIL DeepSetModel-MC] {name}: {exc}")
-                        all_rows.append({**nan_row, "method": "DeepSetModel-MC"})
+                        all_rows.append(skipped_benchmark_row(
+                            nan_row,
+                            "DeepSetModel-MC",
+                            cpu_skip_reason,
+                            **deepset_feature_meta,
+                        ))
+                    elif int(X_train_p.shape[0]) < int(BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES):
+                        print(
+                            f"  [FAIL DeepSetModel-MC] {name}: fewer train rows than "
+                            "non-overlapping DeepSet contexts",
+                            flush=True,
+                        )
+                        all_rows.append({
+                            **nan_row,
+                            "method": "DeepSetModel-MC",
+                            **deepset_feature_meta,
+                        })
+                    else:
+                        try:
+                            X_train_deepset, X_test_deepset, selected_feature_meta = (
+                                select_deepset_features_train_only(
+                                    X_train_p,
+                                    y_train,
+                                    X_test_p,
+                                    feature_cap,
+                                    BENCHMARK_DEEPSET_FEATURE_SELECTOR,
+                                )
+                            )
+                            deepset_feature_meta.update(selected_feature_meta)
+                            deepset_feature_meta["raw_features"] = raw_features
+
+                            dataset_identity = f"{source}:{task_id}:{name}"
+                            gpu_skip_reason, estimated_gpu_bytes = deepset_gpu_memory_skip_reason(
+                                X_train_deepset,
+                                X_test_deepset,
+                                deepset_device,
+                            )
+                            if estimated_gpu_bytes is not None:
+                                deepset_feature_meta["estimated_gpu_inference_bytes"] = estimated_gpu_bytes
+                            if gpu_skip_reason:
+                                print(
+                                    f"  [SKIP DeepSetModel-MC] {name}: {gpu_skip_reason}",
+                                    flush=True,
+                                )
+                                all_rows.append(skipped_benchmark_row(
+                                    nan_row,
+                                    "DeepSetModel-MC",
+                                    gpu_skip_reason,
+                                    **deepset_feature_meta,
+                                ))
+                            else:
+                                preds = predict_deepset_bounded_context_ensemble(
+                                    model,
+                                    X_train_deepset,
+                                    y_train,
+                                    X_test_deepset,
+                                    seed=seed,
+                                    dataset_identity=dataset_identity,
+                                    K=mc_K,
+                                    context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
+                                    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+                                    test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
+                                    device=deepset_device,
+                                )
+                                m     = compute_metrics(y_test, preds)
+                                all_rows.append({"task_id": task_id, "name": name, "rep": seed,
+                                                  "source": source, "method": "DeepSetModel-MC",
+                                                  **m, **deepset_feature_meta})
+                        except torch.cuda.OutOfMemoryError as exc:
+                            if BENCHMARK_DEEPSET_EMPTY_CACHE and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            print(f"  [SKIP DeepSetModel-MC] {name}: cuda_oom: {exc}", flush=True)
+                            all_rows.append(skipped_benchmark_row(
+                                nan_row,
+                                "DeepSetModel-MC",
+                                "cuda_oom",
+                                **deepset_feature_meta,
+                            ))
+                        except Exception as exc:
+                            print(f"  [FAIL DeepSetModel-MC] {name}: {exc}")
+                            all_rows.append({
+                                **nan_row,
+                                "method": "DeepSetModel-MC",
+                                **deepset_feature_meta,
+                            })
 
                 # Baselines
-                for bl_name, bl_model in get_baselines(seed).items():
-                    if bl_name not in selected_methods:
-                        continue
-                    try:
-                        bl_model.fit(X_train_p, y_train)
-                        preds_bl = bl_model.predict(X_test_p)
-                        m = compute_metrics(y_test, preds_bl)
-                        all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                         "source": source, "method": bl_name, **m})
-                    except Exception as exc:
-                        print(f"  [FAIL {bl_name}] {name}: {exc}")
-                        all_rows.append({**nan_row, "method": bl_name})
+                selected_baselines = [
+                    method for method in CPU_BASELINE_METHODS
+                    if method in selected_methods
+                ]
+                if selected_baselines and cpu_skip_reason:
+                    print(
+                        f"  [SKIP CPU baselines] {name}: {cpu_skip_reason}",
+                        flush=True,
+                    )
+                    for bl_name in selected_baselines:
+                        all_rows.append(skipped_benchmark_row(
+                            nan_row,
+                            bl_name,
+                            cpu_skip_reason,
+                            processed_features=processed_features,
+                            processed_matrix_bytes=processed_matrix_bytes,
+                        ))
+                elif selected_baselines:
+                    for bl_name, bl_model in get_baselines(seed, selected_baselines).items():
+                        try:
+                            bl_model.fit(X_train_p, y_train)
+                            preds_bl = bl_model.predict(X_test_p)
+                            m = compute_metrics(y_test, preds_bl)
+                            all_rows.append({"task_id": task_id, "name": name, "rep": seed,
+                                             "source": source, "method": bl_name, **m})
+                        except Exception as exc:
+                            print(f"  [FAIL {bl_name}] {name}: {exc}")
+                            all_rows.append({**nan_row, "method": bl_name})
 
                 if "AutoGluon" in selected_methods:
+                    autogluon_skip_reason = cpu_skip_reason or tmp_free_space_skip_reason("/tmp")
+                    if autogluon_skip_reason:
+                        print(
+                            f"  [SKIP AutoGluon] {name}: {autogluon_skip_reason}",
+                            flush=True,
+                        )
+                        all_rows.append(skipped_benchmark_row(
+                            nan_row,
+                            "AutoGluon",
+                            autogluon_skip_reason,
+                            processed_features=processed_features,
+                            processed_matrix_bytes=processed_matrix_bytes,
+                        ))
+                        continue
                     try:
                         preds_ag = predict_autogluon(X_train_p, y_train, X_test_p)
                         m = compute_metrics(y_test, preds_ag)
@@ -1873,6 +2397,8 @@ def main():
 
         selected_methods = parse_benchmark_methods(args.benchmark_method, args.benchmark_methods)
         explicit_method_selection = bool(args.benchmark_method or args.benchmark_methods)
+        if args.mode in ("full", "benchmark"):
+            validate_benchmark_dependencies(selected_methods)
 
         needs_model = (
             args.mode in ("full", "synthetic")
@@ -1926,12 +2452,6 @@ def main():
 
         if args.mode == "synthetic":
             return
-
-        if not BENCHMARK_DEPS_AVAILABLE:
-            raise RuntimeError(
-                "Benchmark dependencies are not available. Install: "
-                "scikit-learn xgboost lightgbm catboost pandas scipy"
-            )
 
         detailed_df, rank_summary_df, metric_summary_df = run_prepared_benchmark(
             model,
