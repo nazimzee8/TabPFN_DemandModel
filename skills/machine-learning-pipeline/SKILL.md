@@ -12,9 +12,11 @@ Use this skill to explain the research workflow implemented in this repo for tra
 Ground every explanation in the current code:
 - `generate_dgp.py` generates many single-task parquet files under `data/train`, `data/val`, and `data/test`.
 - `train.py` trains a `DeepSetModel` over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
-- `hpo.py` materializes the staged train/val parquet splits, scans only `p` and
-  `n_train` metadata, then runs cardinality-aware RandomSearch over DeepSet
-  dimensions and optimizer settings.
+- `hpo.py` selects a deterministic 200 train / 40 validation subset from
+  `META_DATASET_INDEX`, runs a Ray worker Snowpark/session/stage preflight,
+  materializes only those staged parquet payloads, and tunes only `lr`,
+  `weight_decay`, and `dropout` with fixed architecture
+  `d_phi=128`, `d_rho=256`, `pool="pna"`.
 - `evaluate.py` loads only `best.pt` from `@MODEL_STAGE/checkpoints/`, runs permutation checks, writes synthetic reports under `results/synthetic/`, writes per-method benchmark files under `results/benchmark_parts/`, aggregates `results/model_comparison.csv`, and uploads evaluation CSVs to `@EVALUATION_RESULTS_STAGE/` when running inside SPCS.
 
 ## Explain The Data Layout
@@ -28,9 +30,11 @@ State the generation contract from `generate_dgp.py`:
 - With `--n_datasets 1000`, the script writes 800 training tasks, 100 validation tasks, and 100 test tasks.
 
 When describing Snowflake execution, note that these parquet files are uploaded to
-`@META_DATASET_STAGE` and are explicitly materialized by MLJobs into ephemeral
-container-local `DATA_DIR` (default `/tmp/data`). Do not describe local workstation
-downloads of `@META_DATASET_STAGE`.
+`@META_DATASET_STAGE`, indexed in `META_DATASET_INDEX`, and explicitly materialized
+by MLJobs into ephemeral container-local `DATA_DIR` (default `/tmp/data`). HPO,
+production training, and epoch calibration all choose files through
+`META_DATASET_INDEX`; staged parquet remains the payload storage. Do not describe
+local workstation downloads of `@META_DATASET_STAGE`.
 
 ## Explain The SPCS Execution Flow
 
@@ -41,8 +45,10 @@ Use this flow when summarizing the end-to-end pipeline:
 3. Upload Python scripts (`*.py`) to `@MODEL_STAGE/scripts/` via SnowSQL `PUT`.
 4. Create and call the `run_training_pipeline()` Snowpark stored procedure (step 4 in
    `run_training_job.sql`). The procedure imports `run_training_job.py` from the stage
-   and submits HPO plus training MLJobs. HPO writes `@MODEL_STAGE/hpo/best_config.json`;
-   training consumes that JSON through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
+   and submits **three** sequential MLJobs:
+   - **Phase 1 (Pretrain)**: `train.py` with `CHECKPOINT_OUTPUT_NAME=pretrain.pt` and no `BEST_CONFIG`. Trains with default hyperparameters; writes `@MODEL_STAGE/checkpoints/pretrain.pt`.
+   - **Phase 2 (HPO)**: `hpo.py` with no explicit checkpoint env var. HPO requires `@MODEL_STAGE/checkpoints/pretrain.pt`, runs a Ray worker Snowpark/session/stage preflight before trials, and warm-starts every trial from the checkpoint. Writes `@MODEL_STAGE/hpo/best_config.json`.
+   - **Phase 3 (Final training)**: `train.py` with `BEST_CONFIG` from Phase 2 and `PRETRAIN_CHECKPOINT_PATH=@MODEL_STAGE/checkpoints/pretrain.pt`. Fine-tunes the pre-trained model with the best hyperparameters; writes `@MODEL_STAGE/checkpoints/best.pt`.
 
 5. Verify `@MODEL_STAGE/checkpoints/best.pt`, then call `run_evaluation_pipeline()`.
    Evaluation must not depend on `best_config.json`; `best.pt` is the handoff contract.
@@ -71,6 +77,9 @@ When documenting or patching Snowflake execution, include these runtime constrai
 - Validation must not use padded `DistributedSampler` rows. Shard validation with a no-padding rank slice, reduce global `(sum_loss, total_count)`, and compute weighted validation MSE from those reduced totals.
 - Snowflake MLJobs explicitly materialize staged parquet into container-local
   `/tmp/data`; `stage_name` is the payload stage, not a dataset mount.
+- Snowflake HPO, production training, and epoch calibration must materialize
+  through `META_DATASET_INDEX`. If an active Snowflake session exists, missing,
+  empty, incomplete, or insufficient index rows are fatal startup errors.
 - `submit_from_stage(source=...)` points at `@MODEL_STAGE/scripts/`, but `stage_name` is the bare MLJob payload stage name `MLJOB_PAYLOAD_STAGE`, not `@MODEL_STAGE`.
 - Snowflake compute pools cannot use `MIN_NODES = 0`; set CPU pools to `MIN_NODES = 1` and use `AUTO_SUSPEND_SECS` and/or `INITIALLY_SUSPENDED` for cost control.
 - Kaggle benchmark `.npz` files persist in `@META_DATASET_STAGE/kaggle/`.
@@ -100,9 +109,10 @@ Describe `train.py` as training across many tasks, not rows from one dataset.
 
 Call out these implementation details:
 - `DATA_DIR` defaults to `/tmp/data`.
-- Training materializes `@META_DATASET_STAGE/train/` and `@META_DATASET_STAGE/val/`
-  into `/tmp/data`, then reads every parquet file in `/tmp/data/train`; validation
-  reads every parquet file in `/tmp/data/val`.
+- Training selects every `train` and `val` row from `META_DATASET_INDEX`, ordered
+  by `split, task_id`, materializes those `stage_path` payloads into `/tmp/data`,
+  then reads every selected parquet file in `/tmp/data/train`; validation reads
+  every selected parquet file in `/tmp/data/val`.
 - Each parquet file is treated as one meta-dataset.
 - For each task, the model consumes `(X_train, y_train, X_test)` — all m test rows are passed in a single batched forward call. The model returns a vector of m scalar predictions.
 - The per-task loss is the mean squared error between the batched prediction vector and `betaX_test` across that task's m test rows.
@@ -117,45 +127,80 @@ When explaining the learned artifact, describe `best.pt` as the serialized state
 
 ### HPO Design
 
-Describe `hpo.py` as cardinality-aware RandomSearch, not as a fixed dimension
-grid that is always valid.
+Describe `hpo.py` as mandatory warm-start RandomSearch over optimizer/dropout
+parameters with a fixed architecture, not as a six-parameter architecture sweep.
 
 Call out these implementation details:
-- HPO materializes only the train and validation splits from `@META_DATASET_STAGE`
-  into container-local `DATA_DIR`; it does not inspect held-out test metadata
-  during model selection.
-- Before constructing the `Tuner` search space, HPO reads only the scalar parquet
-  columns `p` and `n_train` from train/val task files.
+- HPO uses a table-backed pruning layer over staged parquet payloads. It should
+  select train/validation candidates from `META_DATASET_INDEX`, then materialize
+  only the selected parquet files into container-local `DATA_DIR`.
+- The default HPO search subset is deterministic and balanced: 200 train tasks
+  and 40 validation tasks. Full production training still uses the full train
+  and validation splits.
+- The deterministic HPO subset ranks rows within `(split, hpo_bucket)` by
+  `prior_regime, p, n_train, task_id`, then selects each split by
+  `bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id`.
+- Before launching trials, HPO must run a Ray worker Snowpark/session preflight:
+  each Ray node calls `Session.builder.getOrCreate()`, verifies `SELECT 1`,
+  verifies `LIST @META_DATASET_STAGE`, and downloads one selected HPO parquet to
+  `/tmp`. Failures here are startup failures in Snowpark/session/stage access,
+  not GPU capacity failures.
+- Avoid per-trial full downloads or scans of `@META_DATASET_STAGE`; each trial
+  materializes only the selected HPO subset from `META_DATASET_INDEX`.
+- Before constructing the Ray Tune search space, HPO reads the scalar metadata
+  needed for cardinality bounds, including `p`, `n_train`, `prior_regime`,
+  `split`, and `hpo_bucket`.
 - It computes observed `max(p)` and `max(n_train)` across train/val tasks.
-- `d_phi` candidates are selected from `[64, 128, 256, 512]`, lower-bounded by
-  observed `max(p)`, and kept divisible by `N_HEADS`.
-- `d_rho` candidates are selected from `[128, 256, 512, 1024]`, lower-bounded by
-  observed `max(n_train)`, and kept divisible by `N_HEADS`.
+- HPO fixes `d_phi=128`, `d_rho=256`, and `pool="pna"` for every trial.
+- HPO tunes only `lr`, `weight_decay`, and `dropout`.
 - HPO fails before launching trials if staged train/val metadata is missing,
-  non-positive, or if no candidate dimension satisfies the observed cardinality.
-- `best_config.json` still records the selected `d_phi` and `d_rho` and is
-  uploaded to `@MODEL_STAGE/hpo/` with `auto_compress=False`.
+  non-positive, if `@MODEL_STAGE/checkpoints/pretrain.pt` is absent, or if
+  selected rows exceed `max(p) > 128` or `max(n_train) > 256`.
+- Snowflake ML `TunerConfig.max_concurrent_trials` is per node. The current HPO
+  topology uses `GPU_NV_M` nodes, which have two A10G GPUs per node.
+- GPU trials must set `resource_per_trial={"GPU": 1}`. Do not omit this to
+  increase apparent concurrency; Snowflake Tuner does not allocate GPUs to trials
+  automatically.
+- Do not recommend `scale_cluster()` for MLJob HPO. SPCS MLJob services cannot be
+  dynamically re-scaled after submission; set HPO cluster size when submitting
+  the MLJob.
+- Default HPO parallelism is 20 concurrent trials: submit the HPO MLJob with
+  `target_instances=5` and Ray Tune `resources_per_trial={"gpu": 1}`.
+- `best_config.json` records tuned `lr`, `weight_decay`, and `dropout` plus the
+  fixed `d_phi=128`, `d_rho=256`, and `pool="pna"` and is uploaded to
+  `@MODEL_STAGE/hpo/` with `auto_compress=False`.
+- HPO warm-starts every trial from `@MODEL_STAGE/checkpoints/pretrain.pt`.
+  Missing checkpoint, failed download, or checkpoint architecture mismatch is a
+  hard failure; do not fall back to random init.
+- Each Ray worker downloads `pretrain.pt` independently to a rank-local `/tmp` directory (no shared filesystem across nodes).
+- The pretrain checkpoint is not used as an optimizer warm-start; only `state_dict` is loaded. Each trial's optimizer initializes from scratch.
 
 ### Performance Design
 
-The intended training configuration is distributed GPU utilization across 4 nodes:
+HPO and full training use different parallelism semantics:
+- **HPO (`tune.run()`)** warm-starts every trial from `pretrain.pt`; 30-epoch fine-tuning evaluates the marginal improvement of each optimizer/dropout config on top of the base model.
+- **Full training (`PyTorchDistributor`)** uses distributed data parallel training
+  on the full train/validation splits after HPO writes `best_config.json`.
 
-- **`GPU_NV_S` / `DEEPSET_GPU_POOL` (4 nodes)** — 1× A10G per node and may exceed the earlier $5/hr target.
-- **`PyTorchDistributor`** with `num_nodes=4, num_workers_per_node=1` — handles Ray
+The intended training configuration is distributed GPU utilization across 10 nodes:
+
+- **`GPU_NV_M` / `DEEPSET_GPU_POOL` (10 training nodes, 5 HPO nodes)** - 4x A10G
+  per node and may exceed the earlier $5/hr target.
+- **`PyTorchDistributor`** with `num_nodes=10, num_workers_per_node=4` — handles Ray
   cluster setup, DDP process group initialization, and result collection automatically.
 - **`DistributedDataParallel` wrapping** is required so gradients synchronize across workers.
-- **DDP split accounting** requires 800 training tasks / 4 ranks = 200 backward
+- **DDP split accounting** requires 800 training tasks / 40 ranks = 20 backward
   steps per rank. Future train split sizes must be audited for divisibility by
   `world_size`; do not let train samplers pad duplicate tasks.
 - **No-padding validation sharding** partitions the current 100 validation tasks across
-  4 ranks exactly enough for evaluation, then reduces `(sum_loss, total_count)` so
+  40 ranks (most ranks get 2–3 tasks), then reduces `(sum_loss, total_count)` so
   the early-stop metric is an exact global weighted MSE.
-- **`DistributedSampler`** partitions 800 training tasks across 4 GPU processes
-  (~200 tasks/GPU/epoch); `set_epoch()` called each epoch for correct shuffling.
+- **`DistributedSampler`** partitions 800 training tasks across 40 GPU processes
+  (~20 tasks/GPU/epoch); `set_epoch()` called each epoch for correct shuffling.
 - **Validation reduction** uses a no-padding rank slice and all-reduces
   `(sum_loss, total_count)` before computing exact weighted global MSE;
   `dist.broadcast(stop, src=0)` propagates the stop signal.
-- **`num_workers=4`** per process (GPU_NV_S has ~12 vCPUs; 4 workers leaves headroom for
+- **`num_workers=4`** per process (GPU_NV_M has enough vCPU headroom for
   the main training process).
 - **Batched forward pass** — all m test rows are passed to the model in a single call; do
   not describe or implement row-by-row forward iteration.
@@ -170,8 +215,8 @@ When discussing the model architecture, note:
 - `d_rho` (default 256) must be >= n_train (training-set size) for the sample-level
   aggregation to be expressive enough to distinguish all training contexts.
 - HPO enforces these expressivity constraints by scanning staged train/val
-  metadata and lower-bounding the searched `d_phi` and `d_rho` candidates by
-  observed `max(p)` and `max(n_train)`.
+  metadata and failing before trials unless observed `max(p) <= 128` and
+  `max(n_train) <= 256`.
 - **SAB (Self-Attention Block)** from Set Transformer replaces the simple linear
   equivariance layer. At the feature level, features within each sample attend to
   each other before feature pooling. At the sample level, training samples attend
@@ -238,11 +283,14 @@ Include these caveats when discussing the current evaluation:
 ## Preferred Phrasing
 
 Prefer wording like:
+- "The pipeline has three phases: pre-training with default hyperparameters writes `pretrain.pt`; HPO fine-tunes from `pretrain.pt` to find the best config; final training fine-tunes from `pretrain.pt` with `best_config.json` to produce `best.pt`."
+- "`CHECKPOINT_OUTPUT_NAME=pretrain.pt` in Phase 1 and `CHECKPOINT_OUTPUT_NAME=best.pt` (default) in Phase 3 distinguish the two `train.py` invocations."
+- "HPO warm-start is mandatory: every trial loads `@MODEL_STAGE/checkpoints/pretrain.pt`, and missing, inaccessible, or architecture-mismatched checkpoints fail the run."
 - "DeepSet is trained over many synthetic regression tasks stored as parquet meta-datasets."
 - "`run_training_pipeline()` submits only HPO and training; `run_evaluation_pipeline()` separately consumes `@MODEL_STAGE/checkpoints/best.pt` for synthetic evaluation and benchmarks."
 - "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
-- "HPO runs cardinality-aware RandomSearch: it scans staged train/val parquet metadata, lower-bounds `d_phi` by observed `max(p)` and `d_rho` by observed `max(n_train)`, then runs 40 trials (30 epochs each, 4 concurrent trials on 4 GPU nodes) before full training."
-- "The compute pool uses `DEEPSET_GPU_POOL` with `MAX_NODES = 4` for 4-node DDP training; this can exceed the earlier $5/hr budget cap."
+- "HPO runs RandomSearch over `lr`, `weight_decay`, and `dropout`: it selects a deterministic balanced subset from `META_DATASET_INDEX`, enforces `max(p) <= 128` and `max(n_train) <= 256`, then runs 20 trials (20 concurrent, 1 round on 5 GPU_NV_M nodes) using fixed `d_phi=128`, `d_rho=256`, and `pool='pna'`."
+- "The compute pool uses `DEEPSET_GPU_POOL` with `MAX_NODES = 10` for 5-node HPO and 10-node DDP training; this can exceed the earlier $5/hr budget cap."
 - "Generalization is assessed by comparing DeepSet test MSE against a fixed ridge-regression baseline on unseen datasets."
 - "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for DeepSet than for the baseline."
 - "All m test rows are passed to the model in a single batched forward call; the model returns a vector of m scalar predictions."
@@ -266,5 +314,8 @@ Avoid wording like:
 - Describing "best.pt" as a plain state dict — it now stores {"state_dict": ..., "cfg": ...}.
 - Describing training as single-GPU after this change.
 - Running `run_training_job.py` from the local machine or describing it as a locally-executed script — it runs as a Snowpark stored procedure handler inside Snowflake.
-- Citing `GPU_NV_M` or `GPU_NV_L` as the required pool.
+- Citing `GPU_NV_L` as required for the default runbook; current guidance uses
+  `GPU_NV_M` unless measured phase timings justify a topology change.
 - Referring to Docker or container image build/push commands — the pipeline uses the Snowflake Container Runtime; no custom image is built or maintained.
+- Describing HPO as always starting from random initialization after this change.
+- Describing `pretrain.pt` as an evaluation artifact — it is an intermediate training checkpoint consumed by HPO and final training, not by `evaluate.py`.

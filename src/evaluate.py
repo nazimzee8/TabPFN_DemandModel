@@ -5,16 +5,14 @@ Evaluate a saved DeepSetModel checkpoint:
   1. Permutation-invariance tests (7 synthetic)
   2. Synthetic DGP evaluation: DeepSetModel vs OLS, stratified by regime (A/B/C/D)
   3. MC dropout noise assessment on synthetic DGP
-  4. OpenML + Kaggle regression benchmark: DeepSetModel-MC vs 9 baselines
-     (28 OpenML + 2 Kaggle regression datasets, 10 reps, 90/10 split, ≤10k samples, ≤500 features, 95% CI)
-     Datasets: AutoML Benchmark (study ~271) + OpenML-CTR23 (study 353) + Kaggle TPS-S3 (s3e5, s3e9)
+  4. Prepared OpenML + Kaggle regression benchmark: DeepSetModel-MC vs 9 baselines
+     (prepared manifest datasets, 10 reps, 90/10 split, <=10k samples, <=500 features, 95% CI)
+     Datasets are prepared by prepare_benchmark_datasets.py before benchmark shards run.
      Methods: DeepSetModel-MC, XGBoost, LightGBM, CatBoost, RandomForest,
               KNN, LinearRegression, Ridge, SVR, MLP, AutoGluon
 
 Usage (inside container or locally):
     python evaluate.py --model_path best.pt --data_dir /tmp/data --results_dir results/
-    python evaluate.py --model_path best.pt --no_openml   # Kaggle only (fast smoke test)
-    python evaluate.py --model_path best.pt --no_kaggle   # OpenML only (28 datasets)
 
 Outputs (results_dir/):
     synthetic/test_report.csv              — synthetic DGP per-regime MSE
@@ -29,16 +27,18 @@ uses a 64/16/20 split with 15 seeds; this benchmark uses 90/10 with 10 seeds.
 
 import argparse
 import csv
+import gc
 import os
 import glob
 import shutil
 import tempfile
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 import pandas as pd
 from scipy import stats
 
@@ -53,7 +53,6 @@ os.environ.setdefault("HOME", "/tmp")
 # ---------------------------------------------------------------------------
 
 try:
-    import openml
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_squared_error, r2_score
     from sklearn.neighbors import KNeighborsRegressor
@@ -82,7 +81,9 @@ TRAIN_FRAC        = 0.9                      # 90/10 train/test split
 MAX_SAMPLES       = 10_000
 MAX_FEATURES      = 500
 N_MC_DROPOUT      = 32
-OPENML_N_DATASETS = 28                       # AutoML Benchmark + OpenML-CTR23
+BENCHMARK_DEEPSET_CONTEXT_SIZE = int(os.environ.get("BENCHMARK_DEEPSET_CONTEXT_SIZE", "200"))
+BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES = int(os.environ.get("BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES", "5"))
+BENCHMARK_DEEPSET_TEST_BATCH_SIZE = int(os.environ.get("BENCHMARK_DEEPSET_TEST_BATCH_SIZE", "128"))
 EVAL_RESULTS_STAGE = os.environ.get("EVAL_RESULTS_STAGE", "@EVALUATION_RESULTS_STAGE")
 CHECKPOINT_STAGE = os.environ.get("CHECKPOINT_STAGE", "@MODEL_STAGE/checkpoints/")
 ALL_BENCHMARK_METHODS = [
@@ -98,7 +99,38 @@ ALL_BENCHMARK_METHODS = [
     "MLP",
     "AutoGluon",
 ]
+
+
+def parse_benchmark_methods(benchmark_method=None, benchmark_methods=None):
+    """Resolve benchmark method env/CLI selection into an explicit method list."""
+    if benchmark_method and benchmark_methods:
+        raise ValueError(
+            "Set only one of BENCHMARK_METHOD or BENCHMARK_METHODS; "
+            "BENCHMARK_METHODS is a comma-separated list."
+        )
+    if benchmark_methods:
+        methods = [m.strip() for m in benchmark_methods.split(",") if m.strip()]
+        if not methods:
+            raise ValueError("BENCHMARK_METHODS was set but did not contain any method names.")
+        return methods
+    if benchmark_method:
+        return [benchmark_method]
+    return list(ALL_BENCHMARK_METHODS)
+
+
 AUTOGLUON_TIME_LIMIT = int(os.environ.get("AUTOGLUON_TIME_LIMIT", "300"))
+BENCHMARK_NUM_CPUS = int(os.environ.get("BENCHMARK_NUM_CPUS", "1"))
+BENCHMARK_PREPARED_STAGE = os.environ.get(
+    "BENCHMARK_PREPARED_STAGE", "@META_DATASET_STAGE/benchmark_prepared/"
+)
+BENCHMARK_MANIFEST_STAGE_PATH = os.environ.get(
+    "BENCHMARK_MANIFEST_PATH",
+    "@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json",
+)
+BENCHMARK_DATASET_INDEX_TABLE = os.environ.get(
+    "BENCHMARK_DATASET_INDEX_TABLE", "BENCHMARK_DATASET_INDEX"
+)
+BENCHMARK_SHARD_STRATEGY = os.environ.get("BENCHMARK_SHARD_STRATEGY", "modulo").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -142,27 +174,167 @@ def apply_samp_equiv(model, r):
 # Section A — Load model
 # ---------------------------------------------------------------------------
 
+def model_config_to_dict(cfg):
+    """
+    Convert ModelConfig into a plain dict safe for torch.load(weights_only=True).
+    Called when saving new checkpoints. ModelConfig is a dataclass.
+    """
+    import dataclasses
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    if dataclasses.is_dataclass(cfg) and not isinstance(cfg, type):
+        return dataclasses.asdict(cfg)
+    if hasattr(cfg, "__dict__"):
+        return dict(vars(cfg))
+    raise TypeError(f"Unsupported config type: {type(cfg)!r}")
+
+
+def model_config_from_payload(payload):
+    """
+    Convert a checkpoint cfg payload into a ModelConfig instance.
+    Accepts ModelConfig (legacy trusted load) or plain dict (new format).
+    """
+    if isinstance(payload, ModelConfig):
+        return payload
+    if isinstance(payload, dict):
+        import dataclasses
+        allowed = {f.name for f in dataclasses.fields(ModelConfig)}
+        unknown = set(payload.keys()) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unknown ModelConfig field(s) in checkpoint: {sorted(unknown)}"
+            )
+        return ModelConfig(**payload)
+    raise TypeError(
+        f"Unsupported checkpoint cfg payload type: {type(payload)!r}"
+    )
+
+
+def default_model_config():
+    """
+    Canonical default config for bare state-dict checkpoints (legacy format 0).
+    Matches the defaults used during the original training run.
+    """
+    return ModelConfig(
+        d_phi=128, d_rho=256, pool="pna", dropout=0.1,
+        n_sab_feat=0, n_sab_samp=0,
+        norm_feat=False, norm_target=False,
+    )
+
+
+def load_checkpoint_compat(model_path):
+    """
+    Load a DeepSet checkpoint in a PyTorch 2.6+ compatible way.
+
+    Strategy (in order):
+    1. torch.load(..., weights_only=True) — preferred; works for new format-v2 checkpoints.
+    2. safe_globals([ModelConfig]) + weights_only=True — for legacy checkpoints with pickled
+       ModelConfig. Still safe: only allowlists our own known class.
+    3. weights_only=False — only if ALLOW_UNSAFE_TORCH_LOAD=true env var is set.
+       Security warning is printed. Intended only for trusted internally generated artifacts.
+
+    Note: weights_only=False can execute arbitrary code from the checkpoint file.
+    Never use it with checkpoints from untrusted sources.
+    """
+    # Attempt 1: clean weights_only=True
+    try:
+        return torch.load(model_path, map_location="cpu", weights_only=True)
+    except TypeError as exc:
+        # PyTorch version does not support weights_only parameter at all
+        if "weights_only" not in str(exc):
+            raise
+        print(
+            "[WARNING] PyTorch version does not support weights_only; "
+            "falling back to legacy torch.load. Use only trusted checkpoints.",
+            flush=True,
+        )
+        return torch.load(model_path, map_location="cpu")
+    except Exception as exc:
+        msg = str(exc)
+        is_modelconfig_issue = (
+            "ModelConfig" in msg
+            or "Weights only load failed" in msg
+            or "Unsupported global" in msg
+            or "UnpicklingError" in msg
+        )
+        if not is_modelconfig_issue:
+            raise
+
+    # Attempt 2: allowlist ModelConfig via safe_globals (still weights_only=True)
+    print(
+        "[WARNING] Safe checkpoint load failed — legacy pickled ModelConfig detected. "
+        "Retrying with torch.serialization.safe_globals([ModelConfig]). "
+        "This is safe for internally generated checkpoints.",
+        flush=True,
+    )
+    try:
+        from torch.serialization import safe_globals
+        with safe_globals([ModelConfig]):
+            return torch.load(model_path, map_location="cpu", weights_only=True)
+    except Exception as safe_exc:
+        pass
+
+    # Attempt 3: weights_only=False — requires opt-in env var
+    allow_unsafe = (
+        os.environ.get("ALLOW_UNSAFE_TORCH_LOAD", "false").lower() == "true"
+    )
+    if not allow_unsafe:
+        raise RuntimeError(
+            f"Failed to load checkpoint {model_path!r} with weights_only=True even after "
+            "allowlisting ModelConfig. If this is a trusted internally generated checkpoint, "
+            "set ALLOW_UNSAFE_TORCH_LOAD=true as a temporary escape hatch. "
+            "Long-term fix: resave with cfg as a plain dict (checkpoint_format_version=2)."
+        )
+    print(
+        "[SECURITY WARNING] ALLOW_UNSAFE_TORCH_LOAD=true — loading checkpoint with "
+        "weights_only=False. Only do this for trusted internally generated checkpoints. "
+        "weights_only=False can execute arbitrary code embedded in the checkpoint file.",
+        flush=True,
+    )
+    return torch.load(model_path, map_location="cpu", weights_only=False)
+
+
 def load_model(model_path):
     if not os.path.exists(model_path):
         download_stage_prefix(CHECKPOINT_STAGE, os.path.dirname(model_path) or ".")
     if not os.path.exists(model_path):
         raise FileNotFoundError(
-            f"Checkpoint {model_path!r} does not exist after attempting Snowflake stage fetch "
-            f"from {CHECKPOINT_STAGE}."
+            f"Checkpoint {model_path!r} does not exist after attempting Snowflake stage "
+            f"fetch from {CHECKPOINT_STAGE}."
         )
-    ckpt = torch.load(model_path, map_location="cpu")
-    if isinstance(ckpt, dict) and "cfg" in ckpt:
-        cfg, state_dict = ckpt["cfg"], ckpt["state_dict"]
-    else:
-        # Legacy bare state_dict
-        cfg = ModelConfig(d_phi=128, d_rho=256, pool="pna", dropout=0.1,
-                          n_sab_feat=0, n_sab_samp=0,
-                          norm_feat=False, norm_target=False)
+
+    print(f"Loading checkpoint from {model_path}", flush=True)
+    ckpt = load_checkpoint_compat(model_path)
+
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        cfg_payload = ckpt.get("cfg")
+        if cfg_payload is None:
+            cfg = default_model_config()
+            fmt = "dict_with_state_dict_no_cfg"
+        else:
+            cfg = model_config_from_payload(cfg_payload)
+            fmt = (
+                f"format_v{ckpt['checkpoint_format_version']}"
+                if "checkpoint_format_version" in ckpt
+                else "legacy_dict_with_cfg"
+            )
+        state_dict = ckpt["state_dict"]
+    elif isinstance(ckpt, dict):
+        # Bare state dict — no "state_dict" key, just weight tensors
+        cfg = default_model_config()
         state_dict = ckpt
+        fmt = "bare_state_dict"
+    else:
+        raise TypeError(f"Unsupported checkpoint object type: {type(ckpt)!r}")
+
+    print(f"Checkpoint format: {fmt}", flush=True)
+    print(f"ModelConfig: {cfg}", flush=True)
+    print(f"State dict tensors: {len(state_dict)}", flush=True)
+
     model = DeepSetModel(cfg=cfg)
     model.load_state_dict(state_dict)
     model.eval()
-    print(f"Loaded model from {model_path}")
+    print(f"Loaded model from {model_path}", flush=True)
     return model
 
 
@@ -170,10 +342,13 @@ def load_model(model_path):
 # Section B — Evaluate on held-out synthetic DGP test split
 # ---------------------------------------------------------------------------
 
-def evaluate_synthetic_dgp(model, test_dir):
+def evaluate_synthetic_dgp(model, test_dir, rank=0, world_size=1,
+                            using_torch_distributed=False):
     """
     Predict and compute OLS baseline for every test Parquet file.
     Returns list of per-dataset dicts: model_mse, ols_mse, prior_regime, n, p.
+    In distributed mode, each rank processes a round-robin shard; rank 0 gathers
+    and returns all records; non-rank-0 workers return None.
     """
     files = sorted(
         os.path.join(test_dir, f)
@@ -182,6 +357,9 @@ def evaluate_synthetic_dgp(model, test_dir):
     )
     if not files:
         raise FileNotFoundError(f"No .parquet files found in {test_dir}")
+
+    if world_size > 1:
+        files = [f for i, f in enumerate(files) if i % world_size == rank]
 
     records = []
     model.eval()
@@ -211,6 +389,12 @@ def evaluate_synthetic_dgp(model, test_dir):
                 "ols_mse":      ols_mse,
             })
 
+    if using_torch_distributed and world_size > 1:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, records)
+        if rank != 0:
+            return None
+        records = [r for chunk in gathered for r in chunk]
     return records
 
 
@@ -304,8 +488,12 @@ def mc_dropout_inference(model, X_train, y_train, X_test, K=32):
     return stack.mean(0), stack.std(0)
 
 
-def evaluate_synthetic_dgp_mc(model, test_dir, K=32):
-    """Like evaluate_synthetic_dgp but adds mc_mse and mc_std_mean columns."""
+def evaluate_synthetic_dgp_mc(model, test_dir, K=32, rank=0, world_size=1,
+                               using_torch_distributed=False):
+    """Like evaluate_synthetic_dgp but adds mc_mse and mc_std_mean columns.
+    In distributed mode, each rank processes a round-robin shard; rank 0 gathers
+    and returns all records; non-rank-0 workers return None.
+    """
     files = sorted(
         os.path.join(test_dir, f)
         for f in os.listdir(test_dir)
@@ -313,6 +501,9 @@ def evaluate_synthetic_dgp_mc(model, test_dir, K=32):
     )
     if not files:
         raise FileNotFoundError(f"No .parquet files found in {test_dir}")
+
+    if world_size > 1:
+        files = [f for i, f in enumerate(files) if i % world_size == rank]
 
     records = []
     for path in files:
@@ -349,6 +540,12 @@ def evaluate_synthetic_dgp_mc(model, test_dir, K=32):
             "ols_mse":      ols_mse,
         })
 
+    if using_torch_distributed and world_size > 1:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, records)
+        if rank != 0:
+            return None
+        records = [r for chunk in gathered for r in chunk]
     return records
 
 
@@ -551,6 +748,127 @@ def predict_deepset_mc(model, X_train_np, y_train_np, X_test_np, K=32):
     return mean_preds   # np.ndarray (m,)
 
 
+def select_deepset_context_indices(n_train, context_size, seed, context_index):
+    """
+    Deterministically select one bounded DeepSet context from processed train rows.
+    Rows are sampled without replacement from the already-split training set only.
+    """
+    n_train = int(n_train)
+    context_size = int(context_size)
+    if n_train <= 0:
+        raise ValueError("DeepSet context selection requires at least one training row.")
+    if context_size <= 0:
+        raise ValueError("BENCHMARK_DEEPSET_CONTEXT_SIZE must be positive.")
+    if n_train <= context_size:
+        return np.arange(n_train, dtype=np.int64)
+
+    rng_seed = (int(seed) + 1) * 1_000_003 + int(context_index) * 97_003
+    rng = np.random.default_rng(rng_seed)
+    return np.sort(rng.choice(n_train, size=context_size, replace=False)).astype(np.int64)
+
+
+def deepset_inference_device():
+    """Select and log the torch device used only by DeepSet benchmark inference."""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        name = torch.cuda.get_device_name(device)
+        total_gb = torch.cuda.get_device_properties(device).total_memory / (1024 ** 3)
+        print(
+            f"DeepSet benchmark inference device: cuda ({name}, {total_gb:.1f} GiB)",
+            flush=True,
+        )
+        return device
+
+    print("DeepSet benchmark inference device: cpu (CUDA unavailable)", flush=True)
+    return torch.device("cpu")
+
+
+def predict_deepset_mc_streamed(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    K=32,
+    test_batch_size=128,
+    device=None,
+):
+    """
+    MC dropout mean for one bounded context, streamed over test rows.
+    Chunking is memory-only: output order and length match X_test_np exactly.
+    """
+    if K <= 0:
+        raise ValueError("MC dropout K must be positive.")
+    if test_batch_size <= 0:
+        raise ValueError("BENCHMARK_DEEPSET_TEST_BATCH_SIZE must be positive.")
+
+    device = device or deepset_inference_device()
+    model.to(device)
+    Xtr = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
+    ytr = torch.as_tensor(y_train_np, dtype=torch.float32, device=device)
+    n_test = int(X_test_np.shape[0])
+    out = np.empty(n_test, dtype=np.float64)
+
+    model.train()
+    try:
+        with torch.no_grad():
+            for start in range(0, n_test, test_batch_size):
+                end = min(start + test_batch_size, n_test)
+                Xte = torch.as_tensor(X_test_np[start:end], dtype=torch.float32, device=device)
+                pred_sum = None
+                for _ in range(K):
+                    pred = model(Xtr, ytr, Xte).detach()
+                    pred_sum = pred if pred_sum is None else pred_sum + pred
+                out[start:end] = (pred_sum / float(K)).cpu().numpy()
+    finally:
+        model.eval()
+    return out
+
+
+def predict_deepset_bounded_context_ensemble(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    seed,
+    K=32,
+    context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
+    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+    test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
+    device=None,
+):
+    """
+    DeepSetModel-MC bounded-context benchmark prediction.
+
+    Deterministic train-only contexts each predict the same full processed test
+    split; predictions are averaged once before metrics are computed.
+    """
+    if context_ensembles <= 0:
+        raise ValueError("BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES must be positive.")
+
+    device = device or deepset_inference_device()
+    context_preds = []
+    for context_index in range(int(context_ensembles)):
+        idx = select_deepset_context_indices(
+            X_train_np.shape[0], context_size, seed, context_index
+        )
+        if len(idx) > context_size:
+            raise AssertionError("DeepSet context exceeded configured context size.")
+        preds = predict_deepset_mc_streamed(
+            model,
+            X_train_np[idx],
+            y_train_np[idx],
+            X_test_np,
+            K=K,
+            test_batch_size=test_batch_size,
+            device=device,
+        )
+        if preds.shape[0] != X_test_np.shape[0]:
+            raise AssertionError("DeepSet prediction length did not match test split length.")
+        context_preds.append(preds)
+
+    return np.mean(np.stack(context_preds, axis=0), axis=0)
+
+
 def compute_metrics(y_true, y_pred):
     """Returns dict with mse, rmse, r2."""
     mse = mean_squared_error(y_true, y_pred)
@@ -562,7 +880,7 @@ def compute_metrics(y_true, y_pred):
 
 
 # ---------------------------------------------------------------------------
-# Section E — OpenML Benchmark
+# Section E - Prepared Benchmark
 # ---------------------------------------------------------------------------
 
 def preprocess_split(X_train, X_test, categorical_indicator):
@@ -615,150 +933,6 @@ def preprocess_split(X_train, X_test, categorical_indicator):
     X_test_proc  = np.nan_to_num(X_test_proc, nan=0.0)   # fill residual test NaN with 0
     return X_train_proc, X_test_proc
 
-
-def fetch_tabpfn_datasets(max_samples=MAX_SAMPLES, max_features=MAX_FEATURES,
-                          target_n=OPENML_N_DATASETS,
-                          max_cat_fraction: float = 0.3):
-    """
-    Replicate TabPFN v2 Nature 2025 regression benchmark dataset selection:
-      AutoML Benchmark regression (OpenML study ~271) + OpenML-CTR23 (study 353),
-      filtered to ≤max_samples rows and ≤max_features columns; deduped; capped at target_n.
-    """
-    openml.config.cache_directory = "/tmp/openml_cache"
-    os.makedirs("/tmp/openml_cache", exist_ok=True)
-
-    task_ids = set()
-
-    # 1. AutoML Benchmark regression study (try known IDs; fall back to tag search)
-    for study_id in [271, 269, 218]:
-        try:
-            suite = openml.study.get_suite(study_id)
-            if suite.tasks:
-                task_ids.update(suite.tasks)
-                print(f"  AutoML Benchmark study {study_id}: {len(suite.tasks)} tasks")
-                break
-        except Exception:
-            continue
-
-    # 2. OpenML-CTR23 regression study (study 353 — confirmed)
-    try:
-        ctr23 = openml.study.get_suite(353)
-        task_ids.update(ctr23.tasks)
-        print(f"  OpenML-CTR23 study 353: {len(ctr23.tasks)} tasks")
-    except Exception as exc:
-        print(f"  [WARN] Could not load CTR23 study 353: {exc}")
-
-    datasets = []
-    seen_did = set()
-    for task_id in sorted(task_ids):
-        if len(datasets) >= target_n:
-            break
-        try:
-            task = openml.tasks.get_task(task_id)
-            # Only supervised regression tasks
-            if "Regression" not in str(task.task_type):
-                continue
-            dataset = task.get_dataset()
-            X, y, categorical_indicator, _ = dataset.get_data(
-                dataset_format="array", target=task.target_name
-            )
-            if X is None or y is None:
-                continue
-            # Filter: samples and features
-            if X.shape[0] > max_samples or X.shape[1] > max_features:
-                continue
-            # Filter: categorical fraction
-            if categorical_indicator is not None:
-                cat_frac = sum(categorical_indicator) / max(len(categorical_indicator), 1)
-                if cat_frac > max_cat_fraction:
-                    continue
-            did = dataset.dataset_id
-            if did in seen_did:
-                continue
-            seen_did.add(did)
-            if categorical_indicator is None:
-                categorical_indicator = [False] * X.shape[1]
-            datasets.append({
-                "task_id":               task_id,
-                "name":                  dataset.name,
-                "X":                     X,
-                "y":                     y.astype(np.float64),
-                "categorical_indicator": categorical_indicator,
-            })
-            print(f"  Fetched: {dataset.name} (tid={task_id}, "
-                  f"n={X.shape[0]}, p={X.shape[1]})")
-        except Exception as exc:
-            print(f"  [SKIP] task {task_id}: {exc}")
-
-    print(f"Fetched {len(datasets)}/{target_n} TabPFN benchmark datasets.")
-    return datasets
-
-
-def fetch_staged_kaggle_datasets(stage_path="@META_DATASET_STAGE/kaggle/",
-                                 local_dir="/tmp/kaggle_cache",
-                                 task_type_filter="regression",
-                                 require_numeric_only: bool = True):
-    """
-    Download .npz files from the Kaggle stage path and return them in the same
-    format as fetch_tabpfn_datasets(). Only returns datasets matching task_type_filter.
-
-    Falls back gracefully if no active Snowpark session (e.g., local dev).
-    Returns list of dicts: {task_id, name, X, y, categorical_indicator, source}.
-
-    DeepSetModel fitness:
-      s3e5 Wine Quality     — 11 numerical, ordinal target 3–9; moderate fit.
-      s3e9 Concrete Strength — 8 numerical, ~1030 rows; best fit (small n is model's strength).
-      Both are genuine OOD generalization tests — unseen by the model during training.
-    """
-    os.makedirs(local_dir, exist_ok=True)
-
-    # Download from stage if session available
-    try:
-        from snowflake.snowpark.context import get_active_session
-        session = get_active_session()
-        rows = session.sql(f"LIST {stage_path}").collect()
-        for row in rows:
-            # row["name"] = "meta_dataset_stage/kaggle/playground-series-s3e9.npz"
-            fname      = os.path.basename(row["name"])
-            local_path = os.path.join(local_dir, fname)
-            if not os.path.exists(local_path):   # skip if already cached
-                session.file.get(f"{stage_path}{fname}", local_dir)
-        print(f"  Downloaded {len(rows)} files from {stage_path}")
-    except Exception as exc:
-        print(f"  [WARN] Snowflake stage unavailable ({exc}); using cached files in {local_dir}")
-
-    # Load .npz files
-    datasets = []
-    for fname in sorted(os.listdir(local_dir)):
-        if not fname.endswith(".npz"):
-            continue
-        try:
-            data      = np.load(os.path.join(local_dir, fname), allow_pickle=True)
-            task_type = str(data["task_type"][0])
-            if task_type_filter and task_type != task_type_filter:
-                continue   # skip classification datasets in regression benchmark
-            # Guard: skip datasets with categorical features if require_numeric_only
-            cat_mask = data.get("categorical_indicator", np.zeros(data["X"].shape[1], dtype=bool))
-            if require_numeric_only and np.asarray(cat_mask).any():
-                slug = str(data.get("slug", [fname])[0])
-                print(f"[Kaggle] Skipping {slug}: {np.asarray(cat_mask).sum()} categorical "
-                      f"feature(s) detected — model trained on numeric DGPs only")
-                continue
-            X = data["X"].astype(np.float64)
-            datasets.append({
-                "task_id":               str(data["slug"][0]),
-                "name":                  str(data["dataset_name"][0]),
-                "X":                     X,
-                "y":                     data["y"].astype(np.float64),
-                "categorical_indicator": data["categorical_indicator"].tolist(),
-                "source":                "kaggle",
-            })
-            print(f"  Loaded Kaggle ({task_type}): {fname}  n={X.shape[0]}, p={X.shape[1]}")
-        except Exception as exc:
-            print(f"  [SKIP] {fname}: {exc}")
-
-    print(f"Loaded {len(datasets)} Kaggle regression datasets.")
-    return datasets
 
 
 def rank_methods(metrics_matrix, higher_is_better=False):
@@ -836,7 +1010,7 @@ def predict_autogluon(X_train_np, y_train_np, X_test_np):
             train_df,
             presets="best_quality",
             time_limit=AUTOGLUON_TIME_LIMIT,
-            num_cpus=1,
+            num_cpus=BENCHMARK_NUM_CPUS,
             num_gpus=0,
             verbosity=0,
         )
@@ -989,41 +1163,345 @@ def aggregate_benchmark_results(detailed_df):
     return rank_summary_df, metric_summary_df
 
 
-def run_openml_benchmark(model, n_datasets=OPENML_N_DATASETS, seeds=SEEDS,
-                         mc_K=N_MC_DROPOUT, results_dir="results/",
-                         include_openml=True, include_kaggle=True,
-                         methods=None, dataset_limit=None):
-    """
-    Run TabPFN v2 Nature 2025 aligned regression benchmark (OpenML + optional Kaggle).
+def _download_stage_file_to_dir(stage_path, local_dir):
+    """Download a single file from a Snowflake stage; returns local path."""
+    os.makedirs(local_dir, exist_ok=True)
+    from snowflake.snowpark import Session
+    session = Session.builder.getOrCreate()
+    session.file.get(stage_path, local_dir)
+    fname = os.path.basename(stage_path.rstrip("/"))
+    return os.path.join(local_dir, fname)
 
-    Outer loop: seed in SEEDS (10 reps, seeds 0–9)
-      Inner loop: dataset in datasets (up to 28 OpenML + 2 Kaggle regression datasets)
-        - Subsample to MAX_SAMPLES if needed
-        - 90/10 train/test split (same split for ALL methods)
-        - preprocess_split: encode categoricals, impute train NaN, fill test NaN with 0
-        - DeepSetModel-MC + 9 baselines; store NaN on per-method failure
+
+def load_prepared_benchmark_manifest(stage_path=None):
+    """Download and parse benchmark_manifest.json from stage."""
+    import json
+    stage_path = stage_path or BENCHMARK_MANIFEST_STAGE_PATH
+    local_dir = "/tmp/benchmark_manifest"
+    local_path = _download_stage_file_to_dir(stage_path, local_dir)
+    with open(local_path) as f:
+        manifest = json.load(f)
+    _validate_manifest(manifest)
+    return manifest
+
+
+def _validate_manifest(manifest):
+    """Raise ValueError if manifest is missing required fields."""
+    if "datasets" not in manifest or not manifest["datasets"]:
+        raise ValueError("Benchmark manifest has no datasets.")
+    seen = set()
+    for ds in manifest["datasets"]:
+        for field in ("dataset_index", "source", "task_id", "name",
+                      "stage_path", "n_samples", "n_features", "categorical_indicator"):
+            if field not in ds:
+                raise ValueError(f"Manifest dataset missing field {field!r}: {ds}")
+        dataset_index = int(ds["dataset_index"])
+        if dataset_index in seen:
+            raise ValueError(
+                f"Benchmark manifest has duplicate dataset_index={dataset_index}. "
+                "Re-run CALL prepare_benchmark_datasets(); to rebuild the manifest "
+                "and BENCHMARK_DATASET_INDEX."
+            )
+        seen.add(dataset_index)
+
+
+def _manifest_rows_by_index(datasets_meta):
+    """Return manifest rows keyed by their stable dataset_index value."""
+    rows_by_index = {}
+    for ds in datasets_meta:
+        dataset_index = int(ds["dataset_index"])
+        if dataset_index in rows_by_index:
+            raise ValueError(
+                f"Benchmark manifest has duplicate dataset_index={dataset_index}. "
+                "Re-run CALL prepare_benchmark_datasets(); to rebuild the manifest "
+                "and BENCHMARK_DATASET_INDEX."
+            )
+        rows_by_index[dataset_index] = ds
+    return rows_by_index
+
+
+def _query_benchmark_index_rows(index_table=BENCHMARK_DATASET_INDEX_TABLE):
+    """
+    Read benchmark metadata rows from Snowflake.
+
+    The index is used only for assignment metadata. Prepared .npz files remain
+    opaque staged payloads and are downloaded exactly by stage_path later.
+    """
+    try:
+        from snowflake.snowpark import Session
+        session = Session.builder.getOrCreate()
+        rows = session.sql(
+            f"""
+            SELECT
+                dataset_index,
+                source,
+                task_id,
+                dataset_id,
+                name,
+                stage_path,
+                n_samples,
+                n_features,
+                benchmark_weight
+            FROM {index_table}
+            ORDER BY dataset_index
+            """
+        ).collect()
+        return [
+            {
+                "dataset_index": int(row[0]),
+                "source": None if row[1] is None else str(row[1]),
+                "task_id": None if row[2] is None else str(row[2]),
+                "dataset_id": None if row[3] is None else str(row[3]),
+                "name": None if row[4] is None else str(row[4]),
+                "stage_path": None if row[5] is None else str(row[5]),
+                "n_samples": None if row[6] is None else int(row[6]),
+                "n_features": None if row[7] is None else int(row[7]),
+                "benchmark_weight": None if row[8] is None else float(row[8]),
+            }
+            for row in rows
+        ]
+    except Exception as exc:
+        raise RuntimeError(
+            f"Balanced benchmark sharding requires a readable {index_table} table, "
+            f"but it could not be queried: {exc}. "
+            "Run CALL prepare_benchmark_datasets(); to refresh the manifest and "
+            "BENCHMARK_DATASET_INDEX, or set BENCHMARK_SHARD_STRATEGY=modulo "
+            "for modulo sharding."
+        )
+
+
+def _identity_value(row, field):
+    value = row.get(field)
+    if value is None:
+        return None
+    if field in ("n_samples", "n_features"):
+        return int(value)
+    return str(value)
+
+
+def _validate_benchmark_index_rows(
+    index_rows,
+    datasets_meta,
+    index_table=BENCHMARK_DATASET_INDEX_TABLE,
+    allow_extra_index_rows=False,
+):
+    """Return index rows matching datasets_meta after strict freshness checks."""
+    manifest_rows = _manifest_rows_by_index(datasets_meta)
+    manifest_indices = set(manifest_rows)
+
+    index_counts = Counter(int(row["dataset_index"]) for row in index_rows)
+    duplicate_indices = sorted(i for i, count in index_counts.items() if count > 1)
+    if duplicate_indices:
+        raise RuntimeError(
+            f"{index_table} has duplicate dataset_index values: {duplicate_indices[:10]}. "
+            "Run CALL prepare_benchmark_datasets(); to rebuild the benchmark index."
+        )
+
+    index_rows_by_index = {int(row["dataset_index"]): row for row in index_rows}
+    index_indices = set(index_rows_by_index)
+    missing = sorted(manifest_indices - index_indices)
+    extra = sorted(index_indices - manifest_indices)
+    if missing:
+        raise RuntimeError(
+            f"{index_table} is missing manifest dataset_index values: {missing[:10]}. "
+            "Run CALL prepare_benchmark_datasets(); to refresh the benchmark index, "
+            "or set BENCHMARK_SHARD_STRATEGY=modulo for modulo sharding."
+        )
+    if extra and not allow_extra_index_rows:
+        raise RuntimeError(
+            f"{index_table} contains dataset_index values not present in the manifest: "
+            f"{extra[:10]}. Run CALL prepare_benchmark_datasets(); to refresh the "
+            "benchmark manifest and index together."
+        )
+
+    identity_fields = (
+        "source", "task_id", "dataset_id", "name", "stage_path",
+        "n_samples", "n_features",
+    )
+    selected_rows = []
+    for dataset_index in sorted(manifest_indices):
+        manifest_row = manifest_rows[dataset_index]
+        index_row = index_rows_by_index[dataset_index]
+        for field in identity_fields:
+            if field == "dataset_id" and field not in manifest_row:
+                continue
+            if _identity_value(manifest_row, field) != _identity_value(index_row, field):
+                raise RuntimeError(
+                    f"{index_table} is stale for dataset_index={dataset_index}: "
+                    f"{field} is {index_row.get(field)!r}, manifest has "
+                    f"{manifest_row.get(field)!r}. Run CALL prepare_benchmark_datasets(); "
+                    "to refresh the benchmark manifest and index together."
+                )
+        if index_row.get("benchmark_weight") is None:
+            raise RuntimeError(
+                f"{index_table} row dataset_index={dataset_index} has NULL "
+                "benchmark_weight. Run CALL prepare_benchmark_datasets(); to backfill "
+                "benchmark metadata."
+            )
+        selected_rows.append(index_row)
+
+    return selected_rows
+
+
+def _balanced_dataset_indices(index_rows, num_shards, shard_index):
+    """
+    Greedily assign datasets by descending benchmark_weight to balance shards.
+
+    Ties are stable by dataset_index, so the result is deterministic.
+    """
+    shard_loads = [0.0] * num_shards
+    shard_indices = [[] for _ in range(num_shards)]
+    weighted_rows = []
+    for row in index_rows:
+        dataset_index = int(row["dataset_index"])
+        weight = row.get("benchmark_weight")
+        if weight is None:
+            weight = row.get("n_samples", 0) * row.get("n_features", 0)
+        weighted_rows.append((dataset_index, float(weight or 0.0)))
+
+    for dataset_index, weight in sorted(weighted_rows, key=lambda item: (-item[1], item[0])):
+        target_shard = min(range(num_shards), key=lambda i: (shard_loads[i], i))
+        shard_indices[target_shard].append(dataset_index)
+        shard_loads[target_shard] += weight
+
+    return sorted(shard_indices[shard_index])
+
+
+def select_benchmark_dataset_indices(
+    datasets_meta,
+    shard_index=0,
+    num_shards=1,
+    strategy=None,
+    allow_extra_index_rows=False,
+):
+    """Return stable dataset_index values assigned to this shard."""
+    strategy = (strategy or BENCHMARK_SHARD_STRATEGY or "modulo").lower()
+    manifest_indices = [int(ds["dataset_index"]) for ds in datasets_meta]
+    if num_shards < 1:
+        raise ValueError(f"Invalid num_shards={num_shards}")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(
+            f"Invalid shard_index={shard_index} for num_shards={num_shards}"
+        )
+
+    if strategy in ("modulo", "dataset_modulo"):
+        if num_shards <= 1:
+            return manifest_indices
+        return [i for i in manifest_indices if i % num_shards == shard_index]
+
+    if strategy == "balanced":
+        index_rows = _query_benchmark_index_rows()
+        index_rows = _validate_benchmark_index_rows(
+            index_rows,
+            datasets_meta,
+            allow_extra_index_rows=allow_extra_index_rows,
+        )
+        assigned = _balanced_dataset_indices(index_rows, num_shards, shard_index)
+        return assigned
+
+    raise ValueError(
+        f"Unsupported BENCHMARK_SHARD_STRATEGY={strategy!r}. "
+        "Expected 'modulo' or 'balanced'."
+    )
+
+
+def _default_benchmark_cache_dir():
+    method = os.environ.get("BENCHMARK_METHOD") or os.environ.get("BENCHMARK_METHODS", "all")
+    method = method.replace(os.sep, "_").replace(",", "_")
+    shard = os.environ.get("BENCHMARK_SHARD_INDEX", "0")
+    num_shards = os.environ.get("BENCHMARK_NUM_SHARDS", "1")
+    return os.path.join(
+        "/tmp",
+        "benchmark_datasets",
+        f"pid-{os.getpid()}",
+        f"method-{method}",
+        f"shard-{shard}-of-{num_shards}",
+    )
+
+
+def load_prepared_dataset(ds_meta, local_cache_dir=None):
+    """Download and load a single prepared .npz dataset file from stage."""
+    stage_path = ds_meta["stage_path"]
+    local_cache_dir = local_cache_dir or _default_benchmark_cache_dir()
+    fname = os.path.basename(stage_path.rstrip("/"))
+    local_path = os.path.join(local_cache_dir, fname)
+    if os.path.exists(local_path):
+        os.remove(local_path)
+    _download_stage_file_to_dir(stage_path, local_cache_dir)
+    data = np.load(local_path, allow_pickle=False)
+    return {
+        "task_id":               str(ds_meta["task_id"]),
+        "name":                  str(ds_meta["name"]),
+        "X":                     data["X"].astype(np.float64),
+        "y":                     data["y"].astype(np.float64),
+        "categorical_indicator": data["categorical_indicator"].tolist(),
+        "source":                str(ds_meta["source"]),
+    }
+
+
+def run_prepared_benchmark(
+    model,
+    manifest_stage_path=None,
+    seeds=SEEDS,
+    mc_K=N_MC_DROPOUT,
+    results_dir="results/",
+    methods=None,
+    dataset_limit=None,
+    rank=0,
+    world_size=1,
+    using_torch_distributed=False,
+):
+    """
+    Run the regression benchmark using pre-staged dataset files from
+    benchmark_manifest.json. Sharding is dataset-first: a shard owns dataset
+    indices, downloads one owned dataset at a time, evaluates every seed, then
+    releases the arrays before continuing.
 
     Returns (detailed_df, rank_summary_df, metric_summary_df).
-    Note: Metrics not directly comparable to the TabPFN paper (different split ratio).
-    The 'source' column in detailed_df identifies "openml" vs "kaggle" datasets,
-    enabling stratified analysis of DeepSet OOD generalization across dataset types.
     """
-    openml_datasets = []
-    if include_openml:
-        print("\nFetching TabPFN benchmark datasets (AutoML Benchmark + OpenML-CTR23)...")
-        openml_datasets = fetch_tabpfn_datasets(target_n=n_datasets)
+    manifest = load_prepared_benchmark_manifest(manifest_stage_path)
+    datasets_meta = manifest["datasets"]
+    manifest_dataset_count = len(datasets_meta)
+    if dataset_limit:
+        datasets_meta = datasets_meta[:int(dataset_limit)]
 
-    kaggle_datasets = []
-    if include_kaggle:
-        print("\nFetching Kaggle benchmark datasets from stage...")
-        kaggle_datasets = fetch_staged_kaggle_datasets()
-
-    datasets = openml_datasets + kaggle_datasets
-    if dataset_limit is not None:
-        datasets = datasets[:int(dataset_limit)]
-    if not datasets:
-        print("[WARNING] No datasets fetched. Skipping benchmark.")
+    if not datasets_meta:
+        print("[WARNING] Benchmark manifest has no datasets. Skipping benchmark.")
         return None, None, None
+
+    rows_by_index = _manifest_rows_by_index(datasets_meta)
+    assigned_indices = select_benchmark_dataset_indices(
+        datasets_meta,
+        shard_index=rank,
+        num_shards=world_size,
+        allow_extra_index_rows=dataset_limit is not None,
+    )
+    missing_assigned = [i for i in assigned_indices if i not in rows_by_index]
+    if missing_assigned:
+        raise RuntimeError(
+            f"Shard assignment produced dataset_index values not present in the "
+            f"manifest subset: {missing_assigned[:10]}"
+        )
+    assigned_datasets = [rows_by_index[i] for i in assigned_indices]
+    assigned_weight = sum(
+        int(ds.get("benchmark_weight") or int(ds["n_samples"]) * int(ds["n_features"]))
+        for ds in assigned_datasets
+    )
+    total_work_units = len(datasets_meta) * len(seeds)
+    assigned_work_units = len(assigned_datasets) * len(seeds)
+
+    print(
+        f"Benchmark manifest: {len(datasets_meta)} datasets\n"
+        f"Benchmark manifest total before limit: {manifest_dataset_count} datasets\n"
+        f"Shard: rank={rank} world_size={world_size}\n"
+        f"Shard strategy: {BENCHMARK_SHARD_STRATEGY}\n"
+        f"Assigned dataset indices: {assigned_indices}\n"
+        f"Assigned benchmark weight: {assigned_weight}\n"
+        f"Assigned datasets: {len(assigned_datasets)}/{len(datasets_meta)}\n"
+        f"Assigned work units: {assigned_work_units}/{total_work_units} "
+        f"(each dataset x {len(seeds)} seeds)",
+        flush=True,
+    )
 
     selected_methods = methods or ALL_BENCHMARK_METHODS
     unknown_methods = sorted(set(selected_methods) - set(ALL_BENCHMARK_METHODS))
@@ -1031,73 +1509,104 @@ def run_openml_benchmark(model, n_datasets=OPENML_N_DATASETS, seeds=SEEDS,
         raise ValueError(f"Unknown benchmark method(s): {unknown_methods}")
     if "DeepSetModel-MC" in selected_methods and model is None:
         raise ValueError("DeepSetModel-MC benchmark requires a loaded model.")
+    deepset_device = (
+        deepset_inference_device()
+        if "DeepSetModel-MC" in selected_methods
+        else None
+    )
 
     all_rows = []
-
-    for seed in seeds:
-        rng = np.random.default_rng(seed)
-        print(f"\n--- Benchmark rep seed={seed} ---")
-
-        for ds in datasets:
+    for ds_meta in assigned_datasets:
+        i_ds = int(ds_meta["dataset_index"])
+        print(f"\n--- Benchmark dataset {i_ds}: {ds_meta['name']} ---", flush=True)
+        ds = load_prepared_dataset(ds_meta)
+        try:
             X, y    = ds["X"], ds["y"]
             cat_ind = ds["categorical_indicator"]
             name    = ds["name"]
             task_id = ds["task_id"]
-
-            # Subsample
-            if X.shape[0] > MAX_SAMPLES:
-                idx = rng.choice(X.shape[0], MAX_SAMPLES, replace=False)
-                X, y = X[idx], y[idx]
-
-            # 50/50 split
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=1.0 - TRAIN_FRAC, random_state=seed
-            )
-
-            # Preprocess (same data for all methods)
-            try:
-                X_train_p, X_test_p = preprocess_split(X_train, X_test, cat_ind)
-            except Exception as exc:
-                print(f"  [SKIP preprocess] {name}: {exc}")
-                continue
-
             source  = ds.get("source", "openml")
-            nan_row = {"task_id": task_id, "name": name, "rep": seed, "source": source,
-                       "mse": float("nan"), "rmse": float("nan"), "r2": float("nan")}
 
-            if "DeepSetModel-MC" in selected_methods:
+            for seed in seeds:
+                rng = np.random.default_rng(seed)
+                print(f"  seed={seed}", flush=True)
+                X_seed, y_seed = X, y
+
+                # Subsample
+                if X_seed.shape[0] > MAX_SAMPLES:
+                    idx = rng.choice(X_seed.shape[0], MAX_SAMPLES, replace=False)
+                    X_seed, y_seed = X_seed[idx], y_seed[idx]
+
+                # 90/10 split
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_seed, y_seed, test_size=1.0 - TRAIN_FRAC, random_state=seed
+                )
+
+                # Preprocess (same data for all methods)
                 try:
-                    preds = predict_deepset_mc(model, X_train_p, y_train, X_test_p, K=mc_K)
-                    m     = compute_metrics(y_test, preds)
-                    all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                      "source": source, "method": "DeepSetModel-MC", **m})
+                    X_train_p, X_test_p = preprocess_split(X_train, X_test, cat_ind)
                 except Exception as exc:
-                    print(f"  [FAIL DeepSetModel-MC] {name}: {exc}")
-                    all_rows.append({**nan_row, "method": "DeepSetModel-MC"})
-
-            # Baselines
-            for bl_name, bl_model in get_baselines(seed).items():
-                if bl_name not in selected_methods:
+                    print(f"  [SKIP preprocess] {name}: {exc}")
                     continue
-                try:
-                    bl_model.fit(X_train_p, y_train)
-                    preds_bl = bl_model.predict(X_test_p)
-                    m = compute_metrics(y_test, preds_bl)
-                    all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                     "source": source, "method": bl_name, **m})
-                except Exception as exc:
-                    print(f"  [FAIL {bl_name}] {name}: {exc}")
-                    all_rows.append({**nan_row, "method": bl_name})
 
-            if "AutoGluon" in selected_methods:
-                try:
-                    preds_ag = predict_autogluon(X_train_p, y_train, X_test_p)
-                    m = compute_metrics(y_test, preds_ag)
-                    all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                     "source": source, "method": "AutoGluon", **m})
-                except Exception as exc:
-                    print(f"  [FAIL AutoGluon] {name}: {exc}")
-                    all_rows.append({**nan_row, "method": "AutoGluon"})
+                nan_row = {"task_id": task_id, "name": name, "rep": seed, "source": source,
+                           "mse": float("nan"), "rmse": float("nan"), "r2": float("nan")}
+
+                if "DeepSetModel-MC" in selected_methods:
+                    try:
+                        preds = predict_deepset_bounded_context_ensemble(
+                            model,
+                            X_train_p,
+                            y_train,
+                            X_test_p,
+                            seed=seed,
+                            K=mc_K,
+                            context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
+                            context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+                            test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
+                            device=deepset_device,
+                        )
+                        m     = compute_metrics(y_test, preds)
+                        all_rows.append({"task_id": task_id, "name": name, "rep": seed,
+                                          "source": source, "method": "DeepSetModel-MC", **m})
+                    except Exception as exc:
+                        print(f"  [FAIL DeepSetModel-MC] {name}: {exc}")
+                        all_rows.append({**nan_row, "method": "DeepSetModel-MC"})
+
+                # Baselines
+                for bl_name, bl_model in get_baselines(seed).items():
+                    if bl_name not in selected_methods:
+                        continue
+                    try:
+                        bl_model.fit(X_train_p, y_train)
+                        preds_bl = bl_model.predict(X_test_p)
+                        m = compute_metrics(y_test, preds_bl)
+                        all_rows.append({"task_id": task_id, "name": name, "rep": seed,
+                                         "source": source, "method": bl_name, **m})
+                    except Exception as exc:
+                        print(f"  [FAIL {bl_name}] {name}: {exc}")
+                        all_rows.append({**nan_row, "method": bl_name})
+
+                if "AutoGluon" in selected_methods:
+                    try:
+                        preds_ag = predict_autogluon(X_train_p, y_train, X_test_p)
+                        m = compute_metrics(y_test, preds_ag)
+                        all_rows.append({"task_id": task_id, "name": name, "rep": seed,
+                                         "source": source, "method": "AutoGluon", **m})
+                    except Exception as exc:
+                        print(f"  [FAIL AutoGluon] {name}: {exc}")
+                        all_rows.append({**nan_row, "method": "AutoGluon"})
+        finally:
+            del ds
+            gc.collect()
+
+    # Gather results from all distributed workers.
+    if using_torch_distributed and world_size > 1:
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, all_rows)
+        if rank != 0:
+            return None, None, None
+        all_rows = [row for chunk in gathered for row in chunk]
 
     if not all_rows:
         return None, None, None
@@ -1105,6 +1614,7 @@ def run_openml_benchmark(model, n_datasets=OPENML_N_DATASETS, seeds=SEEDS,
     detailed_df = normalize_benchmark_columns(pd.DataFrame(all_rows))
     rank_summary_df, metric_summary_df = aggregate_benchmark_results(detailed_df)
     return detailed_df, rank_summary_df, metric_summary_df
+
 
 
 def print_benchmark_table(rank_summary_df, metric_summary_df):
@@ -1174,18 +1684,43 @@ def save_benchmark_part_csv(detailed_df, method, results_dir):
     """Save a single-method benchmark detail file under benchmark_parts/."""
     part_dir = os.path.join(results_dir, "benchmark_parts")
     os.makedirs(part_dir, exist_ok=True)
-    part_path = os.path.join(part_dir, f"{safe_method_name(method)}_detailed.csv")
+
+    shard_index = os.environ.get("BENCHMARK_SHARD_INDEX")
+    num_shards = os.environ.get("BENCHMARK_NUM_SHARDS")
+
+    if shard_index is not None and num_shards is not None and int(num_shards) > 1:
+        filename = (
+            f"{safe_method_name(method)}_"
+            f"shard{int(shard_index)}_of_{int(num_shards)}_detailed.csv"
+        )
+    else:
+        filename = f"{safe_method_name(method)}_detailed.csv"
+
+    part_path = os.path.join(part_dir, filename)
     normalize_benchmark_columns(detailed_df).to_csv(part_path, index=False)
-    print(f"Saved {part_path} ({len(detailed_df)} rows)")
+    print(f"Saved {part_path} ({len(detailed_df)} rows)", flush=True)
     return part_path
+
+
+def save_benchmark_part_csvs(detailed_df, methods, results_dir):
+    """Save one benchmark part CSV per method present in detailed_df."""
+    detailed_df = normalize_benchmark_columns(detailed_df)
+    part_paths = []
+    for method in methods:
+        method_df = detailed_df[detailed_df["method"] == method]
+        if method_df.empty:
+            print(f"[WARNING] No benchmark rows for {method}; no part CSV written.", flush=True)
+            continue
+        part_paths.append(save_benchmark_part_csv(method_df, method, results_dir))
+    return part_paths
 
 
 def download_stage_prefix(stage_path, local_dir):
     """Download a stage prefix into local_dir; no-op outside Snowflake."""
     os.makedirs(local_dir, exist_ok=True)
     try:
-        from snowflake.snowpark.context import get_active_session
-        session = get_active_session()
+        from snowflake.snowpark import Session
+        session = Session.builder.getOrCreate()
         session.file.get(stage_path, local_dir)
         print(f"Downloaded {stage_path} to {local_dir}")
     except Exception as exc:
@@ -1201,25 +1736,93 @@ def aggregate_benchmark_parts(results_dir, eval_stage=EVAL_RESULTS_STAGE):
     if not part_files:
         raise FileNotFoundError(f"No benchmark part CSVs found in {local_parts}")
 
+    print(f"Found {len(part_files)} benchmark part files in {local_parts}:", flush=True)
+    for pf in part_files:
+        print(f"  {pf}", flush=True)
+
     frames = [pd.read_csv(path) for path in part_files]
     detailed_df = normalize_benchmark_columns(pd.concat(frames, ignore_index=True))
+
+    methods_found = sorted(detailed_df["method"].unique().tolist())
+    print(f"Methods discovered: {methods_found}", flush=True)
+    print(f"Total rows: {len(detailed_df)}", flush=True)
     rank_summary_df, metric_summary_df = aggregate_benchmark_results(detailed_df)
     return save_benchmark_csvs(detailed_df, rank_summary_df, metric_summary_df, results_dir)
 
 
+def resolve_parallel_context():
+    """
+    Resolve rank/world_size/using_torch_distributed for evaluation.
+
+    Priority:
+    1. Explicit shard mode via BENCHMARK_NUM_SHARDS + BENCHMARK_SHARD_INDEX.
+    2. Real PyTorch distributed (RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT all set).
+    3. Single-process fallback.
+
+    Returns (rank, world_size, using_torch_distributed).
+    """
+    num_shards = int(os.environ.get("BENCHMARK_NUM_SHARDS", "1"))
+    shard_index = int(os.environ.get("BENCHMARK_SHARD_INDEX", "0"))
+
+    if num_shards > 1:
+        if shard_index < 0 or shard_index >= num_shards:
+            raise ValueError(
+                f"Invalid BENCHMARK_SHARD_INDEX={shard_index} "
+                f"for BENCHMARK_NUM_SHARDS={num_shards}"
+            )
+        print(
+            f"Using independent benchmark shard mode: "
+            f"shard {shard_index + 1}/{num_shards}",
+            flush=True,
+        )
+        return shard_index, num_shards, False
+
+    req_nodes = int(os.environ.get("EVAL_NUM_NODES", "1"))
+    req_workers = int(os.environ.get("EVAL_WORKERS_PER_NODE", "1"))
+    req_world_size = req_nodes * req_workers
+
+    dist_vars = ["RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"]
+    has_dist_env = all(os.environ.get(v) for v in dist_vars)
+
+    if req_world_size > 1:
+        if has_dist_env:
+            dist.init_process_group(backend="gloo")
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            print(
+                f"Using PyTorch distributed evaluation: "
+                f"rank={rank}, world_size={world_size}, "
+                f"MASTER_ADDR={os.environ.get('MASTER_ADDR')}",
+                flush=True,
+            )
+            return rank, world_size, True
+        raise RuntimeError(
+            f"Distributed evaluation requested (EVAL_NUM_NODES={req_nodes}, "
+            f"EVAL_WORKERS_PER_NODE={req_workers}, world_size={req_world_size}) "
+            "but PyTorch distributed env vars are missing "
+            f"({', '.join(v for v in dist_vars if not os.environ.get(v))}). "
+            "submit_from_stage(target_instances=N) alone does not create a PyTorch "
+            "process group. For CPU baselines and AutoGluon, use "
+            "BENCHMARK_NUM_SHARDS + BENCHMARK_SHARD_INDEX instead."
+        )
+
+    print("Using single-process evaluation mode.", flush=True)
+    return 0, 1, False
+
+
 # ---------------------------------------------------------------------------
-# Section F — Upload results to Snowflake (fixed: get_active_session)
+# Section F — Upload results to Snowflake
 # ---------------------------------------------------------------------------
 
 def upload_to_snowflake(local_path: str, stage_path: str):
     """
     Upload a local file to a Snowflake internal stage via Snowpark.
-    Uses get_active_session() — the only correct pattern inside SPCS containers.
-    Degrades gracefully when running locally (no active session).
+    Uses Session.builder.getOrCreate() so uploads work from both the main process
+    and distributed worker processes (rank 0 only). Degrades gracefully locally.
     """
     try:
-        from snowflake.snowpark.context import get_active_session
-        session = get_active_session()
+        from snowflake.snowpark import Session
+        session = Session.builder.getOrCreate()
         session.file.put(local_path, stage_path, overwrite=True, auto_compress=False)
         print(f"Uploaded {local_path} to {stage_path}")
     except Exception as exc:
@@ -1238,12 +1841,7 @@ def main():
                         help="Root data directory (contains test/ subdir).")
     parser.add_argument("--results_dir", default=os.environ.get("RESULTS_DIR", "results/"),
                         help="Directory for output files.")
-    parser.add_argument("--no_openml",   action="store_true",
-                        help="Skip OpenML datasets; run Kaggle benchmark only.")
-    parser.add_argument("--no_kaggle",   action="store_true",
-                        help="Skip Kaggle staged datasets (use if @META_DATASET_STAGE/kaggle/ "
-                             "not yet populated).")
-    parser.add_argument("--mc_K",        type=int, default=N_MC_DROPOUT,
+    parser.add_argument("--mc_K",        type=int, default=int(os.environ.get("MC_K", N_MC_DROPOUT)),
                         help="Number of MC dropout forward passes (default: 32).")
     parser.add_argument("--mode",        default=os.environ.get("EVAL_MODE", "full"),
                         choices=["full", "synthetic", "benchmark", "aggregate"],
@@ -1251,6 +1849,9 @@ def main():
     parser.add_argument("--benchmark_method",
                         default=os.environ.get("BENCHMARK_METHOD"),
                         help="Run only one benchmark method.")
+    parser.add_argument("--benchmark_methods",
+                        default=os.environ.get("BENCHMARK_METHODS"),
+                        help="Comma-separated benchmark methods to run in one shard.")
     parser.add_argument("--eval_results_stage",
                         default=os.environ.get("EVAL_RESULTS_STAGE", EVAL_RESULTS_STAGE),
                         help="Snowflake stage for evaluation CSV outputs.")
@@ -1261,89 +1862,131 @@ def main():
 
     os.makedirs(args.results_dir, exist_ok=True)
 
-    if args.mode == "aggregate":
-        det_path, sum_path = aggregate_benchmark_parts(args.results_dir, args.eval_results_stage)
-        upload_to_snowflake(det_path, args.eval_results_stage)
-        upload_to_snowflake(sum_path, args.eval_results_stage)
-        return
+    rank, world_size, using_torch_distributed = resolve_parallel_context()
 
-    needs_model = (
-        args.mode in ("full", "synthetic")
-        or args.benchmark_method in (None, "DeepSetModel-MC")
-    )
-    model = load_model(args.model_path) if needs_model else None
-
-    if args.mode in ("full", "synthetic"):
-        materialize_meta_dataset_stage(args.data_dir, splits=("test",))
-        all_pass = run_permutation_tests(model)
-        if not all_pass:
-            print("[WARNING] One or more permutation tests FAILED.")
-
-        test_dir = os.path.join(args.data_dir, "test")
-        print(f"\nEvaluating on synthetic DGP test files in {test_dir} ...")
-        try:
-            records = evaluate_synthetic_dgp(model, test_dir)
-            print(f"Evaluated {len(records)} datasets.")
-
-            report_rows = build_report(records)
-            print("\nTest Split Results (Point Prediction):")
-            print_report(report_rows)
-
-            synthetic_dir = os.path.join(args.results_dir, "synthetic")
-            os.makedirs(synthetic_dir, exist_ok=True)
-            csv_path = os.path.join(synthetic_dir, "test_report.csv")
-            save_report_csv(report_rows, csv_path)
-            print(f"Saved {csv_path}")
-            upload_to_snowflake(csv_path, f"{args.eval_results_stage}/synthetic/")
-
-            print(f"\nRunning MC dropout noise assessment (K={args.mc_K}) ...")
-            mc_records = evaluate_synthetic_dgp_mc(model, test_dir, K=args.mc_K)
-            mc_rows = build_mc_report(mc_records)
-            print("\nMC Dropout Noise Assessment (ratio_mc_ols <= ratio_model_ols = noise reduction):")
-            print_mc_report(mc_rows)
-
-            mc_csv_path = os.path.join(synthetic_dir, "mc_report.csv")
-            save_mc_report_csv(mc_rows, mc_csv_path)
-            print(f"Saved {mc_csv_path}")
-            upload_to_snowflake(mc_csv_path, f"{args.eval_results_stage}/synthetic/")
-
-        except FileNotFoundError as exc:
-            print(f"[WARNING] {exc} - skipping synthetic DGP evaluation.")
-
-    if args.mode == "synthetic":
-        return
-
-    if args.no_openml and args.no_kaggle:
-        print("\n--no_openml and --no_kaggle both set: skipping benchmark.")
-        return
-
-    if not BENCHMARK_DEPS_AVAILABLE:
-        raise RuntimeError(
-            "Benchmark dependencies are not available. Install: "
-            "openml scikit-learn xgboost lightgbm catboost pandas scipy"
-        )
-        return
-
-    methods = [args.benchmark_method] if args.benchmark_method else ALL_BENCHMARK_METHODS
-    detailed_df, rank_summary_df, metric_summary_df = run_openml_benchmark(
-        model, results_dir=args.results_dir, mc_K=args.mc_K,
-        include_openml=not args.no_openml,
-        include_kaggle=not args.no_kaggle,
-        methods=methods,
-        dataset_limit=args.benchmark_dataset_limit,
-    )
-
-    if detailed_df is not None:
-        print_benchmark_table(rank_summary_df, metric_summary_df)
-        if args.benchmark_method:
-            part_path = save_benchmark_part_csv(detailed_df, args.benchmark_method, args.results_dir)
-            upload_to_snowflake(part_path, f"{args.eval_results_stage}/benchmark_parts/")
-        else:
-            det_path, sum_path = save_benchmark_csvs(
-                detailed_df, rank_summary_df, metric_summary_df, args.results_dir
-            )
+    try:
+        if args.mode == "aggregate":
+            det_path, sum_path = aggregate_benchmark_parts(args.results_dir, args.eval_results_stage)
             upload_to_snowflake(det_path, args.eval_results_stage)
             upload_to_snowflake(sum_path, args.eval_results_stage)
+            return
+
+        selected_methods = parse_benchmark_methods(args.benchmark_method, args.benchmark_methods)
+        explicit_method_selection = bool(args.benchmark_method or args.benchmark_methods)
+
+        needs_model = (
+            args.mode in ("full", "synthetic")
+            or "DeepSetModel-MC" in selected_methods
+        )
+        model = load_model(args.model_path) if needs_model else None
+
+        if args.mode in ("full", "synthetic"):
+            materialize_meta_dataset_stage(args.data_dir, splits=("test",))
+            all_pass = run_permutation_tests(model)
+            if not all_pass:
+                print("[WARNING] One or more permutation tests FAILED.")
+
+            test_dir = os.path.join(args.data_dir, "test")
+            print(f"\nEvaluating on synthetic DGP test files in {test_dir} ...")
+            try:
+                records = evaluate_synthetic_dgp(model, test_dir, rank=rank, world_size=world_size,
+                                                 using_torch_distributed=using_torch_distributed)
+                if records is not None:
+                    print(f"Evaluated {len(records)} datasets.")
+
+                    report_rows = build_report(records)
+                    print("\nTest Split Results (Point Prediction):")
+                    print_report(report_rows)
+
+                    synthetic_dir = os.path.join(args.results_dir, "synthetic")
+                    os.makedirs(synthetic_dir, exist_ok=True)
+                    csv_path = os.path.join(synthetic_dir, "test_report.csv")
+                    save_report_csv(report_rows, csv_path)
+                    print(f"Saved {csv_path}")
+                    upload_to_snowflake(csv_path, f"{args.eval_results_stage}/synthetic/")
+
+                print(f"\nRunning MC dropout noise assessment (K={args.mc_K}) ...")
+                mc_records = evaluate_synthetic_dgp_mc(model, test_dir, K=args.mc_K,
+                                                       rank=rank, world_size=world_size,
+                                                       using_torch_distributed=using_torch_distributed)
+                if mc_records is not None:
+                    mc_rows = build_mc_report(mc_records)
+                    print("\nMC Dropout Noise Assessment (ratio_mc_ols <= ratio_model_ols = noise reduction):")
+                    print_mc_report(mc_rows)
+
+                    synthetic_dir = os.path.join(args.results_dir, "synthetic")
+                    os.makedirs(synthetic_dir, exist_ok=True)
+                    mc_csv_path = os.path.join(synthetic_dir, "mc_report.csv")
+                    save_mc_report_csv(mc_rows, mc_csv_path)
+                    print(f"Saved {mc_csv_path}")
+                    upload_to_snowflake(mc_csv_path, f"{args.eval_results_stage}/synthetic/")
+
+            except FileNotFoundError as exc:
+                print(f"[WARNING] {exc} - skipping synthetic DGP evaluation.")
+
+        if args.mode == "synthetic":
+            return
+
+        if not BENCHMARK_DEPS_AVAILABLE:
+            raise RuntimeError(
+                "Benchmark dependencies are not available. Install: "
+                "scikit-learn xgboost lightgbm catboost pandas scipy"
+            )
+
+        detailed_df, rank_summary_df, metric_summary_df = run_prepared_benchmark(
+            model,
+            manifest_stage_path=BENCHMARK_MANIFEST_STAGE_PATH,
+            seeds=SEEDS,
+            mc_K=args.mc_K,
+            results_dir=args.results_dir,
+            methods=selected_methods,
+            dataset_limit=args.benchmark_dataset_limit,
+            rank=rank, world_size=world_size,
+            using_torch_distributed=using_torch_distributed,
+        )
+
+        if detailed_df is not None:
+            print_benchmark_table(rank_summary_df, metric_summary_df)
+            if explicit_method_selection:
+                for part_path in save_benchmark_part_csvs(
+                    detailed_df, selected_methods, args.results_dir
+                ):
+                    upload_to_snowflake(part_path, f"{args.eval_results_stage}/benchmark_parts/")
+            else:
+                det_path, sum_path = save_benchmark_csvs(
+                    detailed_df, rank_summary_df, metric_summary_df, args.results_dir
+                )
+                upload_to_snowflake(det_path, args.eval_results_stage)
+                upload_to_snowflake(sum_path, args.eval_results_stage)
+
+    except Exception as exc:
+        import traceback
+        import json as _json_eval
+        shard_index = os.environ.get("BENCHMARK_SHARD_INDEX", "")
+        num_shards = os.environ.get("BENCHMARK_NUM_SHARDS", "")
+        method = os.environ.get("BENCHMARK_METHOD") or os.environ.get("BENCHMARK_METHODS", "unknown")
+        mode = os.environ.get("EVAL_MODE", "unknown")
+        suffix = (f"_shard{shard_index}_of_{num_shards}"
+                  if shard_index and num_shards and int(num_shards) > 1 else "")
+        failure_payload = {
+            "method": method, "mode": mode,
+            "shard_index": shard_index, "num_shards": num_shards,
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        failure_local = f"/tmp/{method}{suffix}_failure.json"
+        with open(failure_local, "w") as _f:
+            _json_eval.dump(failure_payload, _f, indent=2)
+        print(f"[EVAL FAILURE JSON]\n{_json_eval.dumps(failure_payload, indent=2)}", flush=True)
+        upload_to_snowflake(
+            failure_local,
+            f"{args.eval_results_stage}/failures/",
+        )
+        raise
+    finally:
+        if using_torch_distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()

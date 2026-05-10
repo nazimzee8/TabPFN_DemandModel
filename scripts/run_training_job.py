@@ -10,41 +10,26 @@ from snowflake.ml.jobs import submit_from_stage
 
 GPU_POOL = "DEEPSET_GPU_POOL"
 CPU_POOL = "DEEPSET_CPU_POOL"
-AUTOGLUON_CPU_POOL = "AUTOGLUON_CPU_POOL"
 MODEL_STAGE = "@MODEL_STAGE"
 SCRIPTS_STAGE = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
-EVAL_RESULTS_STAGE = "@EVALUATION_RESULTS_STAGE"
 KAGGLE_STAGE = "@META_DATASET_STAGE/kaggle/"
-TRAIN_NUM_NODES = 4
-BENCHMARK_PIP_REQUIREMENTS = [
-    "openml",
-    "scikit-learn",
-    "xgboost",
-    "lightgbm",
-    "catboost",
-    "pandas",
-    "scipy",
-]
-AUTOGLUON_PIP_REQUIREMENTS = BENCHMARK_PIP_REQUIREMENTS + ["autogluon.tabular[all]==1.0.0"]
-
-BASELINE_METHODS = [
-    "XGBoost",
-    "LightGBM",
-    "CatBoost",
-    "RandomForest",
-    "KNN",
-    "LinearRegression",
-    "Ridge",
-    "SVR",
-    "MLP",
-]
-AUTOGLUON_METHOD = "AutoGluon"
-MAX_BASELINE_CONCURRENCY = 3
+TRAIN_NUM_NODES = 10
 
 
 def _wait_done(job, label, session):
-    job.wait()
+    try:
+        job.wait()
+    except Exception as exc:
+        if "300002" in str(exc) or "000603" in str(exc):
+            raise RuntimeError(
+                f"{label} job terminated with Snowflake internal error 300002 "
+                "(service status unavailable — container likely crashed before reaching "
+                "a terminal state). Check @MODEL_STAGE/hpo/hpo_failure.json for the "
+                "Python traceback. If that file is absent, inspect container logs in "
+                "Snowsight for OOM or pre-Python crash details."
+            ) from exc
+        raise
     if job.status == "DONE":
         print(f"{label} complete.")
         return
@@ -58,33 +43,6 @@ def _wait_done(job, label, session):
         )
     print(f"{label} container logs:\n", logs)
     raise RuntimeError(f"{label} failed with status {job.status!r}\n--- logs ---\n{logs}")
-
-
-def _submit_eval(session, label, compute_pool, env_vars):
-    print(f"Submitting {label} ...")
-    job_kwargs = {
-        "source": SCRIPTS_STAGE,
-        "entrypoint": "evaluate.py",
-        "compute_pool": compute_pool,
-        "stage_name": MLJOB_PAYLOAD_STAGE,
-        "target_instances": 1,
-        "env_vars": {
-            "MODEL_PATH": "best.pt",
-            "DATA_DIR": "/tmp/data",
-            "RESULTS_DIR": "results/",
-            "EVAL_RESULTS_STAGE": EVAL_RESULTS_STAGE,
-            "HOME": "/tmp",
-            **env_vars,
-        },
-        "session": session,
-    }
-    if env_vars.get("EVAL_MODE") == "benchmark":
-        job_kwargs["external_access_integrations"] = ["BENCHMARK_EXTERNAL_ACCESS"]
-        if env_vars.get("BENCHMARK_METHOD") == AUTOGLUON_METHOD:
-            job_kwargs["pip_requirements"] = AUTOGLUON_PIP_REQUIREMENTS
-        else:
-            job_kwargs["pip_requirements"] = BENCHMARK_PIP_REQUIREMENTS
-    return submit_from_stage(**job_kwargs)
 
 
 def _list_stage(session, stage_path):
@@ -152,15 +110,104 @@ def run_kaggle_download(session) -> str:
     )
 
 
+def build_meta_dataset_index(session) -> str:
+    print("Submitting META_DATASET_INDEX build job ...")
+    job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="build_meta_dataset_index.py",
+        compute_pool=CPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        pip_requirements=["pyarrow"],
+        env_vars={"HOME": "/tmp"},
+        session=session,
+    )
+    _wait_done(job, "META_DATASET_INDEX build", session)
+
+    counts = session.sql(
+        """
+        SELECT split, COUNT(*) AS task_count
+        FROM META_DATASET_INDEX
+        GROUP BY split
+        ORDER BY split
+        """
+    ).collect()
+    subset_counts = session.sql(
+        """
+        WITH ranked AS (
+          SELECT
+            *,
+            ROW_NUMBER() OVER (
+              PARTITION BY split, hpo_bucket
+              ORDER BY prior_regime, p, n_train, task_id
+            ) AS bucket_rank
+          FROM META_DATASET_INDEX
+          WHERE split IN ('train', 'val')
+        ),
+        selected AS (
+          SELECT *
+          FROM ranked
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY split
+            ORDER BY bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id
+          ) <= IFF(split = 'train', 200, 40)
+        )
+        SELECT split, COUNT(*) AS selected_rows
+        FROM selected
+        GROUP BY split
+        ORDER BY split
+        """
+    ).collect()
+    subset_count_map = {str(row[0]): int(row[1]) for row in subset_counts}
+    expected_subset_counts = {"train": 200, "val": 40}
+    if subset_count_map != expected_subset_counts:
+        raise ValueError(
+            "META_DATASET_INDEX HPO subset validation failed: "
+            f"expected {expected_subset_counts}, got {subset_count_map}"
+        )
+    return (
+        "META_DATASET_INDEX build complete.\n\n"
+        "Full split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        + "\n\nHPO subset counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in subset_counts)
+    )
+
+
 def run_pipeline(session) -> str:
-    # Phase 1: HPO
-    print("Submitting HPO job ...")
+    # ── Phase 1: Pre-train with default hyperparameters ───────────────────────
+    print("Submitting pre-training job (Phase 1) ...")
+    pretrain_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="train.py",
+        compute_pool=GPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=TRAIN_NUM_NODES,
+        env_vars={
+            "CHECKPOINT_OUTPUT_NAME": "pretrain.pt",
+            "TRAIN_NUM_NODES": str(TRAIN_NUM_NODES),
+            "HOME": "/tmp",
+            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
+            "STRICT_WORLD_SIZE_CHECK": "true",
+        },
+        session=session,
+    )
+    _wait_done(pretrain_job, "Pre-training", session)
+
+    if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "pretrain.pt"):
+        raise RuntimeError(
+            "Phase 1 (pre-training) did not produce pretrain.pt in "
+            f"{MODEL_STAGE}/checkpoints/. Check container logs before proceeding."
+        )
+
+    # ── Phase 2: HPO (each trial warm-starts from pretrain.pt) ───────────────
+    print("Submitting HPO job (Phase 2) ...")
     hpo_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
         compute_pool=GPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
-        target_instances=4,
+        target_instances=5,
         env_vars={"HOME": "/tmp"},
         session=session,
     )
@@ -171,8 +218,8 @@ def run_pipeline(session) -> str:
         best_config = json.load(f)
     print("Best config:", best_config)
 
-    # Phase 2: Full training
-    print("Submitting training job ...")
+    # ── Phase 3: Final training (fine-tunes from pretrain.pt with best_config) ─
+    print("Submitting final training job (Phase 3) ...")
     train_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="train.py",
@@ -181,17 +228,20 @@ def run_pipeline(session) -> str:
         target_instances=TRAIN_NUM_NODES,
         env_vars={
             "BEST_CONFIG": json.dumps(best_config),
+            "PRETRAIN_CHECKPOINT_PATH": f"{MODEL_STAGE}/checkpoints/pretrain.pt",
             "TRAIN_NUM_NODES": str(TRAIN_NUM_NODES),
             "HOME": "/tmp",
+            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
+            "STRICT_WORLD_SIZE_CHECK": "true",
         },
         session=session,
     )
-    _wait_done(train_job, "Training", session)
+    _wait_done(train_job, "Final training", session)
 
-    hpo_contents = _list_stage(session, f"{MODEL_STAGE}/hpo/")
+    hpo_contents        = _list_stage(session, f"{MODEL_STAGE}/hpo/")
     checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")
     return (
-        "Training pipeline complete.\n\n"
+        "Training pipeline complete (Pretrain → HPO → Final training).\n\n"
         "MODEL_STAGE hpo:\n"
         + "\n".join(f"  {p}" for p in hpo_contents)
         + "\n\nMODEL_STAGE checkpoints:\n"
@@ -199,71 +249,3 @@ def run_pipeline(session) -> str:
     )
 
 
-def run_evaluation_pipeline(session) -> str:
-    if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "best.pt"):
-        raise FileNotFoundError(f"{MODEL_STAGE}/checkpoints/best.pt is required before evaluation.")
-
-    synthetic_job = _submit_eval(
-        session,
-        "synthetic evaluation job",
-        GPU_POOL,
-        {"EVAL_MODE": "synthetic"},
-    )
-    deepset_job = _submit_eval(
-        session,
-        "DeepSetModel-MC benchmark job",
-        GPU_POOL,
-        {"EVAL_MODE": "benchmark", "BENCHMARK_METHOD": "DeepSetModel-MC"},
-    )
-
-    baseline_jobs = []
-    for i in range(0, len(BASELINE_METHODS), MAX_BASELINE_CONCURRENCY):
-        batch = BASELINE_METHODS[i:i + MAX_BASELINE_CONCURRENCY]
-        running = [
-            (
-                method,
-                _submit_eval(
-                    session,
-                    f"{method} benchmark job",
-                    CPU_POOL,
-                    {"EVAL_MODE": "benchmark", "BENCHMARK_METHOD": method},
-                ),
-            )
-            for method in batch
-        ]
-        for method, job in running:
-            _wait_done(job, f"{method} benchmark", session)
-            baseline_jobs.append(job)
-
-    autogluon_job = _submit_eval(
-        session,
-        "AutoGluon benchmark job",
-        AUTOGLUON_CPU_POOL,
-        {
-            "EVAL_MODE": "benchmark",
-            "BENCHMARK_METHOD": AUTOGLUON_METHOD,
-            "AUTOGLUON_TIME_LIMIT": "300",
-        },
-    )
-
-    _wait_done(synthetic_job, "Synthetic evaluation", session)
-    _wait_done(deepset_job, "DeepSetModel-MC benchmark", session)
-    _wait_done(autogluon_job, "AutoGluon benchmark", session)
-
-    aggregate_job = _submit_eval(
-        session,
-        "benchmark aggregate job",
-        CPU_POOL,
-        {"EVAL_MODE": "aggregate"},
-    )
-    _wait_done(aggregate_job, "Benchmark aggregate", session)
-
-    checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")
-    eval_contents = _list_stage(session, f"{EVAL_RESULTS_STAGE}/")
-    return (
-        "Evaluation pipeline complete.\n\n"
-        "MODEL_STAGE checkpoints:\n"
-        + "\n".join(f"  {p}" for p in checkpoint_contents)
-        + "\n\nEVALUATION_RESULTS_STAGE:\n"
-        + "\n".join(f"  {p}" for p in eval_contents)
-    )

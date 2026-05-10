@@ -10,7 +10,6 @@ Usage (inside container):
 """
 
 import os
-import glob
 
 import numpy as np
 import torch
@@ -18,8 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pyarrow.parquet as pq
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.data import Subset
-from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 try:
     from snowflake.ml.modeling.distributors.pytorch import (
@@ -35,7 +32,6 @@ except ImportError:
     get_context = None
 
 from model import DeepSetModel, ModelConfig
-from snowflake_io import materialize_meta_dataset_stage
 
 # ---------------------------------------------------------------------------
 # Key constants
@@ -57,8 +53,8 @@ WEIGHT_DECAY = 1e-4
 USE_AMP      = DEVICE == "cuda"
 
 USE_HUBER    = False   # off by default; toggle via hyper_params["use_huber"]
-LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse β
-HUBER_DELTA  = 1.0     # δ for Huber loss; robustness to Regime C heavy-tailed ε
+LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse Î²
+HUBER_DELTA  = 1.0     # Î´ for Huber loss; robustness to Regime C heavy-tailed Îµ
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +110,7 @@ def make_loader(files, shuffle):
         num_workers=4,
         prefetch_factor=2,
         pin_memory=USE_AMP,
+        persistent_workers=True,
         collate_fn=identity_collate,
     )
 
@@ -129,7 +126,7 @@ def run_epoch(model, loader, optimizer, scaler, training: bool, device, use_amp,
     Returns mean loss across all test-row predictions in the epoch.
 
     Args:
-        loss_fn:   callable(y_hat, y) → scalar loss, or None for MSE.
+        loss_fn:   callable(y_hat, y) â†’ scalar loss, or None for MSE.
         l1_lambda: L1 penalty coefficient on model parameters (training only).
     """
     model.train(training)
@@ -137,10 +134,10 @@ def run_epoch(model, loader, optimizer, scaler, training: bool, device, use_amp,
     total_count = 0
 
     for X_train, y_train, X_test, betaX_test in loader:
-        X_train    = X_train.to(device)
-        y_train    = y_train.to(device)
-        X_test     = X_test.to(device)
-        betaX_test = betaX_test.to(device)
+        X_train    = X_train.to(device, non_blocking=True)
+        y_train    = y_train.to(device, non_blocking=True)
+        X_test     = X_test.to(device, non_blocking=True)
+        betaX_test = betaX_test.to(device, non_blocking=True)
 
         if training:
             optimizer.zero_grad()
@@ -183,33 +180,137 @@ def reduce_loss_sum_count(loss_sum, total_count, device, dist_module):
 
 
 # ---------------------------------------------------------------------------
+# Pretrain checkpoint loader
+# ---------------------------------------------------------------------------
+
+def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank):
+    """Download and warm-start model from a pretrain checkpoint.
+
+    Called before torch.compile() and DDP wrapping so the plain nn.Module
+    receives the state dict. Raises RuntimeError if PRETRAIN_CHECKPOINT_PATH
+    is set but the file cannot be downloaded (missing stage file). Skips
+    gracefully only on architecture mismatch so HPO trials can explore
+    configs beyond the pretrain defaults.
+    """
+    import glob as _glob
+    local_dir = f"/tmp/pretrain_ckpt_rank{rank}"
+    os.makedirs(local_dir, exist_ok=True)
+    local_path = os.path.join(local_dir, "pretrain.pt")
+    try:
+        from snowflake.snowpark import Session
+        session = Session.builder.getOrCreate()
+        session.file.get(stage_path, local_dir)
+        # session.file.get may rename with a suffix; try exact path first, then glob
+        if not os.path.exists(local_path):
+            candidates = sorted(_glob.glob(local_path + "*"))
+            if candidates:
+                local_path = candidates[0]
+        if not os.path.exists(local_path):
+            raise RuntimeError(
+                f"[PRETRAIN] rank {rank}: PRETRAIN_CHECKPOINT_PATH was set to "
+                f"{stage_path!r} but the file could not be downloaded. "
+                "Verify the file exists with: LIST @MODEL_STAGE/checkpoints/;"
+            )
+        # PyTorch 2.6+ compat: try weights_only=True first, fall back for legacy ModelConfig
+        try:
+            ckpt = torch.load(local_path, map_location=device, weights_only=True)
+        except Exception as _exc:
+            _msg = str(_exc)
+            if ("ModelConfig" in _msg or "Weights only load failed" in _msg
+                    or "Unsupported global" in _msg or "UnpicklingError" in _msg):
+                try:
+                    from torch.serialization import safe_globals
+                    from model import ModelConfig as _MC
+                    with safe_globals([_MC]):
+                        ckpt = torch.load(local_path, map_location=device, weights_only=True)
+                except Exception:
+                    ckpt = torch.load(local_path, map_location=device, weights_only=False)
+            else:
+                raise
+        saved_cfg = ckpt.get("cfg")
+        if saved_cfg != cfg:
+            print(f"[PRETRAIN] rank {rank}: architecture mismatch "
+                  f"(saved={saved_cfg}, current={cfg}); starting from scratch.", flush=True)
+            return
+        model.load_state_dict(ckpt["state_dict"])
+        print(f"[PRETRAIN] rank {rank}: loaded pretrain checkpoint from {stage_path}", flush=True)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        print(f"[PRETRAIN] rank {rank}: could not load {stage_path}: {exc}; starting from scratch.", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Snowpark upload
 # ---------------------------------------------------------------------------
 
-def upload_to_snowflake(local_path: str, stage_path: str):
+def upload_to_snowflake(local_path: str, stage_path: str, raise_on_error: bool = False):
     """
     Upload a local file to a Snowflake internal stage via Snowpark.
     Wrapped in try/except so it degrades gracefully when running locally.
+    Set raise_on_error=True for diagnostic uploads where silent failure is unacceptable.
     """
     try:
-        from snowflake.snowpark.context import get_active_session
-        session = get_active_session()
+        from snowflake.snowpark import Session
+        session = Session.builder.getOrCreate()
         session.file.put(local_path, stage_path, overwrite=True, auto_compress=False)
-        print(f"Uploaded {local_path} to {stage_path}")
+        print(f"Uploaded {local_path} to {stage_path}", flush=True)
     except Exception as exc:
-        print(f"[WARNING] Snowpark upload failed (skipping): {exc}")
+        print(f"[WARNING] Snowpark upload failed (skipping): {exc}", flush=True)
+        if raise_on_error:
+            raise
+
+
+def upload_training_failure(exc, stage_path="@MODEL_STAGE/checkpoints/"):
+    """
+    Upload uncaught training failure details for Snowflake-first diagnostics.
+    """
+    import json as _json
+    import socket as _socket
+    import time as _time
+    import traceback as _traceback
+
+    payload = {
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+        "traceback": _traceback.format_exc(),
+        "time_utc": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        "host": _socket.gethostname(),
+        "checkpoint_output_name": os.environ.get("CHECKPOINT_OUTPUT_NAME", ""),
+        "train_num_nodes": os.environ.get("TRAIN_NUM_NODES", ""),
+        "expected_train_world_size": os.environ.get("EXPECTED_TRAIN_WORLD_SIZE", ""),
+    }
+    local_path = "train_failure.json"
+    with open(local_path, "w", encoding="utf-8") as handle:
+        _json.dump(payload, handle, indent=2, sort_keys=True)
+    print("[TRAINING FAILURE JSON]", _json.dumps(payload, indent=2, sort_keys=True), flush=True)
+    try:
+        upload_to_snowflake(local_path, stage_path, raise_on_error=True)
+    except Exception as upload_exc:
+        print(
+            "[TRAINING FAILURE UPLOAD FAILED] "
+            f"{type(upload_exc).__name__}: {upload_exc}",
+            flush=True,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Distributed training function (invoked by PyTorchDistributor on each worker)
 # ---------------------------------------------------------------------------
 
-def train_fn(dataset_map, hyper_params):
+def train_fn():
     """
     Invoked by PyTorchDistributor on each worker.
     DDP process group is initialized automatically by the distributor.
+    All config is read from os.environ â€” PyTorchDistributor calls this with zero args.
     """
+    print("[train_fn] entered train_fn", flush=True)
+    import json as _json
     import torch.distributed as dist
+    from snowflake_io import (
+        materialize_indexed_meta_dataset,
+        select_rank_sharded_index_rows,
+    )
 
     ctx       = get_context()
     local_rank = ctx.get_local_rank() if hasattr(ctx, "get_local_rank") else ctx.local_rank
@@ -217,7 +318,25 @@ def train_fn(dataset_map, hyper_params):
     world_size = ctx.get_world_size() if hasattr(ctx, "get_world_size") else ctx.world_size
     device    = f"cuda:{local_rank}"
     is_main   = (rank == 0)
+    import socket as _socket
+    print(
+        f"[train_fn] worker: rank={rank} local_rank={local_rank} world_size={world_size} "
+        f"device={device} host={_socket.gethostname()} "
+        f"cuda_available={torch.cuda.is_available()} "
+        f"cuda_device_count={torch.cuda.device_count()} "
+        f"TRAIN_NUM_NODES={os.environ.get('TRAIN_NUM_NODES', '?')} "
+        f"EXPECTED_TRAIN_WORLD_SIZE={os.environ.get('EXPECTED_TRAIN_WORLD_SIZE', '?')} "
+        f"STRICT_WORLD_SIZE_CHECK={os.environ.get('STRICT_WORLD_SIZE_CHECK', '?')} "
+        f"CHECKPOINT_OUTPUT_NAME={os.environ.get('CHECKPOINT_OUTPUT_NAME', '?')}",
+        flush=True,
+    )
     use_amp   = True
+    pretrain_ckpt_stage_path = os.environ.get("PRETRAIN_CHECKPOINT_PATH", "").strip()
+    checkpoint_output_name   = os.environ.get("CHECKPOINT_OUTPUT_NAME", "best.pt")
+
+    # Pre-training: BEST_CONFIG absent â†’ hyper_params={} â†’ all .get() fall back to
+    # module-level defaults (LR=1e-3, D_PHI=128, MAX_EPOCHS=200, etc.). Correct.
+    hyper_params = _json.loads(os.environ.get("BEST_CONFIG", "{}"))
 
     lr           = float(hyper_params.get("lr",           LR))
     weight_decay = float(hyper_params.get("weight_decay", WEIGHT_DECAY))
@@ -234,35 +353,73 @@ def train_fn(dataset_map, hyper_params):
     _huber_loss = nn.HuberLoss(delta=huber_delta) if use_huber else None
     loss_fn     = (lambda y_hat, y: _huber_loss(y_hat, y)) if use_huber else None
 
-    # --- DataLoader with DistributedSampler ---
-    materialize_meta_dataset_stage(DATA_DIR, splits=("train", "val"))
-    train_files = sorted(glob.glob(os.path.join(DATA_DIR, "train", "*.parquet")))
-    val_files   = sorted(glob.glob(os.path.join(DATA_DIR, "val",   "*.parquet")))
+    # ---- World-size topology check (fires before data materialization) ----
+    _expected_ws   = int(os.environ.get("EXPECTED_TRAIN_WORLD_SIZE", "0"))
+    _strict_ws     = os.environ.get("STRICT_WORLD_SIZE_CHECK", "").lower() == "true"
+    if is_main:
+        print(
+            f"[train_fn] topology: actual_world_size={world_size}  "
+            f"expected_world_size={_expected_ws if _expected_ws > 0 else '(not set)'}  "
+            f"TRAIN_NUM_NODES={os.environ.get('TRAIN_NUM_NODES', '?')}  "
+            f"num_workers_per_node=4  "
+            f"STRICT_WORLD_SIZE_CHECK={_strict_ws}",
+            flush=True,
+        )
+    if _expected_ws > 0 and _strict_ws and world_size != _expected_ws:
+        raise RuntimeError(
+            f"[train_fn] World-size mismatch: EXPECTED_TRAIN_WORLD_SIZE={_expected_ws} "
+            f"but PyTorchDistributor reports world_size={world_size}. "
+            f"TRAIN_NUM_NODES={os.environ.get('TRAIN_NUM_NODES', '?')}, "
+            "num_workers_per_node=4. "
+            "Verify that target_instances in submit_from_stage() equals num_nodes in "
+            "PyTorchScalingConfig, and that all nodes in the compute pool are healthy."
+        )
+
+    # --- Data: query this rank's rows directly; avoid ShardedDataConnector shard conversion. ---
+    train_rows = select_rank_sharded_index_rows("train", rank=rank, world_size=world_size)
+    val_rows = select_rank_sharded_index_rows("val", rank=rank, world_size=world_size)
+    print(
+        f"[train_fn] rank={rank} world_size={world_size} selected_rows "
+        f"train={len(train_rows)} val={len(val_rows)} "
+        f"train_stage_sample={[row['stage_path'] for row in train_rows[:3]]} "
+        f"val_stage_sample={[row['stage_path'] for row in val_rows[:3]]}",
+        flush=True,
+    )
+    files_by_split = materialize_indexed_meta_dataset(
+        DATA_DIR,
+        splits=("train", "val"),
+        rows=train_rows + val_rows,
+    )
+    train_files = files_by_split["train"]
+    val_files = files_by_split["val"]
+
+    # ---- Startup diagnostics (printed before any guard so failures are self-explanatory) ----
+    _num_workers_per_node = 4  # mirrors main() PyTorchScalingConfig; logged for cross-check
+    print(
+        f"[train_fn] rank={rank} local_rank={local_rank} world_size={world_size}  "
+        f"TRAIN_NUM_NODES={os.environ.get('TRAIN_NUM_NODES','?')}  "
+        f"num_workers_per_node={_num_workers_per_node}  "
+        f"checkpoint_output_name={checkpoint_output_name!r}  "
+        f"is_pretrain={checkpoint_output_name == 'pretrain.pt'}  "
+        f"train_files={len(train_files)}  val_files={len(val_files)}  "
+        f"train_sample={train_files[:3]}  val_sample={val_files[:3]}",
+        flush=True,
+    )
+
     if not train_files or not val_files:
         raise FileNotFoundError(
             f"Training requires non-empty train and val parquet splits under {DATA_DIR}; "
             f"found train={len(train_files)}, val={len(val_files)}"
         )
-    if len(train_files) % world_size != 0:
-        raise ValueError(
-            f"Training split has {len(train_files)} tasks, which is not divisible by "
-            f"world_size={world_size}. Regenerate or restage train data so every DDP "
-            "rank has the same number of backward steps."
-        )
 
-    train_dataset = ParquetMetaDataset(train_files)
-    val_dataset_all = ParquetMetaDataset(val_files)
-    val_indices = make_no_padding_rank_indices(len(val_files), rank, world_size)
-    val_dataset = Subset(val_dataset_all, val_indices)
-
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size,
-                                       rank=rank, shuffle=True)
-    train_loader  = DataLoader(train_dataset, batch_size=1, sampler=train_sampler,
-                               num_workers=4, prefetch_factor=2, pin_memory=True,
-                               collate_fn=identity_collate)
-    val_loader    = DataLoader(val_dataset,   batch_size=1, shuffle=False,
-                               num_workers=4, prefetch_factor=2, pin_memory=True,
-                               collate_fn=identity_collate)
+    train_loader = DataLoader(
+        ParquetMetaDataset(train_files), batch_size=1, shuffle=True,
+        num_workers=4, prefetch_factor=2, pin_memory=True, collate_fn=identity_collate,
+    )
+    val_loader = DataLoader(
+        ParquetMetaDataset(val_files), batch_size=1, shuffle=False,
+        num_workers=4, prefetch_factor=2, pin_memory=True, collate_fn=identity_collate,
+    )
 
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
@@ -272,6 +429,8 @@ def train_fn(dataset_map, hyper_params):
                         n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
                         norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout)
     model = DeepSetModel(cfg=cfg).to(device)
+    if pretrain_ckpt_stage_path:
+        _load_pretrain_checkpoint(model, pretrain_ckpt_stage_path, cfg, device, rank)
     model = torch.compile(model, mode="reduce-overhead")
     model = DistributedDataParallel(model, device_ids=[local_rank])
 
@@ -282,7 +441,6 @@ def train_fn(dataset_map, hyper_params):
     patience_count = 0
 
     for epoch in range(1, max_epochs + 1):
-        train_sampler.set_epoch(epoch)
         train_mse = run_epoch(model, train_loader, optimizer, scaler, True,  device, use_amp,
                               loss_fn=loss_fn, l1_lambda=lambda_l1)
         with torch.no_grad():
@@ -300,7 +458,17 @@ def train_fn(dataset_map, hyper_params):
                 patience_count = 0
                 ckpt = model.module if isinstance(model, DistributedDataParallel) else model
                 ckpt = ckpt._orig_mod if hasattr(ckpt, "_orig_mod") else ckpt
-                torch.save({"state_dict": ckpt.state_dict(), "cfg": ckpt.cfg}, "best.pt")
+                import dataclasses as _dc
+                torch.save({
+                    "checkpoint_format_version": 2,
+                    "cfg": _dc.asdict(ckpt.cfg),
+                    "state_dict": ckpt.state_dict(),
+                    "metadata": {
+                        "source": "train.py",
+                        "checkpoint_name": os.path.basename(checkpoint_output_name),
+                        "pytorch_version": torch.__version__,
+                    },
+                }, checkpoint_output_name)
             else:
                 patience_count += 1
 
@@ -312,36 +480,63 @@ def train_fn(dataset_map, hyper_params):
             break
 
     if is_main:
-        upload_to_snowflake("best.pt", "@MODEL_STAGE/checkpoints/")
+        upload_to_snowflake(checkpoint_output_name, "@MODEL_STAGE/checkpoints/")
 
     return {"val_mse": best_val_mse}
 
 
 # ---------------------------------------------------------------------------
-# Entry point — submits train_fn via PyTorchDistributor
+# Entry point â€” submits train_fn via PyTorchDistributor
 # ---------------------------------------------------------------------------
 
 def main():
-    import json
+    print("[train.py main] entered main", flush=True)
     if PyTorchDistributor is None:
         raise RuntimeError(
             "snowflake.ml is required to submit distributed training. "
             "Run train.py inside the Snowflake ML runtime or install snowflake-ml-python."
         )
-    hyper_params = json.loads(os.environ.get("BEST_CONFIG", "{}"))
 
     distributor = PyTorchDistributor(
         train_func=train_fn,
         scaling_config=PyTorchScalingConfig(
-            num_nodes=int(os.environ.get("TRAIN_NUM_NODES", "4")),
-            num_workers_per_node=1,   # 1 A10G per GPU_NV_S node
+            num_nodes=int(os.environ.get("TRAIN_NUM_NODES", "10")),
+            num_workers_per_node=4,   # 4 A10G GPUs per GPU_NV_M node
             resource_requirements_per_worker=WorkerResourceConfig(
                 num_cpus=4,
                 num_gpus=1,
             ),
         ),
     )
-    result = distributor.run(hyper_params=hyper_params)
+    # Write a startup artifact before launching workers so we can confirm train.py main()
+    # was reached even if distributor.run() fails before Python diagnostics run.
+    import json as _json_main
+    import time as _time_main
+    _startup_payload = {
+        "time_utc":                   _time_main.strftime("%Y-%m-%dT%H:%M:%SZ", _time_main.gmtime()),
+        "TRAIN_NUM_NODES":            os.environ.get("TRAIN_NUM_NODES", ""),
+        "EXPECTED_TRAIN_WORLD_SIZE":  os.environ.get("EXPECTED_TRAIN_WORLD_SIZE", ""),
+        "STRICT_WORLD_SIZE_CHECK":    os.environ.get("STRICT_WORLD_SIZE_CHECK", ""),
+        "has_best_config":            bool(os.environ.get("BEST_CONFIG", "")),
+        "has_pretrain":               bool(os.environ.get("PRETRAIN_CHECKPOINT_PATH", "")),
+        "checkpoint_output_name":     os.environ.get("CHECKPOINT_OUTPUT_NAME", "best.pt"),
+    }
+    print("[train.py main] startup:", _startup_payload, flush=True)
+    _startup_local = "training_submission_started.json"
+    with open(_startup_local, "w", encoding="utf-8") as _f:
+        _json_main.dump(_startup_payload, _f, indent=2, sort_keys=True)
+    upload_to_snowflake(_startup_local, "@MODEL_STAGE/checkpoints/")
+
+    print("[train.py main] starting PyTorchDistributor.run", flush=True)
+    try:
+        result = distributor.run(
+            artifact_stage_location="TABPFN_DB.TABPFN_SCHEMA.MODEL_STAGE"
+        )
+        print("[train.py main] PyTorchDistributor.run completed", flush=True)
+    except Exception as exc:
+        print("[train.py main] PyTorchDistributor.run failed:", repr(exc), flush=True)
+        upload_training_failure(exc)
+        raise
     print("Training result:", result)
 
 

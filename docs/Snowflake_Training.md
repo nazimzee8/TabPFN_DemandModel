@@ -1,4 +1,4 @@
-# Snowflake Training — DeepSet TabPFN
+# Snowflake Training - DeepSet TabPFN
 
 Describes how to run the DeepSet training pipeline inside a Snowflake environment
 using Snowpark Container Services (SPCS) and Snowflake Model Registry.
@@ -15,12 +15,18 @@ written back to Snowflake.
 1. **Create database, schema, and stages** with `run_training_job.sql`: `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_RESULTS_STAGE`, and `@MLJOB_PAYLOAD_STAGE`.
 2. **Create compute pools** with `run_training_job.sql`: `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and `AUTOGLUON_CPU_POOL`. Verify the pools reach `ACTIVE` state before submitting jobs.
 3. **Create network rules, `KAGGLE_API_SECRET`, and `BENCHMARK_EXTERNAL_ACCESS`**. The committed SQL uses placeholders only; never commit real Kaggle credentials.
-4. **Upload scripts and Parquet data** with SnowSQL `PUT`: scripts to `@MODEL_STAGE/scripts/` and local synthetic datasets to `@META_DATASET_STAGE/{train,val,test}/`.
-5. **Call `download_kaggle_to_stage()`**. This submits an MLJob that receives Kaggle credentials at runtime and writes benchmark `.npz` files to `@META_DATASET_STAGE/kaggle/`.
-6. **Call `run_training_pipeline()`**. HPO writes `@MODEL_STAGE/hpo/best_config.json`; training consumes that JSON through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
-7. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
-8. **Call `run_evaluation_pipeline()`**. Evaluation reads `best.pt`, runs synthetic, DeepSet, baseline, AutoGluon, and aggregate jobs, then writes CSV outputs to `@EVALUATION_RESULTS_STAGE`.
-9. **Download results locally** from the client with SnowSQL `GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';`.
+4. **Upload scripts and Parquet data** with SnowSQL `PUT`: `src/*.py` and `scripts/*.py` to `@MODEL_STAGE/scripts/`, and local synthetic datasets to `@META_DATASET_STAGE/{train,val,test}/`.
+5. **Call `build_meta_dataset_index()`**. This submits a CPU MLJob that lists staged synthetic parquet, reads scalar metadata inside Snowflake, rebuilds `META_DATASET_INDEX`, and validates `train=800`, `val=100`, `test=100`.
+6. **Optionally call `download_kaggle_to_stage()`**. This submits an MLJob that receives Kaggle credentials at runtime and stages raw Kaggle benchmark inputs under `@META_DATASET_STAGE/kaggle/`.
+7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_DATASET_STAGE/benchmark_prepared/`.
+8. **Call `run_pretrain_pipeline()`**. Pretrain writes mandatory
+   `@MODEL_STAGE/checkpoints/pretrain.pt`; verify it before HPO starts.
+9. **Call `run_hpo_pipeline()`**. HPO requires `pretrain.pt`, tunes only `lr`,
+   `weight_decay`, and `dropout`, and writes `@MODEL_STAGE/hpo/best_config.json`.
+10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
+11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
+12. **Call `run_evaluation_pipeline()`**. Evaluation reads `best.pt`, runs synthetic evaluation, prepares benchmark datasets if needed, launches prepared-dataset benchmark shards, then aggregates CSV outputs to `@EVALUATION_RESULTS_STAGE`.
+13. **Download results locally** from the client with SnowSQL `GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';`.
 
 ## Current Snowflake Guardrails
 
@@ -38,17 +44,31 @@ written back to Snowflake.
   injected into the Kaggle download MLJob at runtime as `KAGGLE_USERNAME` and
   `KAGGLE_KEY`; they are not stored in the repo, staged as files, printed, or baked
   into a container image.
-- AutoGluon is a full benchmark method. Its job installs the shared benchmark
-  dependencies plus `autogluon.tabular[all]==1.0.0`, sets
-  `BENCHMARK_METHOD=AutoGluon`, `AUTOGLUON_TIME_LIMIT=300`, and writes
-  `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_detailed.csv`.
+- AutoGluon is a full benchmark method. Its shard jobs use
+  `AUTOGLUON_RUNTIME_ENVIRONMENT`, set
+  `BENCHMARK_METHOD=AutoGluon`, `AUTOGLUON_TIME_LIMIT=300`, and write unique part
+  CSVs under `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_shard{i}_of_{n}_detailed.csv`.
+- DeepSet benchmark shard jobs run `DeepSetModel-MC bounded-context ensemble`, not
+  exact full-context DeepSet inference. The OOM boundary was forwarding the full
+  90% processed training split against the full test split inside MC dropout on
+  Snowflake GPU nodes. The remediation preserves dataset, seed, split, and test-row
+  coverage by splitting 90/10 first, fitting preprocessing on train only, sampling
+  five deterministic 200-row train-only contexts, predicting the same processed
+  full test split in 128-row chunks, averaging the five prediction vectors, and
+  computing metrics once. First stable full benchmark runs use `MC_K=8`; move to
+  `MC_K=16` only after memory and runtime stability are proven.
 
 Recommended smoke order: compile the Python scripts, create Snowflake objects with
-`run_training_job.sql`, run `CALL download_kaggle_to_stage()`, run
-`CALL run_training_pipeline()`, verify `LIST @MODEL_STAGE/hpo/` and
-`LIST @MODEL_STAGE/checkpoints/` include `best.pt`, run a one-dataset AutoGluon smoke
-where supported, then run `CALL run_evaluation_pipeline()` and verify
-`AutoGluon_detailed.csv`, `model_comparison.csv`, and
+`run_training_job.sql`, run `CALL build_meta_dataset_index()`, optionally run
+`CALL download_kaggle_to_stage()` for raw Kaggle staging, run
+`CALL prepare_benchmark_datasets()`, verify
+`LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';`,
+run `CALL run_hpo_pipeline()`, verify or read
+`@MODEL_STAGE/hpo/best_config.json`, run `CALL run_model_training()`, verify
+`LIST @MODEL_STAGE/checkpoints/` includes
+`best.pt`, run a one-dataset AutoGluon smoke where supported, then run
+`CALL run_evaluation_pipeline()` and verify
+`benchmark_parts/AutoGluon_shard*_detailed.csv`, `model_comparison.csv`, and
 `model_comparison_summary.csv`.
 
 ## Secure Kaggle Token Handling
@@ -113,8 +133,8 @@ the pipeline again.
 
 ## Snowflake Environment Setup Checklist
 
-Use this checklist before running `CALL run_training_pipeline()` and
-`CALL run_evaluation_pipeline()`. It covers synthetic data staging, Snowflake-native
+Use this checklist before running `CALL run_hpo_pipeline()`,
+`CALL run_model_training()`, and `CALL run_evaluation_pipeline()`. It covers synthetic data staging, Snowflake-native
 Kaggle benchmark ingestion, benchmark external network access,
 `EVALUATION_RESULTS_STAGE`, CPU compute pools, and local result retrieval.
 
@@ -149,15 +169,19 @@ Synthetic meta-datasets are staged as Parquet files:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE;
+REMOVE @META_DATASET_STAGE/train/;
+REMOVE @META_DATASET_STAGE/val/;
+REMOVE @META_DATASET_STAGE/test/;
+PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
-For Kaggle benchmark data, the preferred production path is Snowflake-native:
+For Kaggle benchmark data, the preferred production raw-staging path is Snowflake-native:
 store the Kaggle API token in a Snowflake `SECRET`, run the one-off
-`download_kaggle_to_stage()` setup procedure, and let the MLJob upload `.npz`
-files directly to `@META_DATASET_STAGE/kaggle/`.
+`download_kaggle_to_stage()` setup procedure, and let the MLJob upload raw Kaggle
+`.npz` files directly to `@META_DATASET_STAGE/kaggle/`. Those files are not the
+final benchmark inputs consumed by shard jobs.
 
 Local `kaggle.json` is only needed when generating `.npz` files on your workstation
 for development or fallback testing:
@@ -177,16 +201,39 @@ USE SCHEMA TABPFN_SCHEMA;
 PUT file://C:/Documents/TabPFN_DemandModel/data/kaggle/*.npz @META_DATASET_STAGE/kaggle/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
-The Snowflake-native Kaggle path replaces this local upload for normal operations.
-OpenML remains fetched from inside Snowflake by benchmark MLJobs at runtime; do not
-pre-stage OpenML files unless you intentionally change the evaluation mode.
+After optional Kaggle raw staging, run the canonical preparation procedure. It
+fetches OpenML datasets, normalizes OpenML and Kaggle into prepared `.npz` files,
+and writes the manifest plus `BENCHMARK_DATASET_INDEX` metadata table used by
+all benchmark shards:
+
+```sql
+CALL prepare_benchmark_datasets();
+LIST @META_DATASET_STAGE/benchmark_prepared/;
+LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+```
+
+Production benchmark shard jobs consume prepared staged datasets only:
+`@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
+`.npz` files under `@META_DATASET_STAGE/benchmark_prepared/{openml,kaggle}/`.
+They load prepared files with `np.load(..., allow_pickle=False)` and must not
+fetch OpenML or Kaggle data at shard runtime. `evaluate.py` must not import,
+require, or call OpenML APIs; OpenML is a dataset-preparation dependency only,
+owned by `prepare_benchmark_datasets.py`. `evaluate.py` reads only prepared
+manifest/index metadata plus staged `.npz` payloads. Each shard owns datasets by
+`dataset_index` and evaluates every owned dataset across all configured seeds,
+loading one `.npz` file at a time. The default assignment is deterministic
+modulo; `BENCHMARK_SHARD_STRATEGY=balanced` uses
+`BENCHMARK_DATASET_INDEX.benchmark_weight` for cost-aware assignment without
+inspecting or transforming the staged `.npz` payloads.
 
 ### 3. Enable external network access and Kaggle secret
 
-OpenML benchmark jobs need Snowflake external access so `evaluate.py` can reach
-OpenML from the container runtime. The Kaggle setup job also needs external access
-to Kaggle/download hosts and a Snowflake `SECRET` holding the API credentials.
-Create the network rules and secret in `TABPFN_SCHEMA`:
+Benchmark dataset preparation needs Snowflake external access so
+`prepare_benchmark_datasets.py` can fetch OpenML and read staged Kaggle inputs.
+The optional Kaggle setup job also needs external access to Kaggle/download hosts
+and a Snowflake `SECRET` holding the API credentials. Benchmark shard jobs must
+not use OpenML or Kaggle network fetch paths in production. Create the network
+rules and secret in `TABPFN_SCHEMA`:
 
 ```sql
 USE ROLE SYSADMIN;
@@ -245,17 +292,43 @@ GRANT USAGE ON INTEGRATION benchmark_external_access TO ROLE <job_submitter_role
 `external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"]` and
 `pip_requirements=["kaggle"]`; Kaggle credentials are exposed to the container as
 `KAGGLE_USERNAME` and `KAGGLE_KEY` through MLJob `spec_overrides`, not read by the
-script through `snowflake.snowpark.secrets`. Benchmark evaluation jobs also name
-`BENCHMARK_EXTERNAL_ACCESS` for OpenML fetches and install `openml`, `scikit-learn`,
-`xgboost`, `lightgbm`, `catboost`, `pandas`, and `scipy` with `pip_requirements`.
-Creating the environment objects only makes the route available; jobs will not use
-it unless the MLJob configuration names the integration and dependencies.
+script through `snowflake.snowpark.secrets`.
 
-After uploading scripts, run the setup procedure and verify staged `.npz` files:
+`run_evaluation_pipeline()` first checks
+`@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json`. It submits the
+benchmark dataset preparation job only when that manifest is absent. The prep job
+uses `external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"]`; benchmark
+shard jobs do not receive that integration. `openml` is not a shard dependency,
+and `evaluate.py` must remain OpenML-free. Creating the
+environment objects only makes the route available; jobs will not use it unless
+the MLJob configuration names the integration and dependencies.
+
+The evaluation submission layer requires prebuilt managed runtime images instead
+of installing packages at MLJob startup. Configure all three controls before
+calling `run_evaluation_pipeline()`:
+
+- `PREP_RUNTIME_ENVIRONMENT` for `prepare_benchmark_datasets.py`.
+- `BENCHMARK_RUNTIME_ENVIRONMENT` for non-AutoGluon `evaluate.py` jobs,
+  including synthetic evaluation, DeepSet benchmark shards, baseline benchmark
+  shards, and aggregation.
+- `AUTOGLUON_RUNTIME_ENVIRONMENT` for AutoGluon shards.
+
+`run_evaluation_test.py` passes these values to
+`submit_from_stage(runtime_environment=...)` and does not pass
+`pip_requirements` for evaluation or prep submissions. It fails fast with a
+`RuntimeError` if any required runtime image env var is missing. Verify available
+runtime image names in the target account. Snowflake documents the argument on the
+[`submit_from_stage` API reference](https://docs.snowflake.com/en/developer-guide/snowpark-ml/reference/latest/api/jobs/snowflake.ml.jobs.submit_from_stage).
+
+After uploading scripts, optionally run the raw Kaggle setup procedure, then run
+dataset preparation and verify the prepared benchmark manifest:
 
 ```sql
 CALL download_kaggle_to_stage();
 LIST @META_DATASET_STAGE/kaggle/;
+CALL prepare_benchmark_datasets();
+LIST @META_DATASET_STAGE/benchmark_prepared/;
+LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 ```
 
 References: Snowflake [`CREATE NETWORK RULE`](https://docs.snowflake.com/en/sql-reference/sql/create-network-rule) and [`CREATE EXTERNAL ACCESS INTEGRATION`](https://docs.snowflake.com/en/sql-reference/sql/create-external-access-integration).
@@ -275,16 +348,16 @@ CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_S
 
 Resource split:
 
-- GPU (`DEEPSET_GPU_POOL`): HPO, 4-node DDP training, synthetic DeepSet evaluation, and DeepSet benchmark.
-- CPU_X64_XS (`DEEPSET_CPU_POOL`): Kaggle download, classic baseline benchmark jobs, and aggregation.
-- CPU_X64_M (`AUTOGLUON_CPU_POOL`): AutoGluon benchmark.
+- GPU (`DEEPSET_GPU_POOL`): 5-node HPO, 10-node DDP training, synthetic DeepSet evaluation, and DeepSet-MC benchmark (10 single-node GPU shard jobs).
+- CPU_X64_XS (`DEEPSET_CPU_POOL`): Kaggle download, 3 single-node combined baseline dataset shard jobs, and aggregation. Each baseline shard receives `BENCHMARK_METHODS=<all 9 baseline methods>`, owns a dataset subset, and runs all baseline methods inside the dataset-first loop.
+- CPU_X64_M (`AUTOGLUON_CPU_POOL`): AutoGluon benchmark shards (30 single-node jobs).
 
 ```sql
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 4
-  INSTANCE_FAMILY = GPU_NV_S
+  MAX_NODES = 10
+  INSTANCE_FAMILY = GPU_NV_M
   AUTO_SUSPEND_SECS = 300;
 
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
@@ -298,7 +371,7 @@ CREATE COMPUTE POOL DEEPSET_CPU_POOL
 DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;
 CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 1
+  MAX_NODES = 30
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -329,35 +402,43 @@ python download_results.py
 
 ```
 Local machine
-  └── *.parquet ──PUT──→ @META_DATASET_STAGE
-  └── *.py ──PUT──→ @MODEL_STAGE/scripts/ ──vol mount──→ /opt/app/
+  â””â”€â”€ *.parquet â”€â”€PUTâ”€â”€â†’ @META_DATASET_STAGE
+  â””â”€â”€ *.py â”€â”€PUTâ”€â”€â†’ @MODEL_STAGE/scripts/ â”€â”€vol mountâ”€â”€â†’ /opt/app/
 
 Snowsight / SnowSQL
-  └── CALL run_training_pipeline() ──→ Snowpark stored procedure
-        └── run_training_job.run_pipeline(session) submits:
+  â””â”€â”€ CALL run_hpo_pipeline() â”€â”€â†’ Snowpark stored procedure
+        â””â”€â”€ run_hpo_job.run_hpo_pipeline(session) submits:
 
-Container Runtime — Phase 1: HPO (2 nodes)
-  └── hpo.py → @MODEL_STAGE/hpo/best_config.json
-
-Container Runtime — Phase 2: Training (4 nodes, DDP)
-  ├── materialize_meta_dataset_stage() copies staged parquet to /tmp/data/
-  ├── DataLoader (4 workers, prefetch_factor=2) reads /tmp/data/train/*.parquet
-  ├── trains DeepSet (phi, rho, psi + 4 equivariant scalars)
-  │     BF16 autocast + GradScaler, batched forward over all m test rows
-  │     torch.compile(mode="reduce-overhead") fuses GPU kernels
-  └── writes best.pt → @MODEL_STAGE/checkpoints/best.pt
+Container Runtime - Phase 1: HPO (5 nodes, GPU_NV_M)
+  â””â”€â”€ hpo.py â†’ @MODEL_STAGE/hpo/best_config.json
 
 Snowsight / SnowSQL
-  └── CALL run_evaluation_pipeline() ──→ Snowpark stored procedure
-        └── run_training_job.run_evaluation_pipeline(session) submits:
+  â””â”€â”€ CALL run_model_training() â”€â”€â†’ Snowpark stored procedure
+        â””â”€â”€ run_model_training_job.run_model_training(session) submits:
 
-Container Runtime — Evaluation
-  └── evaluate.py → @EVALUATION_RESULTS_STAGE/synthetic/*.csv
-                  → @EVALUATION_RESULTS_STAGE/benchmark_parts/*.csv
-                  → @EVALUATION_RESULTS_STAGE/model_comparison.csv
+Container Runtime - Phase 2: Training (10 nodes, DDP)
+  â”œâ”€â”€ reads @MODEL_STAGE/hpo/best_config.json into BEST_CONFIG
+  â”œâ”€â”€ META_DATASET_INDEX selects full train/val stage_path rows
+  â”œâ”€â”€ materialize_indexed_meta_dataset() copies selected parquet to /tmp/data/
+  â”œâ”€â”€ DataLoader (4 workers, prefetch_factor=2) reads /tmp/data/train/*.parquet
+  â”œâ”€â”€ trains DeepSet (phi, rho, psi + 4 equivariant scalars)
+  â”‚     BF16 autocast + GradScaler, batched forward over all m test rows
+  â”‚     torch.compile(mode="reduce-overhead") fuses GPU kernels
+  â””â”€â”€ writes best.pt â†’ @MODEL_STAGE/checkpoints/best.pt
+
+Snowsight / SnowSQL
+  â””â”€â”€ CALL run_evaluation_pipeline() â”€â”€â†’ Snowpark stored procedure
+        â””â”€â”€ run_evaluation_test.run_evaluation_pipeline(session) submits:
+
+Container Runtime - Evaluation
+  â”œâ”€â”€ prepare_benchmark_datasets.py â†’ @META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json
+  â””â”€â”€ evaluate.py â†’ @EVALUATION_RESULTS_STAGE/synthetic/*.csv
+                  â†’ @EVALUATION_RESULTS_STAGE/benchmark_parts/*_shard*_detailed.csv
+                  â†’ @EVALUATION_RESULTS_STAGE/model_comparison.csv
+                  â†’ @EVALUATION_RESULTS_STAGE/model_comparison_summary.csv
 
 Model Registry
-  └── DEEPSET_TABPFN_V1!PREDICT() ← loads from @MODEL_STAGE/checkpoints/best.pt
+  â””â”€â”€ DEEPSET_TABPFN_V1!PREDICT() â† loads from @MODEL_STAGE/checkpoints/best.pt
 ```
 
 ---
@@ -369,9 +450,9 @@ Use an **internal named stage** with Parquet files:
 
 ```
 @META_DATASET_STAGE/
-  train/   ← 800 parquet files (one per meta-task)
-  val/     ← 100 parquet files
-  test/    ← 100 parquet files
+  train/   â† 800 parquet files (one per meta-task)
+  val/     â† 100 parquet files
+  test/    â† 100 parquet files
 ```
 
 Each Parquet file contains: `X_train`, `y_train`, `X_test`, `betaX_test`,
@@ -410,9 +491,12 @@ Then run the three `PUT` commands inside SnowSQL:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE;
+REMOVE @META_DATASET_STAGE/train/;
+REMOVE @META_DATASET_STAGE/val/;
+REMOVE @META_DATASET_STAGE/test/;
+PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 Verify the upload:
@@ -423,6 +507,48 @@ LIST @META_DATASET_STAGE/val/;
 LIST @META_DATASET_STAGE/test/;
 ```
 
+`META_DATASET_INDEX` is required before HPO and training. It is a metadata
+pruning table over staged parquet payloads, not a copy of the payloads. Rebuild
+it after every synthetic parquet regeneration or restaging:
+
+```sql
+CALL build_meta_dataset_index();
+
+SELECT split, COUNT(*) AS task_count
+FROM META_DATASET_INDEX
+GROUP BY split
+ORDER BY split;
+-- Expected: train=800, val=100, test=100
+```
+
+The HPO subset is deterministic and should return 200 train rows and 40
+validation rows:
+
+```sql
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY split, hpo_bucket
+      ORDER BY prior_regime, p, n_train, task_id
+    ) AS bucket_rank
+  FROM META_DATASET_INDEX
+  WHERE split IN ('train', 'val')
+),
+selected AS (
+  SELECT *
+  FROM ranked
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY split
+    ORDER BY bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id
+  ) <= IFF(split = 'train', 200, 40)
+)
+SELECT split, COUNT(*) AS selected_rows
+FROM selected
+GROUP BY split
+ORDER BY split;
+```
+
 ### Uploading Python scripts via SnowSQL
 
 Run once, and re-run whenever any script changes:
@@ -431,14 +557,93 @@ Run once, and re-run whenever any script changes:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-PUT file://C:/Documents/TabPFN_DemandModel/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
+
+The current local canonical data has verified HPO cardinality
+`max_p=24` and `max_n_train=200`. HPO uses a fixed warm-start architecture
+`d_phi=128`, `d_rho=256`, and `pool="pna"`; regenerated datasets must keep
+selected HPO rows within `max(p) <= 128` and `max(n_train) <= 256` or HPO fails
+before launching trials.
+
+After the ShardedDataConnector failure fix, restage at least the changed runtime
+files before rerunning pretrain or final training:
+
+```sql
+USE DATABASE TABPFN_DB;
+USE SCHEMA TABPFN_SCHEMA;
+USE WAREHOUSE COMPUTE_WH;
+
+PUT file://C:/Documents/TabPFN_DemandModel/src/train.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/snowflake_io.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+
+LIST @MODEL_STAGE/scripts/ PATTERN='.*(train|snowflake_io)[.]py';
+```
+
+For a safer full restage that avoids stale script drift:
+
+```sql
+USE DATABASE TABPFN_DB;
+USE SCHEMA TABPFN_SCHEMA;
+USE WAREHOUSE COMPUTE_WH;
+
+PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+
+LIST @MODEL_STAGE/scripts/ PATTERN='.*(train|snowflake_io|model|run_pretrain_job|run_model_training_job)[.]py';
+```
+
+All runnable MLJob code, including `hpo_epoch_test.py` and `train_epoch_test.py`,
+is loaded from `@MODEL_STAGE/scripts/`. `@EPOCH_STAGE` is output-only for epoch
+calibration JSON. `hpo_timing.json` contains metadata selection time,
+materialization time, a baseline run, marginal sweep runs, and derived HPO
+wall-clock estimates; `train_timing.json` contains production topology timing
+and full train/val materialization time. Error files are written as
+`hpo_epoch_error.json` and `train_epoch_error.json`.
+
+Read `hpo_timing.json` by phase. HPO wall time includes MLJob startup, Ray/Tuner
+scheduling, metadata selection, per-node stage materialization, and epoch
+compute; the single `epoch_time_s` field is only the model-compute component.
 
 Verify:
 
 ```sql
 LIST @MODEL_STAGE/scripts/;
+LIST @MODEL_STAGE/scripts/ PATTERN='.*(hpo_epoch_test|train_epoch_test|train|model|snowflake_io)[.]py';
 ```
+
+Before rerunning a canceled HPO job, confirm `hpo.py`, `train.py`, `model.py`,
+`snowflake_io.py`, `run_hpo_job.py`, `run_model_training_job.py`, and
+`run_training_job.py` are all present under
+`@MODEL_STAGE/scripts/` and are not only `.gz` duplicates. HPO is expected to
+produce either `@MODEL_STAGE/hpo/best_config.json` on success or
+`@MODEL_STAGE/hpo/hpo_failure.json` if Python starts and then fails.
+
+**hpo.py guardrails:**
+
+- `debug/hpo_failure.json` is a **locally-downloaded snapshot** and is not
+  automatically synced from the stage. An unchanged local file does not mean
+  `main()` was not reached — always check the stage version first:
+  `LIST @MODEL_STAGE/hpo/;` and compare the `last_modified` timestamp.
+- `TunerConfig` does not accept `uses_snowflake_trainer` in its documented API
+  (`metric`, `mode`, `search_alg`, `num_trials`, `max_concurrent_trials`,
+  `resource_per_trial`). Do not add undocumented kwargs; a library version bump
+  will raise `TypeError: __init__() got an unexpected keyword argument` inside
+  `main()`, which the `except` block catches but may not successfully upload to
+  `hpo_failure.json` if the session is also disrupted.
+- Legacy Snowflake ML Tuner path only: `ctx.report()` inside `train_for_hpo()`
+  **must** pass `model=model.to("cpu")`. Omitting the model argument causes
+  `TypeError: Path must be a string` inside `tuner.run()` when Snowflake tries
+  to load `TunerResults.best_model` from an empty path after all trials complete.
+- `hpo.py` emits three diagnostic prints that confirm normal startup sequence in
+  job logs: `"hpo.py: module load started"` (before imports), `"hpo.py: all
+  imports OK"` (after all imports), and `"hpo.py: entered main()"` (first line
+  of `main()`). If any of these are absent, the crash happened before that point.
+
+Before running epoch calibration, confirm `hpo_epoch_test.py`,
+`train_epoch_test.py`, `train.py`, `model.py`, and `snowflake_io.py` are all
+present under `@MODEL_STAGE/scripts/`.
 
 ---
 
@@ -475,16 +680,18 @@ CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_S
 ### 1. Compute Pool
 
 ```sql
--- GPU_NV_S: 1 A10G per node. MAX_NODES=4 supports 4-node DDP training.
--- This can exceed the earlier $5/hr budget cap when all GPU nodes are active.
--- CPU_X64_XS handles baseline benchmark jobs with bounded concurrency.
--- CPU_X64_M handles the separate AutoGluon stacked-ensemble benchmark.
+-- GPU_NV_M: 4 A10G GPUs per node. MAX_NODES=10 supports 5-node HPO (20 concurrent
+-- one-GPU trials, 1 round) and 10-node DDP training (world_size=40).
+-- Evaluation: synthetic=1 GPU node; DeepSet benchmark=10 GPU dataset shard jobs;
+--   baselines=3 CPU dataset shard jobs, each running all 9 baseline methods;
+--   AutoGluon=30 CPU shard jobs. CPU_X64_XS: MAX_NODES=3 supports the combined
+--   baseline shard topology.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 4
-  INSTANCE_FAMILY = GPU_NV_S
+  MAX_NODES = 10
+  INSTANCE_FAMILY = GPU_NV_M
   AUTO_SUSPEND_SECS = 300;
 
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
@@ -498,7 +705,7 @@ CREATE COMPUTE POOL DEEPSET_CPU_POOL
 DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;
 CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 1
+  MAX_NODES = 30
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -506,12 +713,13 @@ CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
 
 ### 2. Job Submission (MLJob)
 
-`run_training_job.py` is deployed as Snowpark Python stored procedures. The training
-procedure submits HPO and training MLJobs using scripts already on
-`@MODEL_STAGE/scripts/`; the evaluation procedure separately submits synthetic,
-DeepSet benchmark, baseline benchmark, AutoGluon benchmark, and aggregate MLJobs. No
-local Python environment is needed, and no dataset stage contents are materialized
-outside Snowflake.
+`run_hpo_job.py`, `run_model_training_job.py`, and `run_training_job.py` are
+deployed as Snowpark Python stored procedures. The split training procedures submit
+HPO and training MLJobs using scripts already on `@MODEL_STAGE/scripts/`; the
+combined wrapper still submits both phases in one call. The evaluation procedure
+separately submits synthetic, DeepSet benchmark, baseline benchmark, AutoGluon
+benchmark, and aggregate MLJobs. No local Python environment is needed, and no
+dataset stage contents are materialized outside Snowflake.
 
 #### What is an MLJob container?
 
@@ -523,19 +731,20 @@ stage, then shuts the container down. The `stage_name` argument is the MLJob pay
 stage for scripts/artifacts; it is not a dataset mount. Training scripts explicitly
 materialize `@META_DATASET_STAGE/{train,val,test}/` into container-local `/tmp/data`
 with Snowpark `session.file.get()`. PyTorch, Ray, and `snowflake-ml-python` are
-pre-installed — no Docker build or image management is required.
+pre-installed - no Docker build or image management is required.
 
 Create the procedures only after the scripts are staged. Otherwise `IMPORTS =
 ('@MODEL_STAGE/scripts/run_training_job.py')` can fail because Snowflake cannot
 resolve the staged file:
 
 ```sql
-PUT file://C:/Documents/TabPFN_DemandModel/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 LIST @MODEL_STAGE/scripts/;
 ```
 
-Create the procedures, and re-run these statements after uploading an updated
-`run_training_job.py`:
+Create the procedures, and re-run these statements after uploading updated
+procedure scripts:
 
 ```sql
 CREATE OR REPLACE PROCEDURE download_kaggle_to_stage()
@@ -546,6 +755,30 @@ CREATE OR REPLACE PROCEDURE download_kaggle_to_stage()
   IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
   HANDLER = 'run_training_job.run_kaggle_download';
 
+CREATE OR REPLACE PROCEDURE build_meta_dataset_index()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
+  HANDLER = 'run_training_job.build_meta_dataset_index';
+
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline';
+
+CREATE OR REPLACE PROCEDURE run_model_training()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_model_training_job.py')
+  HANDLER = 'run_model_training_job.run_model_training';
+
 CREATE OR REPLACE PROCEDURE run_training_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -554,22 +787,46 @@ CREATE OR REPLACE PROCEDURE run_training_pipeline()
   IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
   HANDLER = 'run_training_job.run_pipeline';
 
+CREATE OR REPLACE PROCEDURE prepare_benchmark_datasets()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/prepare_benchmark_datasets.py')
+  HANDLER = 'prepare_benchmark_datasets.prepare_datasets';
+
 CREATE OR REPLACE PROCEDURE run_evaluation_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
-  IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
-  HANDLER = 'run_training_job.run_evaluation_pipeline';
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_evaluation_pipeline';
 ```
 
-Then stage Kaggle data once, run training, verify the checkpoint, and run evaluation:
+Procedure responsibilities:
+
+- `build_meta_dataset_index()` imports `run_training_job.py` and submits `build_meta_dataset_index.py` on `DEEPSET_CPU_POOL`; it rebuilds `META_DATASET_INDEX` from `@META_DATASET_STAGE/{train,val,test}/`.
+- `run_hpo_pipeline()` imports `run_hpo_job.py` and submits only the `hpo.py` MLJob/container.
+- `run_model_training()` imports `run_model_training_job.py`, reads `@MODEL_STAGE/hpo/best_config.json`, passes it to `train.py` as `BEST_CONFIG`, and submits only the training MLJob/container.
+- `run_training_pipeline()` imports `run_training_job.py` and remains a one-call convenience wrapper for HPO plus training.
+- `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_DATASET_STAGE/benchmark_prepared/`.
+- `run_evaluation_pipeline()` imports `run_evaluation_test.py`, runs single-node GPU synthetic evaluation, skips dataset preparation when the prepared benchmark manifest already exists, then launches prepared benchmark shards and aggregation.
+
+Then optionally stage raw Kaggle data once, prepare benchmark datasets, run HPO,
+inspect the HPO artifact, run training, verify the checkpoint, and run evaluation:
 
 ```sql
 CALL download_kaggle_to_stage();
 LIST @META_DATASET_STAGE/kaggle/;
-CALL run_training_pipeline();
-LIST @MODEL_STAGE/hpo/;
+CALL prepare_benchmark_datasets();
+LIST @META_DATASET_STAGE/benchmark_prepared/;
+LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+CALL build_meta_dataset_index();
+CALL run_hpo_pipeline();
+LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
+SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
+CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
 CALL run_evaluation_pipeline();
 ```
@@ -585,37 +842,176 @@ SHOW COMPUTE POOLS LIKE 'AUTOGLUON_CPU_POOL';
 LIST @MODEL_STAGE/scripts/;
 CALL download_kaggle_to_stage();
 LIST @META_DATASET_STAGE/kaggle/;
+CALL prepare_benchmark_datasets();
+LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 ```
+
+If `best_config.json` is missing, training has not started; the issue is in HPO.
+First confirm the mandatory pretrain checkpoint exists, then check
+`@MODEL_STAGE/hpo/hpo_failure.json`:
+
+```sql
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain[.]pt';
+LIST @MODEL_STAGE/hpo/ PATTERN='.*hpo_failure[.]json';
+SELECT $1 FROM @MODEL_STAGE/hpo/hpo_failure.json (FILE_FORMAT => (TYPE = JSON));
+```
+
+Check service logs only if `hpo_failure.json` is missing or incomplete. First
+confirm `DEEPSET_GPU_POOL` has capacity for five `GPU_NV_M` nodes, then inspect
+the SPCS job service state and container logs:
+
+```sql
+SHOW JOB SERVICES IN ACCOUNT;
+
+-- Replace with the exact HPO service name from SHOW JOB SERVICES.
+DESC SERVICE TABPFN_DB.TABPFN_SCHEMA.<HPO_SERVICE_NAME>;
+
+SELECT SYSTEM$GET_SERVICE_LOGS(
+  'TABPFN_DB.TABPFN_SCHEMA.<HPO_SERVICE_NAME>',
+  0,
+  'main',
+  500
+);
+
+LIST @MODEL_STAGE/scripts/;
+```
+
+Ray scrape or TSDB compaction warnings are usually noise unless they appear with
+real worker failures, trial failures, Python tracebacks, or resource allocation
+errors.
+
+For a healthy HPO startup, the logs should include `[HPO] Pretrain checkpoint
+found`, `Ray object-store preflight success`, `HPO trial received in-memory records`,
+and `[HPO trial] Loaded pretrain checkpoint from Ray object store.`. If driver
+materialization fails before trials start, the likely failure domain is driver
+Snowpark/session/stage access to `@META_DATASET_STAGE`, not GPU capacity.
+
+If logs are unavailable, record the `SHOW JOB SERVICES` row fields `name`,
+`status`, `created_on`, `updated_on`, `current_instances`, `target_instances`,
+`compute_pool`, `query_warehouse`, `managing_object_domain`, and
+`managing_object_name`. Use `sql/diagnose_training_pipeline_failure.sql` as the
+full worksheet before rerunning.
+
+For training failures after `best_config.json` exists, check for
+`@MODEL_STAGE/checkpoints/train_failure.json` before service logs:
+
+```sql
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*train_failure[.]json';
+SELECT $1 FROM @MODEL_STAGE/checkpoints/train_failure.json (FILE_FORMAT => (TYPE = JSON));
+```
+
+For pretrain or final-training startup failures, the Snowflake message
+`Multi-node training requires a stage... SF_PYTORCH` is not the fatal error; it
+means `artifact_stage_location` was missing or inferred. The production path now
+passes `artifact_stage_location="TABPFN_DB.TABPFN_SCHEMA.MODEL_STAGE"` explicitly.
+If service logs stop after `Loading data into a pandas dataframe`, suspect
+worker-side ShardedDataConnector shard conversion/materialization around
+`shard.to_pandas()`. The canonical path is SQL rank sharding over
+`META_DATASET_INDEX`; inspect `@MODEL_STAGE/checkpoints/train_failure.json` first,
+then service logs if that artifact is missing or incomplete.
+
+If `CALL run_hpo_epoch_test()` fails with
+`ModuleNotFoundError: No module named 'train'`, the epoch MLJob source stage is
+missing the shared Python modules. Re-upload both source trees to
+`@MODEL_STAGE/scripts/`, recreate `run_hpo_epoch_test()` and
+`run_train_epoch_test()` from `sql/run_training_job.sql`, then rerun the epoch
+call:
+
+```sql
+PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+LIST @MODEL_STAGE/scripts/ PATTERN='.*(hpo_epoch_test|train_epoch_test|train|model|snowflake_io)[.]py';
+```
+
+`@EPOCH_STAGE` is not a code source for these MLJobs. It only receives
+`hpo_timing.json`, `hpo_epoch_error.json`, `train_timing.json`, and
+`train_epoch_error.json`. `hpo_timing.json` is a sweep summary with `baseline`,
+`runs`, and `summary`, not one scalar epoch-time object. If `hpo_epoch_error.json`
+was absent during this failure, Python failed while importing project modules
+before the script's older error handler could run.
 
 For full acceptance:
 
 ```sql
-CALL run_training_pipeline();
+CALL run_hpo_pipeline();
+LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
+CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
+CALL prepare_benchmark_datasets();
+LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 CALL run_evaluation_pipeline();
 LIST @EVALUATION_RESULTS_STAGE/;
 GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';
 ```
 
-Kaggle download uses `compute_pool="DEEPSET_CPU_POOL"` and writes `.npz` files to
-`@META_DATASET_STAGE/kaggle/`. HPO, training, synthetic evaluation, and
-DeepSetModel-MC benchmark use `compute_pool="DEEPSET_GPU_POOL"`; baseline benchmark
-jobs use `compute_pool="DEEPSET_CPU_POOL"` with bounded concurrency. AutoGluon runs
-as a separate stacked-ensemble benchmark job on `AUTOGLUON_CPU_POOL` with
+Kaggle download uses `compute_pool="DEEPSET_CPU_POOL"` and writes raw `.npz` files
+to `@META_DATASET_STAGE/kaggle/`. Benchmark dataset preparation uses one CPU node
+and writes `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` plus
+prepared `.npz` files under `benchmark_prepared/{openml,kaggle}/`. HPO, training,
+synthetic evaluation, and DeepSetModel-MC benchmark use
+`compute_pool="DEEPSET_GPU_POOL"`; baseline benchmark jobs use
+`compute_pool="DEEPSET_CPU_POOL"` as 3 combined dataset shard jobs with
+`BENCHMARK_METHODS=<all 9 baseline methods>` and bounded concurrency. AutoGluon runs as
+separate stacked-ensemble benchmark shard jobs on `AUTOGLUON_CPU_POOL` with
 `autogluon.tabular[all]==1.0.0`, `presets="best_quality"`,
-`AUTOGLUON_TIME_LIMIT=300`, `num_cpus=1`, `num_gpus=0`, and temporary model
+`AUTOGLUON_TIME_LIMIT=300`, `num_cpus=BENCHMARK_NUM_CPUS` (default `1`),
+`num_gpus=0`, and temporary model
 artifacts under `/tmp` cleaned after each fit:
+
+Benchmark shard jobs are dataset-first: a shard owns a subset of manifest
+datasets, loads one prepared `.npz`, evaluates all seeds for that dataset,
+releases it, and then continues to the next owned dataset.
 
 | Phase | Entrypoint | Instances | Output |
 |---|---|---|---|
-| Kaggle download | `download_kaggle_to_stage.py` | 1 CPU | `@META_DATASET_STAGE/kaggle/*.npz` |
-| HPO | `hpo.py` | 2 | `@MODEL_STAGE/hpo/best_config.json` |
-| Training | `train.py` | 4 (DDP) | `@MODEL_STAGE/checkpoints/best.pt` |
-| Synthetic evaluation | `evaluate.py` | 1 GPU | `@EVALUATION_RESULTS_STAGE/synthetic/test_report.csv` and `mc_report.csv` |
-| DeepSet benchmark | `evaluate.py` | 1 GPU | `@EVALUATION_RESULTS_STAGE/benchmark_parts/DeepSetModel-MC_detailed.csv` |
-| Baseline benchmarks | `evaluate.py` | bounded CPU jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/<method>_detailed.csv` |
-| AutoGluon benchmark | `evaluate.py` | 1 CPU_X64_M | `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_detailed.csv` |
-| Aggregate comparison | `evaluate.py` | 1 CPU | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` |
+| Optional Kaggle raw staging | `download_kaggle_to_stage.py` | 1 CPU | `@META_DATASET_STAGE/kaggle/*.npz` |
+| Benchmark dataset preparation | `prepare_benchmark_datasets.py` | 1 CPU | `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared `.npz` files |
+| HPO | `hpo.py` | 5 | `@MODEL_STAGE/hpo/best_config.json` |
+| Training | `train.py` | 10 (DDP, 40 workers) | `@MODEL_STAGE/checkpoints/best.pt` |
+| Synthetic evaluation | `evaluate.py` | 1 GPU single-node job | `@EVALUATION_RESULTS_STAGE/synthetic/test_report.csv` and `mc_report.csv` |
+| DeepSet benchmark | `evaluate.py` | 10 GPU shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/DeepSetModel-MC_shard{i}_of_{n}_detailed.csv` |
+| Baseline benchmarks | `evaluate.py` | 3 CPU shard jobs; each receives `BENCHMARK_METHODS=<all 9 baseline methods>` | `@EVALUATION_RESULTS_STAGE/benchmark_parts/<method>_shard{i}_of_{n}_detailed.csv` |
+| AutoGluon benchmark | `evaluate.py` | 30 CPU_X64_M shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_shard{i}_of_{n}_detailed.csv` |
+| Aggregate comparison | `evaluate.py` | 1 CPU | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` and `model_comparison_summary.csv` |
+
+When benchmark preparation is skipped because the prepared manifest/index and
+staged `.npz` payloads already exist, the expected evaluation MLJob count drops
+from about 70 to about 46 when counting the orchestration job: synthetic
+evaluation, 10 DeepSet benchmark shards, 3 combined baseline shards, 30 AutoGluon
+shards, aggregate comparison, and the parent submission/orchestration job.
+
+#### Evaluation Runtime Reduction Plan
+
+The old baseline topology parallelized by method and dataset shard:
+`9 methods × 3 CPU shard jobs = 27` jobs. That repeated dataset load and
+preprocessing work for each method. The planned topology parallelizes only by
+dataset shard for baselines: 3 CPU shard jobs receive
+`BENCHMARK_METHODS=<all 9 baseline methods>`, each shard selects its assigned
+dataset indices first, and then runs every baseline method inside that
+dataset-first loop.
+
+This is still full-fidelity benchmark execution: no change to datasets, seeds,
+method list, `AUTOGLUON_TIME_LIMIT=300`, or AutoGluon `presets="best_quality"`.
+It does not batch all datasets into memory, and all benchmark shards remain
+single-node jobs. It does not introduce PyTorch distributed execution for
+benchmark shards. `BENCHMARK_NUM_CPUS` is for
+AutoGluon single-node internal parallelism only and defaults to `1`; sklearn
+baselines keep their existing `n_jobs=1` behavior.
+
+Keep the benchmark worker architecture invariant:
+
+- Assigned dataset indices are selected first.
+- `load_prepared_dataset(ds_meta)` stays inside the assigned dataset loop.
+- Seeds run inside that dataset scope.
+- The dataset is deleted and garbage-collected before the next dataset.
+
+Keep the dependency invariant:
+
+- `openml` belongs only to preparation.
+- AutoGluon remains lazy-imported only for the AutoGluon method.
+- Baseline and DeepSet benchmark shards should not load API/data-fetch dependencies.
+- `run_evaluation_test.py` must submit prep and evaluation MLJobs with
+  `runtime_environment`, never per-job `pip_requirements`.
 
 ### 3. Checkpoint Output
 
@@ -643,59 +1039,146 @@ evaluation CSVs for aggregation/download, and Kaggle `.npz` files for benchmarks
 Snowflake Container Runtime for ML provides a managed, GPU-enabled image with PyTorch,
 Ray, and `snowflake-ml-python` pre-installed.
 
-- No container image build or push needed — scripts are read directly from
+- No container image build or push needed - scripts are read directly from
   `@MODEL_STAGE/scripts/` via `submit_from_stage()`.
 - Runtime image: `snowflake/ml-runtime-gpu:latest` (Snowflake-managed).
-- Jobs submitted from the stored procedure via `run_training_job.py`.
+- Jobs submitted from stored procedures via `run_hpo_job.py`,
+  `run_model_training_job.py`, and `run_training_job.py`.
 
 > Scripts are referenced directly from the stage via `source=` in
 > `submit_from_stage()`. No Docker image is required or maintained.
 
-### Distributed Training — PyTorchDistributor
+### Distributed Training - PyTorchDistributor
 
 - Class: `snowflake.ml.modeling.distributors.pytorch.PyTorchDistributor`
 - Manages Ray cluster setup, DDP process group initialization, and result collection
-  internally — no manual `torchrun` or rank-environment setup required.
-- `PyTorchScalingConfig(num_nodes=4, num_workers_per_node=1, ...)` maps to
-  4× GPU_NV_S nodes (one A10G each); `run_training_job.py` submits training with
-  matching `target_instances=4`.
+  internally - no manual `torchrun` or rank-environment setup required.
+- `PyTorchScalingConfig(num_nodes=10, num_workers_per_node=4, ...)` maps to
+  10 x GPU_NV_M nodes (four A10G GPUs each); `run_model_training_job.py` submits training with
+  matching `target_instances=10`. Total world_size=40 (10 nodes x 4 workers/node).
 - `get_context()` inside `train_fn` provides `local_rank`, `rank`, and `world_size`.
-- `DistributedSampler` with `rank` / `world_size` splits the 800 training tasks
-  across 4 GPU processes (200 tasks/GPU/epoch); future train split sizes must divide
-  evenly by `world_size`.
+- `train_fn` shards `META_DATASET_INDEX` directly in SQL by DDP `rank` and
+  `world_size`, using `ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1`
+  and `MOD(rn, world_size) = rank`. Each worker materializes only its selected
+  train/val stage paths with `materialize_indexed_meta_dataset()`.
 - Validation uses a no-padding rank slice, reduces `(sum_loss, total_count)` across
   ranks, and computes exact weighted global MSE before the early-stop check;
   `dist.broadcast(stop, src=0)` propagates the stop signal.
 
-### Hyperparameter Optimization — Tuner + BayesOpt
+### Hyperparameter Optimization - Ray Tune RandomSearch
 
-- Class: `snowflake.ml.modeling.tune.Tuner`
-- Algorithm: `BayesOpt` (Gaussian-process surrogate; minimizes trials needed vs.
-  grid or random search).
-- Search space: `lr`, `weight_decay`, `d_phi`, `d_rho`, `dropout`, `pool`.
+- Class: Ray Tune functional API (`tune.run()`).
+- Algorithm: Random sampling with FIFO scheduling.
+- Search space: `lr`, `weight_decay`, `dropout`.
+- Fixed architecture for every trial: `d_phi=128`, `d_rho=256`, `pool="pna"`.
+- Ray Tune metric reporting must use metrics-dict style for every trial, e.g.
+  `tune.report({"val_mse": value})` or the local compatibility helper. Do not
+  use keyword-style `tune.report(val_mse=value)`; Snowflake's Ray runtime can
+  raise `TypeError: report() got an unexpected keyword argument 'val_mse'`.
+  Keep `tune.run(metric="val_mse", mode="min")` unchanged so best-trial
+  selection and downstream artifacts continue to use the `val_mse` key.
 - 20 trials, 30-epoch runs each; best config written to
-  `@MODEL_STAGE/hpo/best_config.json` on completion.
-- To use a simpler baseline, swap `BayesOpt()` → `RandomSearch()` in `hpo.py`.
+  `@MODEL_STAGE/hpo/best_config.json` on completion. The file includes tuned
+  optimizer/dropout values plus the fixed architecture so final training uses
+  the same model shape.
+- Parallel layout: `run_training_job.py` and `run_hpo_job.py` both submit HPO with
+  `target_instances=5`; Ray Tune uses `resources_per_trial={"gpu": 1}`.
+  With 5 nodes × 4 A10G GPUs = 20 GPUs total, Ray Tune schedules all 20 trials
+  concurrently (no explicit max_concurrent_trials needed); 20 trials / 20 = 1 round x 30 epochs.
+  Calibrated with `CALL run_hpo_epoch_test()`, which writes a baseline plus
+  marginal sweep summary to `@EPOCH_STAGE/hpo_timing.json`.
+- HPO uses a deterministic balanced search subset by default: 200 train tasks
+  and 40 validation tasks. Full production training still consumes the full
+  train/validation splits after HPO writes `best_config.json`.
+- HPO requires `@MODEL_STAGE/checkpoints/pretrain.pt`. Missing checkpoint,
+  failed driver download, or checkpoint architecture mismatch is a hard failure;
+  trials must log `[HPO trial] Loaded pretrain checkpoint from Ray object store.`.
+- Before `tune.run()`, the HPO driver materializes the deterministic 200 train
+  and 40 validation parquet payloads, loads them as CPU tensors, downloads
+  `pretrain.pt`, and publishes both payloads to the Ray object store. Ray workers
+  consume only these object-store payloads and do not create Snowpark sessions.
+  A successful startup logs `Ray object-store preflight success`.
+- `META_DATASET_INDEX` is the pruning layer over staged parquet payloads, not a
+  replacement for `@META_DATASET_STAGE`. It stores one row per task payload and
+  is clustered by `(split, hpo_bucket, prior_regime, p, n_train)` so HPO can
+  select balanced subsets before materializing data on each node.
+- `CALL build_meta_dataset_index();` is the canonical Snowflake-native population
+  step. It reads metadata from staged parquet inside an MLJob, truncates/rebuilds
+  `META_DATASET_INDEX`, validates `train=800`, `val=100`, `test=100`, and should
+  be re-run after synthetic parquet regeneration or restaging.
+- Runtime selection is index-backed. HPO ranks rows within `(split, hpo_bucket)`
+  by `prior_regime, p, n_train, task_id`, then chooses each split by
+  `bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id`. Production
+  training selects every `train` and `val` row ordered by `split, task_id`.
+- Snowflake jobs fail fast if `META_DATASET_INDEX` is missing, empty, lacks
+  required runtime fields (`split`, `task_id`, `stage_path`, `p`, `n_train`),
+  or cannot provide the required HPO subset. Local developer runs with no active
+  Snowflake session use existing local parquet files instead of downloading
+  `@META_DATASET_STAGE`.
+- HPO also fails before trials if selected HPO cardinality exceeds the fixed
+  architecture. Current local data was verified at `max_p=24`,
+  `max_n_train=200`, which is within the fixed `d_phi=128`, `d_rho=256` guard.
+- HPO query time is broader than one model epoch. It includes MLJob startup,
+  Ray/Tuner scheduling, metadata selection, driver stage materialization,
+  object-store payload publication, and epoch compute. The observed
+  `CALL run_hpo_epoch_test()` query time was 6m 24s
+  (384s), which is the current fixed overhead budget until a newer calibration
+  run proves otherwise.
+- SPCS MLJob services (`Service Type: JOB`) cannot be dynamically re-scaled after
+  submission - `scale_cluster()` was removed from `hpo.py` because it always raises
+  error 517003. All GPU parallelism is set at submission time via `target_instances`.
+- GPU_NV_M has 4 A10G GPUs per node; `max_concurrent_trials=4` with
+  `resource_per_trial={"GPU": 1}` assigns one GPU to each concurrent trial.
+
+Expected HPO success logs:
+
+```text
+[HPO] Pretrain checkpoint found
+Ray object-store preflight success
+HPO trial received in-memory records
+[HPO trial] Loaded pretrain checkpoint from Ray object store.
+```
+
+If HPO fails before `[HPO trial] Loaded pretrain checkpoint from Ray object store.`
+and the logs show parquet materialization errors, investigate driver
+Snowpark/session/stage access first. Do not treat this symptom as GPU capacity failure when
+`target_instances=5` and `resources_per_trial={"gpu": 1}` are unchanged.
+If every Ray trial fails with `TypeError: report() got an unexpected keyword
+argument 'val_mse'`, restage patched `src/hpo.py` to `@MODEL_STAGE/scripts/`
+and rerun HPO. No `CALL build_meta_dataset_index();` rerun is required for
+this reporting-only patch, and no procedure recreation is required if only
+`src/hpo.py` changed.
+- `TunerResults.best_result` is handled as a one-row DataFrame. Hyperparameters
+  are read from `config/<param>` columns, with raw parameter names only as a
+  compatibility fallback, then written with the `best_config.json` schema consumed
+  by `train.py`: `{lr, weight_decay, d_phi, d_rho, dropout, pool}`.
 
 ### Compute Pool & Cost
 
 | Configuration | Credits/node/hr | Nodes | Total cost/hr |
 |---|---|---|---|
-| GPU_NV_S (this design) | 0.57 | 2 | ~$2.28–3.42 |
-| previous single-node | 2.68 | 1 | ~$5.36–8.04 |
+| GPU_NV_M | 1.42 | 5 (HPO) / 5 (train) | $7.10 / $7.10 |
+| previous GPU_NV_S | 0.57 | 2 | ~$2.28-3.42 |
+| previous single-node | 2.68 | 1 | ~$5.36-8.04 |
 
-- 2-node GPU_NV_S pool: 1.14 cr/hr ≈ **$2.28–3.42/hr** (Standard/Enterprise) — ~80%
-  cheaper than the previous single-node configuration.
+- GPU_NV_M (this design): 1.42 cr/node/hr; 5-node HPO = 7.10 cr/hr; 5-node training = 7.10 cr/hr.
 - Pool suspends when idle; no charges in `SUSPENDED` state.
 
 ### Estimated End-to-End Cost
 
 | Phase | Nodes | Cost/hr | Duration | Total |
 |---|---|---|---|---|
-| HPO (20 trials × 30 epochs) | 2 × GPU_NV_S | ~$2.28–3.42 | ~40–60 min | ~$1.52–3.42 |
-| Full training (DDP) | 4 × GPU_NV_S | ~$4.56–6.84 | ~8–13 min | ~$0.61–1.48 |
-| Evaluation | 1 × GPU_NV_S | ~$1.14–1.71 | ~5–10 min | ~$0.10–0.29 |
-| **Total** | | | **~53–83 min** | **~$2.23–5.19** |
+| HPO (20 trials x 30 epochs) | 5 x GPU_NV_M | ~$7.10 | ~31.6 min* | ~$3.74 |
+| Full training (DDP) | 5 x GPU_NV_M | ~$7.10 | roughly 25% of HPO wall time | ~$1.87 |
+| Evaluation | 1 x GPU_NV_M | ~$1.42 | ~5-10 min | ~$0.12-0.24 |
+| **Total** | | | **~45 min plus evaluation** | **~$9.47 plus evaluation** |
+
+\* Calibrated against `@EPOCH_STAGE/hpo_timing.json`; re-estimate from
+`summary.mean_epoch_time_s` and `summary.max_epoch_time_s` if sweep timings differ.
+Observed 12-way calibration was about 48.1 min mean with overhead and 107.4 min
+conservative with overhead. The target 40-way conservative estimate is
+`30 * 50.48 + 384 = 1898.4s`, or about 31.6 min.
+† With world_size=40 (10 nodes x 4 workers/node), the 800-file train split maps to 20 files/GPU/epoch.
 
 ---
 
@@ -739,9 +1222,9 @@ class ParquetMetaDataset(Dataset):
 def identity_collate(batch):
     return batch[0]   # batch_size=1; skip default list-wrapping
 
-materialize_meta_dataset_stage(DATA_DIR, splits=("train", "val"))
-train_files = sorted(glob.glob(os.path.join(DATA_DIR, "train", "*.parquet")))
-val_files   = sorted(glob.glob(os.path.join(DATA_DIR, "val",   "*.parquet")))
+files_by_split = materialize_indexed_meta_dataset(DATA_DIR, splits=("train", "val"))
+train_files = files_by_split["train"]
+val_files   = files_by_split["val"]
 
 train_loader = DataLoader(
     ParquetMetaDataset(train_files), batch_size=1, shuffle=True,
@@ -823,7 +1306,7 @@ for epoch in range(MAX_EPOCHS):
 
 The original training loop ran row-by-row: for each meta-dataset, `forward()` was called
 once per test row (`X_test[k]`), producing ~3.6 M serial GPU kernel launches across 800
-training files × ~4,500 test rows. This serialized inference saturated the CPU and left
+training files x ~4,500 test rows. This serialized inference saturated the CPU and left
 GPU Tensor Cores idle.
 
 ### 1. Batched Forward Pass
@@ -857,23 +1340,23 @@ model = torch.compile(model, mode="reduce-overhead")
 `torch.compile` traces the graph and fuses repeated small kernels (linear + ReLU,
 residual add) into single fused kernels, reducing Python interpreter overhead and GPU
 kernel launch latency. The compiled model is saved via `model._orig_mod` to avoid
-`torch.compile` wrapper artefacts in the checkpoint.
+`torch.compile` wrapper artifacts in the checkpoint.
 
-### 5. GPU_NV_S Compute Pool
+### 5. Historical GPU_NV_S Compute Pool
 
-`GPU_NV_S` provides 1× A10G GPU per node and ~12 vCPUs. 4 DataLoader worker processes
-fit comfortably within available host RAM, leaving headroom for the main training
-process. 4 nodes are used for DDP training; 2 nodes for parallel HPO trials.
+This section describes the previous GPU_NV_S design for comparison only. The
+current HPO/training runbook uses `GPU_NV_M`: 5 nodes for HPO with 20 concurrent
+one-GPU trials (1 round), and 10 nodes for full DDP training with `world_size=40`.
 
 ### Cost Comparison
 
 | Configuration | Estimated wall-clock | Notes |
 |---|---|---|
 | GPU_NV_S, row-by-row, FP32 | ~4 hours | Original |
-| GPU_NV_S × 2, batched, BF16, DDP, compile | ~15–25 minutes | Previous optimized |
-| GPU_NV_S × 4, batched, BF16, DDP, compile | ~8–13 minutes | Current (4-node DDP) |
+| GPU_NV_S x 2, batched, BF16, DDP, compile | ~15-25 minutes | Previous optimized |
+| GPU_NV_S x 4, batched, BF16, DDP, compile | ~8-13 minutes | Previous 4-node DDP design |
 
-Estimates assume 800 training files × 200 epochs with early stopping at epoch ~100.
+Estimates assume 800 training files x 200 epochs with early stopping at epoch ~100.
 
 ---
 
@@ -895,8 +1378,8 @@ or more than 256 training samples, increase these accordingly.
 
 ### Phi Injectivity
 
-`phi: R^3 → R^{d_phi}` must be injective — different input triples must produce
-different embeddings — so that no two training examples collapse to the same vector
+`phi: R^3 â†’ R^{d_phi}` must be injective - different input triples must produce
+different embeddings - so that no two training examples collapse to the same vector
 before aggregation. With `d_phi=128` (far larger than the 3-dimensional input), a
 trained ReLU MLP is injective on the training manifold by standard covering arguments.
 
@@ -904,7 +1387,7 @@ trained ReLU MLP is injective on the training manifold by standard covering argu
 
 `phi` and `rho` must be continuous: a small perturbation in the input must produce
 a small change in the output, so that the aggregated representation varies smoothly.
-ReLU networks are piecewise linear and therefore Lipschitz continuous — this
+ReLU networks are piecewise linear and therefore Lipschitz continuous - this
 requirement is satisfied by the architecture as-is.
 
 ### PNA Pooling and the Sum/Mean Collision Problem
@@ -912,44 +1395,44 @@ requirement is satisfied by the architecture as-is.
 **The problem:** even with an injective `phi`, two *different* multisets can satisfy
 
 ```
-mean(phi(x) for x in S1)  ==  mean(phi(x) for x in S2),   S1 ≠ S2
+mean(phi(x) for x in S1)  ==  mean(phi(x) for x in S2),   S1 â‰  S2
 ```
 
 This "multiset collision" causes the model to map distinct training contexts to the
 same latent representation, losing information that is relevant for the prediction.
 
-**The fix — Principal Neighbourhood Aggregation (PNA):** instead of aggregating with
+**The fix - Principal Neighbourhood Aggregation (PNA):** instead of aggregating with
 mean alone, concatenate four statistics over the set dimension:
 
 ```
-pool(S) = cat[ sum_phi, mean_phi, max_phi, std_phi ]   ∈ R^{4·d_phi}
+pool(S) = cat[ sum_phi, mean_phi, max_phi, std_phi ]   âˆˆ R^{4Â·d_phi}
 ```
 
 Two sets that share the same mean will generally differ in at least one of sum, max,
 or std, yielding a distinct joint embedding. PNA is applied at *both* pooling stages
 (feature-level and sample-level), so collisions are suppressed throughout the network.
-The learnable equivariance layers (λ, γ) continue to operate *before* pooling and are
+The learnable equivariance layers (Î», Î³) continue to operate *before* pooling and are
 unaffected by this change.
 
-PNA increases the rho input from `d_phi → 4·d_phi` and the psi input from
-`d_rho → 4·d_rho`. The extra parameters are absorbed by rho and psi without changing
+PNA increases the rho input from `d_phi â†’ 4Â·d_phi` and the psi input from
+`d_rho â†’ 4Â·d_rho`. The extra parameters are absorbed by rho and psi without changing
 the output interface.
 
 ### Self-Attention Blocks (SAB)
 
-The simple linear equivariance layer (λI + γ/n·11ᵀ) is replaced by one or more
+The simple linear equivariance layer (Î»I + Î³/nÂ·11áµ€) is replaced by one or more
 **Self-Attention Blocks** from the Set Transformer (Lee et al. 2019), applied at both
 the feature level (features attend to each other per sample) and the sample level
 (samples attend to each other before final pooling):
 
 ```
-X → φ → SAB_feat → pool_feat → ρ → SAB_samp → pool_samp → ψ
+X â†’ Ï† â†’ SAB_feat â†’ pool_feat â†’ Ï â†’ SAB_samp â†’ pool_samp â†’ Ïˆ
 ```
 
 `SAB(X) = MAB(X, X)` where `MAB(Q, K) = LayerNorm(H + FFN(H))` and
 `H = LayerNorm(Q + Dropout(MHA(Q, K, K)))`. SAB is permutation equivariant:
-`SAB(X[π]) = SAB(X)[π]` for any permutation π — a strictly more expressive
-generalisation of the original λ/γ equivariance. The number of SAB layers is
+`SAB(X[Ï€]) = SAB(X)[Ï€]` for any permutation Ï€ - a strictly more expressive
+generalisation of the original Î»/Î³ equivariance. The number of SAB layers is
 controlled by `n_sab_feat` and `n_sab_samp` in `ModelConfig`.
 
 Setting `n_sab_feat=0, n_sab_samp=0` recovers the original linear equivariance
@@ -967,7 +1450,7 @@ layers exactly (backward-compatible with old checkpoints).
 | `pna` | 4d | Concat[sum, mean, max, std] |
 | `learned` | d | Softmax-weighted sum (learned scores) |
 | `attn` | d | PMA: single-seed cross-attention |
-| `multipool` | 5d | Concat[pna, attn] — for ablation |
+| `multipool` | 5d | Concat[pna, attn] - for ablation |
 
 PNA and multipool are the most expressive. Use `pool="multipool"` to run ablations
 comparing all statistics simultaneously. Use `pool="attn"` for the Set Transformer
@@ -980,11 +1463,11 @@ Two per-context normalizations are applied inside `forward()`:
   standardised to zero mean and unit variance; the same statistics are applied to
   x_test. This makes the model scale-invariant to feature magnitudes.
 - **Target normalization** (`norm_target=True`): y_train is standardised before
-  being fed to φ; the final prediction is denormalized back to the original scale.
+  being fed to Ï†; the final prediction is denormalized back to the original scale.
   This removes sensitivity to the absolute scale of the regression target.
 
 Both normalizations use per-context statistics (computed from X_train / y_train
-of the current task), not global running statistics — the model requires no warm-up
+of the current task), not global running statistics - the model requires no warm-up
 and works immediately on any new task.
 
 Batch normalization is not used: SPCS runs each meta-dataset as a batch of 1, so
@@ -997,8 +1480,8 @@ All hyperparameters are bundled in `ModelConfig` (a `dataclasses.dataclass`):
 
 | Field | Default | Description |
 |---|---|---|
-| `d_phi` | 128 | phi output dim (≥ p for universality) |
-| `d_rho` | 256 | rho output dim (≥ n for universality) |
+| `d_phi` | 128 | phi output dim (â‰¥ p for universality) |
+| `d_rho` | 256 | rho output dim (â‰¥ n for universality) |
 | `pool` | `"pna"` | Pooling mode (see table above) |
 | `n_heads` | 4 | Attention heads for SAB / AttentionPool |
 | `n_sab_feat` | 1 | SAB layers at feature level |
@@ -1038,8 +1521,8 @@ FROM INFERENCE_TABLE;
 ## Model Output
 
 `best.pt` is the pretrained model artifact. It encodes the learned PPD approximation
-procedure — the full state dict of the DeepSet (phi, rho, psi MLPs and the four
-equivariant scalars λ_1, γ_1, λ_2, γ_2).
+procedure - the full state dict of the DeepSet (phi, rho, psi MLPs and the four
+equivariant scalars Î»_1, Î³_1, Î»_2, Î³_2).
 
 **Key properties:**
 - Stored at `@MODEL_STAGE/checkpoints/best.pt`.
@@ -1127,7 +1610,7 @@ Stage ownership is split by artifact type:
 | `@MODEL_STAGE/checkpoints/best.pt` | Model checkpoint | `train.py` (on each val MSE improvement) |
 | `@EVALUATION_RESULTS_STAGE/synthetic/test_report.csv` | Synthetic point-prediction report | `evaluate.py` |
 | `@EVALUATION_RESULTS_STAGE/synthetic/mc_report.csv` | Synthetic MC dropout report | `evaluate.py` |
-| `@EVALUATION_RESULTS_STAGE/benchmark_parts/<method>_detailed.csv` | Per-method benchmark detail | `evaluate.py` |
+| `@EVALUATION_RESULTS_STAGE/benchmark_parts/<method>_shard{i}_of_{n}_detailed.csv` | Per-method benchmark shard detail | `evaluate.py` |
 | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` | Canonical benchmark comparison across DeepSet and all baselines | aggregate evaluation job |
 | `@EVALUATION_RESULTS_STAGE/model_comparison_summary.csv` | Summary ranks and metrics | aggregate evaluation job |
 
@@ -1153,9 +1636,9 @@ Set the following environment variables before running `download_results.py`:
 
 | Variable | Required | Default |
 |---|---|---|
-| `SNOWFLAKE_ACCOUNT` | yes | — |
-| `SNOWFLAKE_USER` | yes | — |
-| `SNOWFLAKE_PASSWORD` | yes | — |
+| `SNOWFLAKE_ACCOUNT` | yes | - |
+| `SNOWFLAKE_USER` | yes | - |
+| `SNOWFLAKE_PASSWORD` | yes | - |
 | `SNOWFLAKE_WAREHOUSE` | no | `COMPUTE_WH` |
 
 ### Run
@@ -1208,3 +1691,120 @@ import pandas as pd
 df = pd.read_csv("models/model_comparison.csv")
 print(df)
 ```
+
+## Troubleshooting: Prometheus mmap Panic During MLJob Startup
+
+### Symptom
+
+The Snowflake MLJob fails with status `FAILED`. Container logs contain:
+
+```text
+level=ERROR source=query_logger.go msg="Failed to mmap"
+component=activeQueryTracker  file=data/queries.active  err="invalid argument"
+panic: Unable to create mmap-ed active query log
+```
+
+Observed runtime context:
+```text
+Snowflake Connector for Python: 4.0.0
+Python: 3.11.14 / Snowpark: 1.49.0 / Prometheus: 3.5.1
+Head Instance IP: 10.244.31.139  Dashboard enabled: true
+```
+
+### Root-cause interpretation
+
+The managed Prometheus process panics during Snowflake MLJob/Ray runtime startup. This is a
+runtime/infrastructure failure, not a model, DDP, NCCL, dataset, or HPO failure. Do not debug
+those layers unless Python training boundary markers prove execution reached them.
+
+### Boundary markers
+
+```text
+[train.py main] entered main              → train.py executing in container
+[train.py main] starting PyTorchDistributor.run  → distributor about to launch
+[train_fn] entered train_fn               → valid to debug DDP/model/dataset layers
+[train_fn] topology                       → valid to debug world-size issues
+[TRAINING FAILURE JSON]                   → Python exception handler ran
+[runtime_probe] entered Python            → probe reached user Python code
+[runtime_probe] completed                 → probe finished successfully
+```
+
+If `[train.py main] entered main` is absent, do not debug Python training code.
+
+### Stage investigation SQL
+
+```sql
+LIST @MODEL_STAGE/checkpoints/;
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*train_failure[.]json';
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*training_submission_started[.]json';
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*best[.]pt';
+LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain[.]pt';
+```
+
+`training_submission_started.json` present → stored procedure or train.py startup reached upload.
+`train_failure.json` absent with Prometheus mmap markers → expected; Python handler did not run.
+
+### Runtime Pinning
+
+Training/HPO/runtime-probe submissions still use the account-managed default
+unless explicitly changed. Evaluation submissions are different:
+`run_evaluation_test.py` requires `PREP_RUNTIME_ENVIRONMENT`,
+`BENCHMARK_RUNTIME_ENVIRONMENT`, and `AUTOGLUON_RUNTIME_ENVIRONMENT` and passes
+those values as `runtime_environment` without per-job `pip_requirements`.
+
+### Operational change notes
+
+- 2026-05-09: Evaluation runtime reduction: required prebuilt runtime images via
+  [`submit_from_stage(runtime_environment=...)`](https://docs.snowflake.com/en/developer-guide/snowpark-ml/reference/latest/api/jobs/snowflake.ml.jobs.submit_from_stage),
+  prep-skip preflight, 27 baseline jobs consolidated to 3 multi-method dataset
+  shards, and single-node CPU parallelism via `BENCHMARK_NUM_CPUS`. Architecture
+  remains dataset-first and single-node shard based.
+
+### Runtime probe workflow
+
+```sql
+-- Step 1: single-node probe
+CALL run_training_runtime_probe(1);    -- single-node probe
+
+-- Step 2: optional intermediate probes
+CALL run_training_runtime_probe(2);    -- 2-node probe (optional)
+CALL run_training_runtime_probe(5);    -- 5-node probe (optional)
+
+-- Step 3: full-topology probe (only if step 1 passes)
+CALL run_training_runtime_probe(10);   -- full-topology probe
+
+-- Step 4: rerun final training (only if probes pass)
+CALL run_model_training();
+```
+
+Look for `[runtime_probe] entered Python` and `[runtime_probe] completed` in job logs.
+If the probe fails before `[runtime_probe] entered Python` and Prometheus mmap markers appear,
+escalate to Snowflake Support.
+
+### Snowflake Support escalation template
+
+```
+Snowflake MLJob / Ray runtime startup failure — GPU compute pool.
+
+Job fails before Python entrypoint execution. Container logs show Prometheus panic:
+  Failed to mmap / component=activeQueryTracker / file=data/queries.active / err="invalid argument"
+  panic: Unable to create mmap-ed active query log
+
+No Python boundary markers appear ([train.py main] entered main, [train_fn] entered train_fn).
+
+Compute pool: DEEPSET_GPU_POOL (GPU_NV_M)
+Target instances: 10 (final training) / 1 (single-node probe)
+Training topology: 10 nodes × 4 workers = 40 world size
+Connector: 4.0.0 / Python: 3.11.14 / Snowpark: 1.49.0 / Prometheus: 3.5.1
+runtime_environment: training not pinned here; evaluation uses required runtime image env vars
+
+Request: Please confirm whether the managed Prometheus data directory supports mmap for
+active query tracking, and whether there is a supported way to disable Ray Dashboard /
+Prometheus or redirect data/queries.active to an mmap-compatible path such as /tmp.
+```
+
+### Canonical topology (do not change without instruction)
+
+- Final training: 10 nodes × 4 workers per node = 40 expected workers
+- Pretraining: 10 nodes × 4 workers per node = 40 expected workers
+- HPO: 5 nodes × 4 concurrent trials per node = 20 total trial slots / 20 total trials
