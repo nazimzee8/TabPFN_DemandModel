@@ -119,12 +119,12 @@ When documenting or patching Snowflake execution, include these runtime constrai
 - `run_evaluation_pipeline()` is phase-gated to avoid Snowflake node quota bursts:
   DeepSet GPU shards (phase 3, 10 nodes) all finish before CPU baseline shards
   (phase 4, 3 nodes) start; CPU baseline shards finish before AutoGluon shards
-  (phase 5) start. AutoGluon shards run in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`
-  (30 total, 6 batches), with each batch waited before the next is submitted.
+  (phase 5) start. AutoGluon shards run in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=30`
+  (30 total, one full-concurrency batch when `AUTOGLUON_CPU_POOL MAX_NODES` and account quota allow it).
 - `run_evaluation_capacity_probe()` validates current account capacity before expensive
   evaluation work. It submits `capacity_probe.py` (no model, no data — 30-second sleep)
   in 3 non-overlapping phases matching the evaluation envelope: GPU=10, CPU=3,
-  AutoGluon=5. Phases are fully serialized. Recommended run order:
+  AutoGluon=30. Phases are fully serialized. Recommended run order:
   1. `CALL run_evaluation_runtime_probes(...)` — validate runtime images
   2. `CALL run_evaluation_capacity_probe(...)` — validate node quota
   3. Split-phase evaluation (recommended) or `run_evaluation_pipeline()` (legacy)
@@ -145,7 +145,7 @@ When documenting or patching Snowflake execution, include these runtime constrai
   CALL run_evaluation_aggregation('<prep>', '<bench>', '<ag>');
   ```
   - Each pool is held only for its own phase; quota is released before the next phase begins.
-  - `run_autogluon_evaluation()` submits 30 shards in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`.
+  - `run_autogluon_evaluation()` submits 30 shards in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=30`.
   - `ALTER COMPUTE POOL ... SUSPEND` must be issued manually after each phase; completing a
     phase does not automatically release quota.
   - `run_evaluation_aggregation()` can be re-run without re-running prior phases if

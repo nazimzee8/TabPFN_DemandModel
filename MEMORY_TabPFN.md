@@ -329,10 +329,11 @@ diagnostics are broken.
   all finish before AutoGluon shards (phase 5) are submitted; all AutoGluon shards must
   finish before the aggregate job (phase 6). Phases 0, 1+2 (synthetic + prep), and 6
   are unchanged.
-- `AUTOGLUON_BENCHMARK_SHARDS=30` total AutoGluon shard jobs; `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`
-  maximum in-flight at once. AutoGluon is submitted and waited in batches of 5 (6 batches total).
+- `AUTOGLUON_BENCHMARK_SHARDS=30` total AutoGluon shard jobs; `AUTOGLUON_MAX_CONCURRENT_SHARDS=30`
+  maximum in-flight at once. AutoGluon is submitted and waited in one full-concurrency batch when
+  `AUTOGLUON_CPU_POOL MAX_NODES` and account quota allow it.
 - `run_evaluation_capacity_probe()` is a lightweight pre-check that allocates nodes in
-  the planned phase sizes (GPU=10, CPU=3, AutoGluon=5) using `capacity_probe.py` (no
+  the planned phase sizes (GPU=10, CPU=3, AutoGluon=30) using `capacity_probe.py` (no
   model, no benchmark data, no heavy imports — just a 30-second sleep). Phases are
   non-overlapping: GPU phase must finish before CPU phase starts; CPU phase must finish
   before AutoGluon phase starts. Recommended run order:

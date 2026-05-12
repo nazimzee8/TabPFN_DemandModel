@@ -571,7 +571,7 @@ def test_evaluation_pipeline_autogluon_batched(monkeypatch):
     ag_events = [(k, ep, env) for k, ep, env in all_events
                  if _event_phase(ep, env) == "autogluon"]
     assert len(ag_events) == 60  # 30 submits + 30 waits
-    batch_size = runner.AUTOGLUON_MAX_CONCURRENT_SHARDS  # 5
+    batch_size = runner.AUTOGLUON_MAX_CONCURRENT_SHARDS  # 30
     # Event pattern: [batch_size submits, batch_size waits] repeated
     for batch_start in range(0, len(ag_events), batch_size * 2):
         chunk = ag_events[batch_start : batch_start + batch_size * 2]
@@ -593,7 +593,12 @@ def test_evaluation_capacity_probe_phases_do_not_overlap(monkeypatch):
 
     cp_events = [(i, k, env) for i, (k, ep, env) in enumerate(all_events)
                  if ep == "capacity_probe.py"]
-    assert len(cp_events) == 36  # (10+3+5) * 2
+    expected_jobs = (
+        runner.GPU_BENCHMARK_SHARDS
+        + runner.CPU_BASELINE_BENCHMARK_SHARDS
+        + runner.AUTOGLUON_MAX_CONCURRENT_SHARDS
+    )
+    assert len(cp_events) == expected_jobs * 2
 
     def cp_phase_indices(phase_substr, kind):
         return [i for i, k, env in cp_events
@@ -695,7 +700,7 @@ def test_evaluation_capacity_probe_job_properties(monkeypatch):
     runner.run_evaluation_capacity_probe(_FakeSession())
 
     cp_jobs = [c for c in submit_calls if c["entrypoint"] == "capacity_probe.py"]
-    assert len(cp_jobs) == 18  # 10 + 3 + 5
+    assert len(cp_jobs) == 43  # 10 + 3 + 30
     assert all("pip_requirements" not in c for c in cp_jobs)
     assert all("external_access_integrations" not in c for c in cp_jobs)
     # Phase sizes
@@ -704,4 +709,4 @@ def test_evaluation_capacity_probe_job_properties(monkeypatch):
     ag_jobs  = [c for c in cp_jobs if c["compute_pool"] == runner.AUTOGLUON_CPU_POOL]
     assert len(gpu_jobs) == runner.GPU_BENCHMARK_SHARDS           # 10
     assert len(cpu_jobs) == runner.CPU_BASELINE_BENCHMARK_SHARDS  # 3
-    assert len(ag_jobs)  == runner.AUTOGLUON_MAX_CONCURRENT_SHARDS # 5
+    assert len(ag_jobs)  == runner.AUTOGLUON_MAX_CONCURRENT_SHARDS # 30

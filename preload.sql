@@ -242,7 +242,7 @@ CREATE OR REPLACE PROCEDURE run_evaluation_runtime_probes(
 
 -- run_evaluation_capacity_probe() is a lightweight quota/capacity check. It submits
 -- capacity_probe.py in 3 non-overlapping phases matching the fixed evaluation pipeline
--- envelope (GPU=10, CPU=3, AutoGluon=5). Run between runtime probes and the full pipeline.
+-- envelope (GPU=10, CPU=3, AutoGluon=30). Run between runtime probes and the full pipeline.
 CREATE OR REPLACE PROCEDURE run_evaluation_capacity_probe(
   PREP_RUNTIME_ENVIRONMENT STRING,
   BENCHMARK_RUNTIME_ENVIRONMENT STRING,
@@ -299,7 +299,7 @@ CREATE OR REPLACE PROCEDURE run_baseline_evaluation(
   IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
   HANDLER = 'run_evaluation_test.run_baseline_evaluation';
 
--- run_autogluon_evaluation() runs 30 AutoGluon shards (max 5 concurrent) on AUTOGLUON_CPU_POOL.
+-- run_autogluon_evaluation() runs 30 AutoGluon shards (max 30 concurrent) on AUTOGLUON_CPU_POOL.
 CREATE OR REPLACE PROCEDURE run_autogluon_evaluation(
   PREP_RUNTIME_ENVIRONMENT STRING,
   BENCHMARK_RUNTIME_ENVIRONMENT STRING,

@@ -36,7 +36,7 @@ BENCHMARK_MANIFEST_STAGE_PATH = f"{BENCHMARK_PREPARED_STAGE}benchmark_manifest.j
 GPU_BENCHMARK_SHARDS          = 10   # DeepSet benchmark: 10 GPU shard jobs (DEEPSET_GPU_POOL MAX_NODES=10)
 CPU_BASELINE_BENCHMARK_SHARDS = 3    # Combined baselines: 3 CPU shard jobs (DEEPSET_CPU_POOL MAX_NODES=3)
 AUTOGLUON_BENCHMARK_SHARDS    = 30   # AutoGluon: 30 CPU shard jobs (AUTOGLUON_CPU_POOL MAX_NODES=30)
-AUTOGLUON_MAX_CONCURRENT_SHARDS = 5   # cap AutoGluon concurrency; total stays 30
+AUTOGLUON_MAX_CONCURRENT_SHARDS = 30  # cap AutoGluon concurrency; total stays 30
 
 # Benchmark shards own datasets, not individual (seed, dataset) pairs. Each
 # owned dataset is loaded, evaluated across all configured seeds, then released.
@@ -609,7 +609,7 @@ def _run_baseline_phase(session, runtimes):
 
 
 def _run_autogluon_phase(session, runtimes):
-    """Submit 30 AutoGluon shards in batches of AUTOGLUON_MAX_CONCURRENT_SHARDS (5)."""
+    """Submit 30 AutoGluon shards in batches of AUTOGLUON_MAX_CONCURRENT_SHARDS."""
     manifest_env = _benchmark_manifest_env()
     autogluon_shards = [
         (f"AutoGluon benchmark shard {i + 1}/{AUTOGLUON_BENCHMARK_SHARDS}", i)
@@ -738,7 +738,7 @@ def run_evaluation_capacity_probe(
     _submit_and_wait_capacity_phase(
         session, "AutoGluon capacity probe",
         AUTOGLUON_CPU_POOL, runtimes["AUTOGLUON_RUNTIME_ENVIRONMENT"],
-        AUTOGLUON_MAX_CONCURRENT_SHARDS,  # 5
+        AUTOGLUON_MAX_CONCURRENT_SHARDS,  # 30
     )
     return (
         f"Capacity probe complete. Validated concurrency envelope: "
@@ -806,7 +806,7 @@ def run_autogluon_evaluation(
     benchmark_runtime_environment: str = None,
     autogluon_runtime_environment: str = None,
 ) -> str:
-    """Run 30 AutoGluon benchmark shards (max 5 concurrent) on AUTOGLUON_CPU_POOL."""
+    """Run 30 AutoGluon benchmark shards on AUTOGLUON_CPU_POOL."""
     runtimes = _resolve_runtime_environments(
         prep_runtime_environment=prep_runtime_environment,
         benchmark_runtime_environment=benchmark_runtime_environment,

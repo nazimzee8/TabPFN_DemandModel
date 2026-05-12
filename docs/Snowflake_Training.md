@@ -62,7 +62,7 @@ ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;   -- release GPU quota
 CALL run_baseline_evaluation('<prep>', '<benchmark>', '<autogluon>');
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;   -- release CPU quota
 
--- Step 5: 30 AutoGluon shards, max 5 concurrent (AUTOGLUON_CPU_POOL)
+-- Step 5: 30 AutoGluon shards, max 30 concurrent (AUTOGLUON_CPU_POOL)
 CALL run_autogluon_evaluation('<prep>', '<benchmark>', '<autogluon>');
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND; -- release AutoGluon quota
 
@@ -81,8 +81,9 @@ CALL run_evaluation_aggregation('<prep>', '<benchmark>', '<autogluon>');
 - **Aggregation re-run**: `run_evaluation_aggregation()` can be re-run without re-running
   prior phases as long as the `benchmark_parts/` part files already exist on
   `@EVALUATION_RESULTS_STAGE`.
-- **AutoGluon batching**: `run_autogluon_evaluation()` submits 30 shards in batches of 5
-  (`AUTOGLUON_MAX_CONCURRENT_SHARDS`), waiting for each batch before submitting the next.
+- **AutoGluon batching**: `run_autogluon_evaluation()` submits 30 shards in batches of up to 30
+  (`AUTOGLUON_MAX_CONCURRENT_SHARDS`), so all AutoGluon shards can run concurrently when
+  `AUTOGLUON_CPU_POOL MAX_NODES` and account quota allow it.
 
 ## Current Snowflake Guardrails
 
@@ -143,7 +144,7 @@ validate all 5 runtime probes (including the CPU baseline probe with catboost) b
 the full run, then run
 `CALL run_evaluation_capacity_probe('<prep>', '2.5.0-py311', '<autogluon>')` to verify
 the account can currently accept the planned concurrency envelope (GPU=10, CPU=3,
-AutoGluon=5) — this is a quota check only and does not load models or benchmark data;
+AutoGluon=30) — this is a quota check only and does not load models or benchmark data;
 if it fails with a node limit error, run `SHOW COMPUTE POOLS`, suspend idle pools, wait
 for active jobs to finish, or request a higher Snowflake account node quota before
 retrying. Then run a one-dataset AutoGluon smoke where supported, then run
