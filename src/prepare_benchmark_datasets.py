@@ -23,6 +23,38 @@ import numpy as np
 # SPCS home guard — redirect ~ to writable path before any Snowflake imports
 os.environ.setdefault("HOME", "/tmp")
 
+
+def _prepare_openml_runtime_paths():
+    """
+    Configure OpenML import-time paths for Snowflake runtimes.
+
+    openml initializes config and cache directories during import and otherwise
+    tries to write under /home/udf, which is read-only in Python stored
+    procedures.
+    """
+    os.environ.setdefault("HOME", "/tmp")
+    os.environ.setdefault("XDG_CONFIG_HOME", "/tmp/.config")
+    os.environ.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
+    try:
+        os.makedirs("/tmp/.config/openml", exist_ok=True)
+        os.makedirs("/tmp/.cache/openml", exist_ok=True)
+        os.makedirs("/tmp/openml_cache", exist_ok=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not create writable OpenML runtime directories under /tmp. "
+            "Snowflake prepare_benchmark_datasets() requires writable "
+            "/tmp/.config/openml, /tmp/.cache/openml, and /tmp/openml_cache "
+            "before importing openml."
+        ) from exc
+
+
+def _configure_openml_cache(openml_module):
+    """Configure OpenML cache path across supported OpenML versions."""
+    if hasattr(openml_module.config, "set_root_cache_directory"):
+        openml_module.config.set_root_cache_directory("/tmp/openml_cache")
+    else:
+        openml_module.config.cache_directory = "/tmp/openml_cache"
+
 # ---------------------------------------------------------------------------
 # Constants (read from env vars with defaults)
 # ---------------------------------------------------------------------------
@@ -259,10 +291,10 @@ def _fetch_openml_datasets(target_n=OPENML_TARGET_N,
         {task_id, dataset_id, name, X (float64 ndarray), y (float64 ndarray),
          categorical_indicator (list of bool)}
     """
+    _prepare_openml_runtime_paths()
     import openml
 
-    openml.config.cache_directory = "/tmp/openml_cache"
-    os.makedirs("/tmp/openml_cache", exist_ok=True)
+    _configure_openml_cache(openml)
 
     task_ids = set()
 
@@ -549,13 +581,22 @@ def prepare_datasets(session=None):
         if BENCHMARK_INCLUDE_OPENML:
             print("\nFetching OpenML benchmark datasets...", flush=True)
             try:
-                import openml  # noqa: F401
-            except ImportError:
+                _prepare_openml_runtime_paths()
+                import openml
+                _configure_openml_cache(openml)
+            except Exception as exc:
                 raise RuntimeError(
-                    "openml package is not installed. "
-                    "PREP_RUNTIME_ENVIRONMENT must include openml; evaluation "
-                    "jobs do not submit pip_requirements."
-                )
+                    "Could not import openml after configuring writable "
+                    "Snowflake runtime paths. Direct CALL "
+                    "prepare_benchmark_datasets() requires openml==0.15.1 in "
+                    "the stored procedure PACKAGES clause and writable "
+                    "/tmp/.config/openml, /tmp/.cache/openml, and "
+                    "/tmp/openml_cache directories. "
+                    "Evaluation pipeline prep MLJobs install OpenML with "
+                    "prep-only pip_requirements. Recreate "
+                    "prepare_benchmark_datasets() and re-stage the updated "
+                    "prepare_benchmark_datasets.py script."
+                ) from exc
             openml_datasets = _fetch_openml_datasets(target_n=OPENML_TARGET_N)
 
             for ds in openml_datasets:

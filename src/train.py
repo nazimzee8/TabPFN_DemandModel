@@ -183,6 +183,45 @@ def reduce_loss_sum_count(loss_sum, total_count, device, dist_module):
 # Pretrain checkpoint loader
 # ---------------------------------------------------------------------------
 
+def _normalize_checkpoint_model_config(saved_cfg, checkpoint_name="checkpoint"):
+    if isinstance(saved_cfg, ModelConfig):
+        return saved_cfg
+    if isinstance(saved_cfg, dict):
+        try:
+            return ModelConfig(**saved_cfg)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{checkpoint_name} has invalid cfg payload: {saved_cfg!r}"
+            ) from exc
+    if saved_cfg is None:
+        raise ValueError(f"{checkpoint_name} is missing required cfg payload")
+    raise TypeError(
+        f"{checkpoint_name} cfg must be a dict or ModelConfig, "
+        f"got {type(saved_cfg).__name__}"
+    )
+
+
+def _checkpoint_architecture_mismatches(saved_cfg, current_cfg):
+    fields = (
+        "d_phi",
+        "d_rho",
+        "pool",
+        "n_heads",
+        "n_sab_feat",
+        "n_sab_samp",
+        "norm_feat",
+        "norm_target",
+    )
+    return {
+        field: {
+            "saved": getattr(saved_cfg, field),
+            "current": getattr(current_cfg, field),
+        }
+        for field in fields
+        if getattr(saved_cfg, field) != getattr(current_cfg, field)
+    }
+
+
 def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank):
     """Download and warm-start model from a pretrain checkpoint.
 
@@ -227,10 +266,12 @@ def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank):
                     ckpt = torch.load(local_path, map_location=device, weights_only=False)
             else:
                 raise
-        saved_cfg = ckpt.get("cfg")
-        if saved_cfg != cfg:
+        saved_cfg = _normalize_checkpoint_model_config(ckpt.get("cfg"), "pretrain checkpoint")
+        arch_mismatches = _checkpoint_architecture_mismatches(saved_cfg, cfg)
+        if arch_mismatches:
             print(f"[PRETRAIN] rank {rank}: architecture mismatch "
-                  f"(saved={saved_cfg}, current={cfg}); starting from scratch.", flush=True)
+                  f"(mismatches={arch_mismatches}; saved={saved_cfg}, current={cfg}); "
+                  "starting from scratch.", flush=True)
             return
         model.load_state_dict(ckpt["state_dict"])
         print(f"[PRETRAIN] rank {rank}: loaded pretrain checkpoint from {stage_path}", flush=True)

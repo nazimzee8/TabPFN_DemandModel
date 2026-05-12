@@ -25,8 +25,64 @@ written back to Snowflake.
    `weight_decay`, and `dropout`, and writes `@MODEL_STAGE/hpo/best_config.json`.
 10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
 11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
-12. **Call `run_evaluation_pipeline()`**. Evaluation reads `best.pt`, preflights compute pools and runtime images, validates prepared benchmark manifest/index metadata, launches prepared-dataset benchmark shards, then aggregates CSV outputs to `@EVALUATION_RESULTS_STAGE`.
+12. **Run evaluation** — two options depending on Snowflake account node quota:
+    - **Split-phase (recommended under tight quota)**: call each phase independently
+      and suspend its pool before starting the next (see *Split-Phase Evaluation Under
+      Tight Node Quota* below). This prevents `Requested number of nodes exceeds node
+      limit` errors when all three pools cannot be held simultaneously.
+    - **Monolithic (legacy convenience)**: call `run_evaluation_pipeline('<prep>', '<benchmark>', '<autogluon>')`.
+      Evaluation reads `best.pt`, preflights all compute pools and runtime images,
+      validates prepared benchmark manifest/index metadata, launches prepared-dataset
+      benchmark shards, then aggregates CSV outputs to `@EVALUATION_RESULTS_STAGE`.
+      Requires holding quota across all three pools for the full ~2-hour run.
 13. **Download results locally** from the client with SnowSQL `GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';`.
+
+## Split-Phase Evaluation Under Tight Node Quota
+
+When the Snowflake account has limited node quota, holding `DEEPSET_GPU_POOL` (10 nodes),
+`DEEPSET_CPU_POOL` (3 nodes), and `AUTOGLUON_CPU_POOL` (30 nodes) simultaneously during the
+full ~2-hour `run_evaluation_pipeline()` run can cause `Requested number of nodes exceeds node
+limit` failures mid-pipeline. The split-phase procedures expose each benchmark phase as its own
+stored procedure so quota is released between phases.
+
+### Recommended SQL sequence
+
+```sql
+-- Step 1: Validate runtime images (run once before all phases)
+CALL run_evaluation_runtime_probes('<prep>', '<benchmark>', '<autogluon>');
+
+-- Step 2: Validate and prepare benchmark manifest/index (DEEPSET_CPU_POOL)
+CALL run_evaluation_prep('<prep>', '<benchmark>', '<autogluon>');
+
+-- Step 3: Synthetic eval + 10 DeepSet GPU shards (DEEPSET_GPU_POOL)
+CALL run_deepset_evaluation('<prep>', '<benchmark>', '<autogluon>');
+ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;   -- release GPU quota
+
+-- Step 4: 3 CPU baseline benchmark shards (DEEPSET_CPU_POOL)
+CALL run_baseline_evaluation('<prep>', '<benchmark>', '<autogluon>');
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;   -- release CPU quota
+
+-- Step 5: 30 AutoGluon shards, max 5 concurrent (AUTOGLUON_CPU_POOL)
+CALL run_autogluon_evaluation('<prep>', '<benchmark>', '<autogluon>');
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND; -- release AutoGluon quota
+
+-- Step 6: Aggregate all benchmark_parts/ into model_comparison.csv
+CALL run_evaluation_aggregation('<prep>', '<benchmark>', '<autogluon>');
+```
+
+### Key notes
+
+- **Manual suspend is required**: completing a phase does not automatically release quota.
+  The caller must issue `ALTER COMPUTE POOL ... SUSPEND` after each phase.
+- **No runtime probes in split procedures**: run `run_evaluation_runtime_probes()` once
+  before starting any split-phase procedure.
+- **Retrying individual phases**: if a phase fails, re-run only that phase without re-running
+  completed ones. The prep and aggregation jobs are idempotent.
+- **Aggregation re-run**: `run_evaluation_aggregation()` can be re-run without re-running
+  prior phases as long as the `benchmark_parts/` part files already exist on
+  `@EVALUATION_RESULTS_STAGE`.
+- **AutoGluon batching**: `run_autogluon_evaluation()` submits 30 shards in batches of 5
+  (`AUTOGLUON_MAX_CONCURRENT_SHARDS`), waiting for each batch before submitting the next.
 
 ## Current Snowflake Guardrails
 
@@ -54,6 +110,13 @@ written back to Snowflake.
   `lightgbm`, and `catboost`, which are not required for AutoGluon shards.
   `scipy`, `pyarrow`, and `torch` must be present because `evaluate.py`
   hard-imports them at module startup regardless of selected benchmark method.
+- `run_evaluation_pipeline()` requires three STRING arguments: the prep, benchmark,
+  and AutoGluon runtime image names. Do not rely on local shell variables or
+  Snowsight worksheet variables; they are not propagated into the Python stored
+  procedure runtime. Quick-fail diagnostic: if the procedure errors in under a few
+  seconds with `PREP_RUNTIME_ENVIRONMENT is required`, the old zero-argument
+  procedure is still installed. Recreate it with three arguments, then:
+  `CALL run_evaluation_pipeline('<prep>', '<benchmark>', '<autogluon>');`
 - DeepSet benchmark shard jobs run `DeepSetModel-MC bounded-context ensemble`, not
   exact full-context DeepSet inference. The OOM boundary was forwarding the full
   90% processed training split against the full test split inside MC dropout on
@@ -74,11 +137,59 @@ Recommended smoke order: compile the Python scripts, create Snowflake objects wi
 `LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';`,
 run `CALL run_hpo_pipeline()`, verify or read
 `@MODEL_STAGE/hpo/best_config.json`, run `CALL run_model_training()`, verify
-`LIST @MODEL_STAGE/checkpoints/` includes
-`best.pt`, run a one-dataset AutoGluon smoke where supported, then run
-`CALL run_evaluation_pipeline()` and verify
+`LIST @MODEL_STAGE/checkpoints/` includes `best.pt`, optionally run
+`CALL run_evaluation_runtime_probes('<prep>', '2.5.0-py311', '<autogluon>')` to
+validate all 5 runtime probes (including the CPU baseline probe with catboost) before
+the full run, then run
+`CALL run_evaluation_capacity_probe('<prep>', '2.5.0-py311', '<autogluon>')` to verify
+the account can currently accept the planned concurrency envelope (GPU=10, CPU=3,
+AutoGluon=5) — this is a quota check only and does not load models or benchmark data;
+if it fails with a node limit error, run `SHOW COMPUTE POOLS`, suspend idle pools, wait
+for active jobs to finish, or request a higher Snowflake account node quota before
+retrying. Then run a one-dataset AutoGluon smoke where supported, then run
+`CALL run_evaluation_pipeline('<prep>', '2.5.0-py311', '<autogluon>')` and verify
 `benchmark_parts/AutoGluon_shard*_detailed.csv`, `model_comparison.csv`, and
 `model_comparison_summary.csv`.
+
+## CatBoost Dependency on Snowflake-Managed Container Runtime
+
+CatBoost is NOT preinstalled in the `2.5.0-py311` Snowflake-managed Container Runtime image.
+It is installed per-MLJob via `pip_requirements` + `external_access_integrations`. This requires
+a Snowflake EAI that allows outbound PyPI access.
+
+### Admin bootstrap (one-time, ACCOUNTADMIN required)
+
+Run the Step 2c block in `sql/run_training_job.sql`:
+```sql
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION TABPFN_CATBOOST_PYPI_EAI ...
+GRANT USAGE ON INTEGRATION TABPFN_CATBOOST_PYPI_EAI TO ROLE <job_submitter_role>;
+```
+
+### MLJob dependency wiring
+
+Every CatBoost-dependent MLJob submission must pass both:
+```python
+pip_requirements=[f"catboost=={CATBOOST_VERSION}"]
+external_access_integrations=["TABPFN_CATBOOST_PYPI_EAI"]
+```
+The EAI opens the PyPI network path; `pip_requirements` triggers the install.
+Passing only one of the two will fail silently or with a network error.
+
+### Validation
+
+1. Verify EAI exists: `SHOW EXTERNAL ACCESS INTEGRATIONS LIKE 'TABPFN_CATBOOST_PYPI_EAI';`
+2. Verify grant: `SHOW GRANTS ON INTEGRATION TABPFN_CATBOOST_PYPI_EAI;`
+3. Run probes: `CALL run_evaluation_runtime_probes('<prep>', '2.5.0-py311', '<autogluon>');`
+4. Confirm logs: `[runtime_probe] required import ok: catboost version=<pinned_version>`
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `No module named 'catboost'` with `pip_requirements` set | Missing EAI — pip cannot reach PyPI | Create EAI and pass `external_access_integrations` |
+| Network error during pip install | EAI exists but USAGE not granted to job role | `GRANT USAGE ON INTEGRATION ... TO ROLE ...` |
+| Notebook imports catboost but probe cannot | Notebook EAI setting does not propagate to submitted MLJobs | Configure submission args, not only notebook |
+| EAI creation fails | Role lacks `CREATE INTEGRATION` or PyPI rule access | Run bootstrap with ACCOUNTADMIN |
 
 ## Secure Kaggle Token Handling
 
@@ -307,15 +418,16 @@ script through `snowflake.snowpark.secrets`.
 before benchmark shards as a lightweight manifest and `BENCHMARK_DATASET_INDEX`
 validation step. Existing valid manifests exit early inside
 `prepare_benchmark_datasets.py`; invalid or incomplete manifests are rebuilt. The
-prep job uses `external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS"]`; benchmark
-shard jobs do not receive that integration. `openml` is not a shard dependency,
-and `evaluate.py` must remain OpenML-free. Creating the
+prep job uses `pip_requirements=["openml==0.15.1"]` and
+`external_access_integrations=["BENCHMARK_EXTERNAL_ACCESS", "TABPFN_PYPI_EAI"]`;
+benchmark shard jobs do not receive the benchmark integration or OpenML dependency.
+`openml` is not a shard dependency, and `evaluate.py` must remain OpenML-free. Creating the
 environment objects only makes the route available; jobs will not use it unless
 the MLJob configuration names the integration and dependencies.
 
-The evaluation submission layer requires prebuilt managed runtime images instead
-of installing packages at MLJob startup. Configure all three controls before
-calling `run_evaluation_pipeline()`:
+The evaluation submission layer requires prebuilt managed runtime images and adds
+only the narrow per-job pip dependencies that are missing from those images.
+Configure all three controls before calling `run_evaluation_pipeline()`:
 
 - `PREP_RUNTIME_ENVIRONMENT` for `prepare_benchmark_datasets.py`.
 - `BENCHMARK_RUNTIME_ENVIRONMENT` for non-AutoGluon `evaluate.py` jobs,
@@ -324,19 +436,45 @@ calling `run_evaluation_pipeline()`:
 - `AUTOGLUON_RUNTIME_ENVIRONMENT` for AutoGluon shards.
 
 `run_evaluation_test.py` passes these values to
-`submit_from_stage(runtime_environment=...)` and does not pass
-`pip_requirements` for evaluation or prep submissions. It fails fast with a
-`RuntimeError` if any required runtime image env var is missing. It also exposes
+`submit_from_stage(runtime_environment=...)`. It fails fast with a
+`RuntimeError` if any required runtime image env var is missing. It exposes
 the selected runtime inside each container as `EVAL_RUNTIME_ENVIRONMENT` and runs
-`runtime_probe.py` before expensive jobs on the benchmark GPU pool, benchmark CPU
-pool, prep CPU pool, and AutoGluon CPU pool. The probe requires runtime-specific
-imports: benchmark images need `torch`, `pyarrow`, `pandas`, `scipy`,
-`sklearn`, XGBoost, LightGBM, CatBoost, Snowpark, and Snowflake ML jobs; prep
-needs `openml`, `numpy`, and Snowpark; AutoGluon needs `autogluon.tabular`,
-`numpy`, `pandas`, `sklearn`, `scipy`, `pyarrow`, `torch`, and Snowpark.
-AutoGluon intentionally excludes XGBoost, LightGBM, and CatBoost. `scipy`,
-`pyarrow`, and `torch` are required because AutoGluon shards still execute
-`evaluate.py`, which imports those modules at startup. Verify available runtime image names in the target account. Snowflake documents the argument on the
+5 `runtime_probe.py` preflight probes: benchmark GPU, benchmark aggregate CPU,
+CPU baseline (with `pip_requirements=["catboost"]`), prep CPU (with
+`pip_requirements=["openml==0.15.1"]`), and AutoGluon CPU.
+Both `run_evaluation_pipeline()` and `run_evaluation_runtime_probes()` submit
+these five probes serially: submit one probe, wait for completion, then submit
+the next. This is intentional because `target_instances=1` still consumes
+account node quota; do not restore concurrent probe fan-out across the GPU, CPU,
+and AutoGluon pools unless Snowflake node quota has been raised and verified.
+
+Probe import requirements (`BENCHMARK_REQUIRED_IMPORTS` / `BASELINE_REQUIRED_IMPORTS`):
+- **Benchmark GPU and aggregate CPU probes** (`BENCHMARK_REQUIRED_IMPORTS`): `torch`,
+  `pyarrow`, `pandas`, `scipy`, `sklearn`, Snowpark, and Snowflake ML jobs.
+  These probes do **not** include XGBoost, LightGBM, or CatBoost.
+- **CPU baseline probe** (`BASELINE_REQUIRED_IMPORTS`): same as above plus
+  `xgboost`, `lightgbm`, and `catboost`. This probe additionally passes
+  `pip_requirements=["catboost"]` because `2.5.0-py311` does not include `catboost`
+  in the managed image.
+- **Prep probe**: `openml`, `numpy`, and Snowpark. This probe passes
+  `pip_requirements=["openml==0.15.1"]` with `TABPFN_PYPI_EAI`.
+- **AutoGluon probe**: `autogluon.tabular`, `numpy`, `pandas`, `sklearn`, `scipy`,
+  `pyarrow`, `torch`, and Snowpark. Intentionally excludes XGBoost, LightGBM, and
+  CatBoost. `scipy`, `pyarrow`, and `torch` are required because `evaluate.py`
+  hard-imports them at module startup regardless of benchmark method.
+
+CPU baseline shard jobs pass `pip_requirements=["catboost"]` **explicitly at
+the call site** in the Phase 4 loop of `run_evaluation_pipeline()`. The
+`_submit_eval()` helper accepts an explicit `pip_requirements` parameter (default
+`_UNSET`); when `_UNSET` the helper falls back to `_pip_requirements_for_eval()`
+inference, but Phase 4 always passes `pip_requirements=list(BASELINE_EXTRA_PIP_REQUIREMENTS)`
+directly so the guarantee is visible at the submission site and does not depend on
+`BENCHMARK_METHODS` parsing. Prep jobs pass only `openml==0.15.1`; AutoGluon jobs
+pass only `autogluon.tabular==1.3.0`; synthetic, DeepSet, and aggregate jobs pass
+no `pip_requirements`.
+
+Verify available runtime image names in the target account. Snowflake documents
+the argument on the
 [`submit_from_stage` API reference](https://docs.snowflake.com/en/developer-guide/snowpark-ml/reference/latest/api/jobs/snowflake.ml.jobs.submit_from_stage).
 
 After uploading scripts, optionally run the raw Kaggle setup procedure, then run
@@ -816,11 +954,17 @@ CREATE OR REPLACE PROCEDURE prepare_benchmark_datasets()
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
-  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python', 'openml==0.15.1')
+  EXTERNAL_ACCESS_INTEGRATIONS = (BENCHMARK_EXTERNAL_ACCESS)
   IMPORTS = ('@MODEL_STAGE/scripts/prepare_benchmark_datasets.py')
   HANDLER = 'prepare_benchmark_datasets.prepare_datasets';
 
-CREATE OR REPLACE PROCEDURE run_evaluation_pipeline()
+CREATE OR REPLACE PROCEDURE run_evaluation_pipeline(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
@@ -836,7 +980,8 @@ Procedure responsibilities:
 - `run_model_training()` imports `run_model_training_job.py`, reads `@MODEL_STAGE/hpo/best_config.json`, passes it to `train.py` as `BEST_CONFIG`, and submits only the training MLJob/container.
 - `run_training_pipeline()` imports `run_training_job.py` and remains a one-call convenience wrapper for HPO plus training.
 - `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_DATASET_STAGE/benchmark_prepared/`.
-- `run_evaluation_pipeline()` imports `run_evaluation_test.py`, verifies `best.pt`, `runtime_probe.py`, compute pools, and runtime-image imports, runs single-node GPU synthetic evaluation, always submits benchmark preparation as manifest/index validation, then launches prepared benchmark shards and aggregation.
+- `run_evaluation_pipeline()` imports `run_evaluation_test.py`, verifies `best.pt`, `runtime_probe.py`, compute pools, and runtime-image imports by submitting and waiting on 5 serial probes including the CPU baseline probe with `pip_requirements=["catboost"]`, runs single-node GPU synthetic evaluation, always submits benchmark preparation as manifest/index validation, then launches prepared benchmark shards and aggregation.
+- `run_evaluation_runtime_probes()` imports `run_evaluation_test.py` and runs only the 5 serial preflight probes without submitting evaluation jobs. Use this to validate runtime environments before a full evaluation run.
 
 Then optionally stage raw Kaggle data once, prepare benchmark datasets, run HPO,
 inspect the HPO artifact, run training, verify the checkpoint, and run evaluation:
@@ -853,7 +998,8 @@ LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
 SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
 CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
-CALL run_evaluation_pipeline();
+CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+CALL run_evaluation_pipeline('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
 ```
 
 For a setup smoke check before the full run:
@@ -964,7 +1110,8 @@ CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
 CALL prepare_benchmark_datasets();
 LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
-CALL run_evaluation_pipeline();
+CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+CALL run_evaluation_pipeline('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
 LIST @EVALUATION_RESULTS_STAGE/;
 GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';
 ```
@@ -1006,9 +1153,9 @@ releases it, and then continues to the next owned dataset.
 
 Benchmark preparation is always submitted before shards. When the prepared
 manifest/index and staged `.npz` payloads already exist, the prep job validates
-and exits early, so the expected evaluation work is: runtime probes, synthetic
-evaluation, prep validation, 10 DeepSet benchmark shards, 3 combined baseline
-shards, 30 AutoGluon shards, aggregate comparison, and the parent
+and exits early, so the expected evaluation work is: five serial runtime probes,
+synthetic evaluation, prep validation, 10 DeepSet benchmark shards, 3 combined
+baseline shards, 30 AutoGluon shards, aggregate comparison, and the parent
 submission/orchestration job.
 
 #### Evaluation Runtime Reduction Plan
@@ -1041,8 +1188,17 @@ Keep the dependency invariant:
 - `openml` belongs only to preparation.
 - AutoGluon remains lazy-imported only for the AutoGluon method.
 - Baseline and DeepSet benchmark shards should not load API/data-fetch dependencies.
-- `run_evaluation_test.py` must submit prep and evaluation MLJobs with
-  `runtime_environment`, never per-job `pip_requirements`.
+- `run_evaluation_test.py` submits all MLJobs with `runtime_environment`.
+  Prep probe and prep MLJob pass `pip_requirements=["openml==0.15.1"]` with
+  `TABPFN_PYPI_EAI`; the prep MLJob also keeps `BENCHMARK_EXTERNAL_ACCESS` for
+  OpenML/Kaggle API access during rebuilds.
+  CPU baseline shard jobs pass `pip_requirements=["catboost"]` because the managed
+  benchmark runtime (`2.5.0-py311`) does not include `catboost`. This is passed
+  **explicitly** in the Phase 4 baseline loop via
+  `pip_requirements=list(BASELINE_EXTRA_PIP_REQUIREMENTS)`, not inferred from
+  `BENCHMARK_METHODS`. The `_submit_eval()` helper uses a module-level `_UNSET`
+  sentinel as the default so that other callers continue using auto-detection
+  unchanged. Synthetic, DeepSet, and aggregate jobs pass no `pip_requirements`.
 - DeepSet benchmark rows include `raw_features`, `processed_features`,
   `selected_features`, `feature_selector`, and `feature_cap`. Feature capping is
   DeepSet-only; baseline and AutoGluon comparison inputs remain the full processed
@@ -1792,10 +1948,47 @@ Training/HPO/runtime-probe submissions still use the account-managed default
 unless explicitly changed. Evaluation submissions are different:
 `run_evaluation_test.py` requires `PREP_RUNTIME_ENVIRONMENT`,
 `BENCHMARK_RUNTIME_ENVIRONMENT`, and `AUTOGLUON_RUNTIME_ENVIRONMENT` and passes
-those values as `runtime_environment` without per-job `pip_requirements`. It
-verifies staged `runtime_probe.py`, preflights compute pools, and preflights
-those images with lightweight `runtime_probe.py` jobs before launching synthetic,
-prep, benchmark shard, or aggregate work.
+those values as `runtime_environment`. The 3-runtime architecture is preserved;
+`BENCHMARK_RUNTIME_ENVIRONMENT` is used for synthetic eval, DeepSet, CPU baseline
+shards, and aggregate. `2.5.0-py311` is the known-good Snowflake-managed benchmark
+runtime. It does not include `catboost`, so CPU baseline shard jobs additionally
+pass `pip_requirements=["catboost"]`. The prep runtime path additionally installs
+`openml==0.15.1` for the prep probe and prep MLJob only. Synthetic, DeepSet, and
+aggregate jobs pass no `pip_requirements`. It verifies staged `runtime_probe.py`,
+preflights compute pools, and runs 5
+`runtime_probe.py` preflight probes (benchmark GPU, benchmark aggregate CPU, CPU
+baseline with `pip_requirements=["catboost"]`, prep CPU with
+`pip_requirements=["openml==0.15.1"]`, and AutoGluon CPU) before launching
+synthetic, prep, benchmark shard, or aggregate work. The probes are deliberately
+serialized in both `run_evaluation_pipeline()` and
+`run_evaluation_runtime_probes()` because each single-node probe still counts
+against the account node quota.
+
+Compute pool preflight (`_preflight_compute_pools`) accepts `SUSPENDED + AUTO_RESUME=TRUE`
+without waiting. If all three pools are suspended when `run_evaluation_runtime_probes()` or
+`run_evaluation_pipeline()` is called, the preflight passes immediately and `submit_from_stage()`
+triggers auto-resume when each probe job is submitted. `SUSPENDED + AUTO_RESUME=FALSE` fails
+with a message instructing the user to enable `AUTO_RESUME` or manually resume.
+
+Development cost-control pattern:
+- Keep all pools suspended when not actively running jobs.
+- Keep `AUTO_RESUME=TRUE` on all pools.
+- Use `AUTO_SUSPEND_SECS = 300` (or shorter) for development.
+- After each run: `ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;` etc.
+
+Use `CALL run_evaluation_runtime_probes('<prep>', '2.5.0-py311', '<autogluon>');`
+to run only the 5 preflight probes without submitting evaluation jobs.
+
+Node quota troubleshooting:
+- If a probe fails with `Requested number of nodes 1 exceeds the node limit for the account`,
+  first suspend idle compute pools and check current pool state with
+  `SHOW COMPUTE POOLS;`.
+- Avoid concurrent evaluation probe fan-out under the current quota. A successful
+  10-node training run does not imply enough spare quota to run simultaneous
+  probes across `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and
+  `AUTOGLUON_CPU_POOL`.
+- Do not change the preflight back to submit-all-then-wait unless the Snowflake
+  account node quota has been increased and verified.
 
 ### Operational change notes
 
@@ -1858,3 +2051,95 @@ Prometheus or redirect data/queries.active to an mmap-compatible path such as /t
 - Final training: 10 nodes × 4 workers per node = 40 expected workers
 - Pretraining: 10 nodes × 4 workers per node = 40 expected workers
 - HPO: 5 nodes × 4 concurrent trials per node = 20 total trial slots / 20 total trials
+
+---
+
+## pip Dependencies on Snowflake-Managed Container Runtime (2.5.0-py311)
+
+### What is missing from the managed image
+
+The `2.5.0-py311` Snowflake-managed runtime does not include several third-party packages
+required by this project. They must be installed per-job via `pip_requirements` +
+`external_access_integrations`.
+
+| Package | Version pinned | Required by |
+|---------|---------------|-------------|
+| `catboost` | `1.2.10` | CPU baseline probe (probe index 2), all CPU baseline shard jobs |
+| `openml` | `0.15.1` | prep CPU runtime probe (probe index 3), benchmark dataset prep MLJob |
+| `autogluon.tabular` | `1.3.0` | AutoGluon CPU runtime probe (probe index 4), all AutoGluon shard jobs |
+
+The direct `CALL prepare_benchmark_datasets()` stored procedure still lists
+`openml==0.15.1` in its `PACKAGES` clause. The evaluation MLJob path installs the
+same pinned version with `pip_requirements` so the prep runtime probe and prep
+MLJob can import OpenML without baking it into every runtime image.
+
+### TABPFN_PYPI_EAI design
+
+A single general-purpose External Access Integration (`TABPFN_PYPI_EAI`) covers all
+pip installs. This replaces the former `TABPFN_CATBOOST_PYPI_EAI` (which was
+CatBoost-specific). The integration uses `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`.
+
+`BENCHMARK_EXTERNAL_ACCESS` is a **separate** concern: it allows runtime calls to
+external APIs (OpenML, Kaggle). The dataset prep MLJob needs `BENCHMARK_EXTERNAL_ACCESS`
+for API downloads and `TABPFN_PYPI_EAI` to install `openml==0.15.1`. Benchmark
+shard and aggregate jobs must not receive the OpenML dependency.
+
+### Job × dependency table
+
+| Job | `pip_requirements` | `external_access_integrations` |
+|-----|--------------------|-------------------------------|
+| GPU benchmark probe (0) | — | — |
+| CPU benchmark probe (1) | — | — |
+| CPU baseline probe (2) | `catboost==1.2.10` | `TABPFN_PYPI_EAI` |
+| prep CPU runtime probe (3) | `openml==0.15.1` | `TABPFN_PYPI_EAI` |
+| AutoGluon CPU runtime probe (4) | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` |
+| `prepare_benchmark_datasets.py` (ML Job) | `openml==0.15.1` | `BENCHMARK_EXTERNAL_ACCESS`, `TABPFN_PYPI_EAI` |
+| CPU baseline shard jobs (×3) | `catboost==1.2.10` | `TABPFN_PYPI_EAI` |
+| AutoGluon shard jobs (×30) | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` |
+| DeepSet GPU shard jobs (×10) | — | — |
+| Synthetic eval job | — | — |
+| Aggregate job | — | — |
+
+### Creating and granting the integration
+
+Run once as ACCOUNTADMIN (or a role with `CREATE INTEGRATION` and access to
+`SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`):
+
+```sql
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION TABPFN_PYPI_EAI
+  ALLOWED_NETWORK_RULES = (SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE)
+  ENABLED = TRUE
+  COMMENT = 'Allows TabPFN ML Jobs to install approved PyPI dependencies in Snowflake-managed Container Runtime.';
+
+GRANT USAGE ON INTEGRATION TABPFN_PYPI_EAI TO ROLE ACCOUNTADMIN;
+```
+
+The full DDL is in `sql/run_training_job.sql` (Step 2c).
+
+### Validation steps
+
+After staging the updated script and recreating stored procedures:
+
+```sql
+-- 1. Verify the integration exists and is enabled.
+SHOW EXTERNAL ACCESS INTEGRATIONS LIKE 'TABPFN_PYPI_EAI';
+DESC EXTERNAL ACCESS INTEGRATION TABPFN_PYPI_EAI;
+SHOW GRANTS ON INTEGRATION TABPFN_PYPI_EAI;
+
+-- 2. Run all 5 preflight probes end-to-end.
+CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+-- All 5 probes must pass, including:
+--   probe 3 (prep): openml,numpy,snowflake.snowpark must import successfully
+--     (openml is installed by prep-probe pip_requirements)
+--   probe 4 (AutoGluon): autogluon.tabular 1.3.0 must import successfully
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `ModuleNotFoundError: No module named 'openml'` in `CALL prepare_benchmark_datasets()` | `openml` missing from stored procedure `PACKAGES` clause | Re-run `CREATE PROCEDURE prepare_benchmark_datasets()` DDL with `'openml==0.15.1'` in `PACKAGES`; the fix is in `sql/run_training_job.sql` |
+| `ModuleNotFoundError: No module named 'openml'` in prep probe or evaluation prep MLJob | Prep job missing `pip_requirements`/EAI | Verify prep probe and prep MLJob pass `openml==0.15.1` with `TABPFN_PYPI_EAI` |
+| `ModuleNotFoundError: No module named 'autogluon'` in shard job | AutoGluon shard job missing `pip_requirements`/EAI | Verify AutoGluon shard loop passes both kwargs |
+| `Integration 'TABPFN_PYPI_EAI' does not exist` | EAI not created or wrong name | Re-run Step 2c in `sql/run_training_job.sql` |
+| Probe passes but shard job fails install | Version pin mismatch between constants and PyPI availability | Check `AUTOGLUON_VERSION` / `OPENML_VERSION` constants |

@@ -105,9 +105,52 @@ When documenting or patching Snowflake execution, include these runtime constrai
 - Evaluation MLJobs require `PREP_RUNTIME_ENVIRONMENT`,
   `BENCHMARK_RUNTIME_ENVIRONMENT`, and `AUTOGLUON_RUNTIME_ENVIRONMENT`.
   `run_evaluation_test.py` passes them as `runtime_environment`, exposes the
-  selected value as `EVAL_RUNTIME_ENVIRONMENT`, avoids per-job
-  `pip_requirements`, and preflights configured runtime/compute-pool pairs with
-  `runtime_probe.py` before expensive work.
+  selected value as `EVAL_RUNTIME_ENVIRONMENT`, uses only narrow per-job
+  `pip_requirements` for dependencies missing from the managed runtime, and
+  preflights configured runtime/compute-pool pairs with `runtime_probe.py`
+  before expensive work.
+- Evaluation preflight probes must stay serialized under the current Snowflake
+  node quota. `target_instances=1` still consumes account node quota, so
+  `run_evaluation_pipeline()` and `run_evaluation_runtime_probes()` submit one
+  runtime probe, wait for it to finish, and only then submit the next probe.
+  Do not reintroduce concurrent runtime probe submission across
+  `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and `AUTOGLUON_CPU_POOL` unless the
+  account node quota has been raised and verified.
+- `run_evaluation_pipeline()` is phase-gated to avoid Snowflake node quota bursts:
+  DeepSet GPU shards (phase 3, 10 nodes) all finish before CPU baseline shards
+  (phase 4, 3 nodes) start; CPU baseline shards finish before AutoGluon shards
+  (phase 5) start. AutoGluon shards run in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`
+  (30 total, 6 batches), with each batch waited before the next is submitted.
+- `run_evaluation_capacity_probe()` validates current account capacity before expensive
+  evaluation work. It submits `capacity_probe.py` (no model, no data — 30-second sleep)
+  in 3 non-overlapping phases matching the evaluation envelope: GPU=10, CPU=3,
+  AutoGluon=5. Phases are fully serialized. Recommended run order:
+  1. `CALL run_evaluation_runtime_probes(...)` — validate runtime images
+  2. `CALL run_evaluation_capacity_probe(...)` — validate node quota
+  3. Split-phase evaluation (recommended) or `run_evaluation_pipeline()` (legacy)
+  If the capacity probe fails with a node limit error: `SHOW COMPUTE POOLS`; suspend
+  idle pools; wait for active jobs to finish; or request higher node quota.
+- **Split-phase evaluation** — use when account node quota cannot hold all three pools
+  simultaneously for a full ~2-hour run. Five independent stored procedures expose each
+  phase; the operator suspends each pool after its phase to release quota:
+  ```sql
+  CALL run_evaluation_runtime_probes('<prep>', '<bench>', '<ag>');
+  CALL run_evaluation_prep('<prep>', '<bench>', '<ag>');
+  CALL run_deepset_evaluation('<prep>', '<bench>', '<ag>');
+  ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
+  CALL run_baseline_evaluation('<prep>', '<bench>', '<ag>');
+  ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+  CALL run_autogluon_evaluation('<prep>', '<bench>', '<ag>');
+  ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+  CALL run_evaluation_aggregation('<prep>', '<bench>', '<ag>');
+  ```
+  - Each pool is held only for its own phase; quota is released before the next phase begins.
+  - `run_autogluon_evaluation()` submits 30 shards in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`.
+  - `ALTER COMPUTE POOL ... SUSPEND` must be issued manually after each phase; completing a
+    phase does not automatically release quota.
+  - `run_evaluation_aggregation()` can be re-run without re-running prior phases if
+    `benchmark_parts/` files already exist on `@EVALUATION_RESULTS_STAGE`.
+  - Do not collapse the phases back into a single overlapping fan-out under tight quota.
 
 ## Explain How DeepSet Is Trained
 

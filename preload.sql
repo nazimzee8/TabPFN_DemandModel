@@ -196,14 +196,20 @@ CREATE OR REPLACE PROCEDURE prepare_benchmark_datasets()
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
-  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  ARTIFACT_REPOSITORY = snowflake.snowpark.pypi_shared_repository
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python', 'openml==0.15.1')
+  EXTERNAL_ACCESS_INTEGRATIONS = (BENCHMARK_EXTERNAL_ACCESS)
   IMPORTS = ('@MODEL_STAGE/scripts/prepare_benchmark_datasets.py')
   HANDLER = 'prepare_benchmark_datasets.prepare_datasets';
 
 -- run_evaluation_pipeline() requires @MODEL_STAGE/checkpoints/best.pt,
 -- then runs (concurrently) synthetic eval and benchmark dataset preparation,
 -- then all benchmark shard jobs, then the aggregate comparison job.
-CREATE OR REPLACE PROCEDURE run_evaluation_pipeline()
+CREATE OR REPLACE PROCEDURE run_evaluation_pipeline(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
@@ -211,6 +217,115 @@ CREATE OR REPLACE PROCEDURE run_evaluation_pipeline()
   IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
   HANDLER = 'run_evaluation_test.run_evaluation_pipeline';
 
+-- Drop old zero-argument overload if it exists:
+DROP PROCEDURE IF EXISTS run_evaluation_pipeline();
+
+-- Call:
+-- CALL run_evaluation_pipeline('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+
+-- run_evaluation_runtime_probes() runs all preflight checks without submitting
+-- evaluation jobs. Use this to validate runtime environments before a full run.
+CREATE OR REPLACE PROCEDURE run_evaluation_runtime_probes(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_evaluation_runtime_probes';
+
+-- Call:
+-- CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+
+-- run_evaluation_capacity_probe() is a lightweight quota/capacity check. It submits
+-- capacity_probe.py in 3 non-overlapping phases matching the fixed evaluation pipeline
+-- envelope (GPU=10, CPU=3, AutoGluon=5). Run between runtime probes and the full pipeline.
+CREATE OR REPLACE PROCEDURE run_evaluation_capacity_probe(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_evaluation_capacity_probe';
+
+-- Call:
+-- CALL run_evaluation_capacity_probe('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
+
+-- Split-phase evaluation: run each phase independently to release quota between pools.
+-- run_evaluation_prep() fetches/validates benchmark manifest and index on DEEPSET_CPU_POOL.
+CREATE OR REPLACE PROCEDURE run_evaluation_prep(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_evaluation_prep';
+
+-- run_deepset_evaluation() runs synthetic eval and 10 DeepSet GPU shards on DEEPSET_GPU_POOL.
+-- Requires @MODEL_STAGE/checkpoints/best.pt.
+CREATE OR REPLACE PROCEDURE run_deepset_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_deepset_evaluation';
+
+-- run_baseline_evaluation() runs 3 CPU baseline benchmark shards on DEEPSET_CPU_POOL.
+CREATE OR REPLACE PROCEDURE run_baseline_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_baseline_evaluation';
+
+-- run_autogluon_evaluation() runs 30 AutoGluon shards (max 5 concurrent) on AUTOGLUON_CPU_POOL.
+CREATE OR REPLACE PROCEDURE run_autogluon_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_autogluon_evaluation';
+
+-- run_evaluation_aggregation() runs the benchmark aggregation job on DEEPSET_CPU_POOL
+-- and returns a listing of @EVALUATION_RESULTS_STAGE. Can be re-run without re-running
+-- prior phases if benchmark_parts/ files already exist on stage.
+CREATE OR REPLACE PROCEDURE run_evaluation_aggregation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
+  HANDLER = 'run_evaluation_test.run_evaluation_aggregation';
 
 
 -- ------------------------------------------------------------------

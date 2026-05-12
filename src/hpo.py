@@ -135,7 +135,29 @@ def cardinality_aware_candidates(name, base_candidates, observed_name, observed_
     return candidates
 
 
+def normalize_checkpoint_model_config(saved_cfg, checkpoint_name="checkpoint"):
+    from model import ModelConfig
+
+    if isinstance(saved_cfg, ModelConfig):
+        return saved_cfg
+    if isinstance(saved_cfg, dict):
+        try:
+            return ModelConfig(**saved_cfg)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{checkpoint_name} has invalid cfg payload: {saved_cfg!r}"
+            ) from exc
+    if saved_cfg is None:
+        raise ValueError(f"{checkpoint_name} is missing required cfg payload")
+    raise TypeError(
+        f"{checkpoint_name} cfg must be a dict or ModelConfig, "
+        f"got {type(saved_cfg).__name__}"
+    )
+
+
 def checkpoint_architecture_mismatches(saved_cfg, current_cfg):
+    saved_cfg = normalize_checkpoint_model_config(saved_cfg, "saved checkpoint")
+    current_cfg = normalize_checkpoint_model_config(current_cfg, "current model")
     fields = (
         "d_phi",
         "d_rho",

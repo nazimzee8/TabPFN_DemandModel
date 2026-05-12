@@ -203,16 +203,44 @@ configuration until Python boundary markers prove the failure reached that layer
 ### Runtime pinning
 
 Training/HPO/runtime-probe submissions use the account default unless explicitly
-changed. Evaluation submissions are intentionally pinned through required env
-vars: `PREP_RUNTIME_ENVIRONMENT`, `BENCHMARK_RUNTIME_ENVIRONMENT`, and
-`AUTOGLUON_RUNTIME_ENVIRONMENT`. `run_evaluation_test.py` must pass those values
-as `runtime_environment`, expose the selected value in container env vars as
-`EVAL_RUNTIME_ENVIRONMENT`, and must not use per-job `pip_requirements`. Before
+changed. Evaluation submissions are intentionally pinned by passing three runtime
+image names as explicit stored procedure arguments to `run_evaluation_pipeline()`.
+The 3-runtime architecture (`PREP_RUNTIME_ENVIRONMENT`, `BENCHMARK_RUNTIME_ENVIRONMENT`,
+`AUTOGLUON_RUNTIME_ENVIRONMENT`) is preserved. `BENCHMARK_RUNTIME_ENVIRONMENT` is
+used for synthetic eval, DeepSet benchmark shards, CPU baseline shards, and the
+aggregate job. `2.5.0-py311` is the known-good Snowflake-managed benchmark runtime;
+it includes `torch`, `pyarrow`, `pandas`, `scipy`, `sklearn`, `xgboost`, `lightgbm`,
+and CUDA, but does NOT include `catboost`.
+
+CPU baseline shard jobs (carrying `BENCHMARK_METHODS` that include `CatBoost`) install
+`catboost` at job submission time via `pip_requirements=["catboost"]`. All other
+eval/prep/aggregate/AutoGluon jobs pass no `pip_requirements`.
+
+`run_evaluation_test.py` must not rely on OS environment variables for runtime
+image names in production — local shell variables, SnowSQL session variables, and
+Snowsight worksheet variables do not become OS environment variables inside the
+Python stored procedure runtime. `run_evaluation_test.py` exposes the selected
+value in container env vars as `EVAL_RUNTIME_ENVIRONMENT`. Before
 expensive evaluation/prep work, it verifies `@MODEL_STAGE/checkpoints/best.pt`,
 requires `@MODEL_STAGE/scripts/runtime_probe.py`, preflights compute pools
 (`DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, `AUTOGLUON_CPU_POOL`), and submits
-`runtime_probe.py` on benchmark GPU, benchmark CPU, prep CPU, and AutoGluon CPU
-with runtime-specific `REQUIRED_IMPORTS`.
+`runtime_probe.py` on 5 probes: benchmark GPU, benchmark aggregate CPU, CPU baseline
+(with `pip_requirements=["catboost"]`), prep CPU, and AutoGluon CPU, each with
+runtime-specific `REQUIRED_IMPORTS`.
+Evaluation runtime probes must remain serialized under the current Snowflake
+node quota: submit one probe, wait for it to finish, then submit the next. Even
+`target_instances=1` consumes account node quota, so do not fan out probes
+concurrently across `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and
+`AUTOGLUON_CPU_POOL` unless a higher node quota has been confirmed.
+
+Compute pool preflight handles SUSPENDED pools:
+- `SUSPENDED + AUTO_RESUME=TRUE` — returns immediately and lets `submit_from_stage()` trigger
+  the resume on first job submission. No ALTER is issued.
+- `SUSPENDED + AUTO_RESUME=FALSE` (or unknown) — issues `ALTER COMPUTE POOL X RESUME` and
+  sleeps 10 s before returning. This is the explicit-resume path.
+For development cost control: keep pools suspended between runs, keep `AUTO_RESUME=TRUE`,
+and use a short `AUTO_SUSPEND_SECS` (60–300 s). Do not keep `DEEPSET_GPU_POOL` warm
+between debugging sessions.
 
 Evaluation dependency guardrail: never add a global benchmark dependency gate
 that requires every baseline package for every shard. Dependency validation must
@@ -230,6 +258,21 @@ hard-imports them at module startup (not inside benchmark method branches), and
 AutoGluon shards execute `evaluate.py`. If `evaluate.py` is later refactored to
 lazy-import those modules, the AutoGluon probe list should be revisited.
 Method-aware dependency validation in `evaluate.py` must remain intact regardless.
+
+If `CALL run_evaluation_pipeline(...)` fails in under a few seconds with
+`PREP_RUNTIME_ENVIRONMENT is required`, the procedure did not receive runtime
+image names. Pass the three runtime image names as procedure arguments and
+recreate the procedure if the old zero-argument signature is still installed:
+
+  DROP PROCEDURE IF EXISTS run_evaluation_pipeline();
+  -- Then recreate with three STRING arguments.
+
+New canonical call:
+  CALL run_evaluation_pipeline(
+    '<prep_runtime_image_name>',
+    '<benchmark_runtime_image_name>',
+    '<autogluon_runtime_image_name>'
+  );
 
 ### Runtime probe workflow
 
@@ -276,10 +319,48 @@ diagnostics are broken.
 - The aggregate job globs `benchmark_parts/*_detailed.csv*` and combines all shards.
 - DeepSet GPU evaluation also uses independent shard jobs (`GPU_BENCHMARK_SHARDS=10`).
 - Synthetic eval runs as a single-process job (1 GPU node, 100 test files).
+- Runtime preflight probes are intentionally serial. A successful 10-node
+  training run does not imply enough spare quota for concurrent evaluation
+  probes across `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and
+  `AUTOGLUON_CPU_POOL`; keep the submit-then-wait ordering unless Snowflake node
+  quota is raised and verified.
+- `run_evaluation_pipeline()` is phase-gated: DeepSet GPU shards (phase 3) must all
+  finish before CPU baseline shards (phase 4) are submitted; CPU baseline shards must
+  all finish before AutoGluon shards (phase 5) are submitted; all AutoGluon shards must
+  finish before the aggregate job (phase 6). Phases 0, 1+2 (synthetic + prep), and 6
+  are unchanged.
+- `AUTOGLUON_BENCHMARK_SHARDS=30` total AutoGluon shard jobs; `AUTOGLUON_MAX_CONCURRENT_SHARDS=5`
+  maximum in-flight at once. AutoGluon is submitted and waited in batches of 5 (6 batches total).
+- `run_evaluation_capacity_probe()` is a lightweight pre-check that allocates nodes in
+  the planned phase sizes (GPU=10, CPU=3, AutoGluon=5) using `capacity_probe.py` (no
+  model, no benchmark data, no heavy imports — just a 30-second sleep). Phases are
+  non-overlapping: GPU phase must finish before CPU phase starts; CPU phase must finish
+  before AutoGluon phase starts. Recommended run order:
+  1. `CALL run_evaluation_runtime_probes(...)` — validate runtime images
+  2. `CALL run_evaluation_capacity_probe(...)` — validate node quota
+  3. `CALL run_evaluation_pipeline(...)` — full evaluation
+  If the capacity probe fails with a node limit error: `SHOW COMPUTE POOLS`; suspend
+  idle pools; wait for active jobs to finish; or request higher Snowflake account node
+  quota before retrying.
 - PyTorch distributed evaluation (`dist.init_process_group`) is only entered when all
   of `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT` are set in the environment.
   If missing and `world_size > 1` is requested without shard mode, evaluate.py raises
   a clear RuntimeError.
+- **Split-phase evaluation design**: 5 independent stored procedures expose each benchmark
+  phase — `run_evaluation_prep`, `run_deepset_evaluation`, `run_baseline_evaluation`,
+  `run_autogluon_evaluation`, `run_evaluation_aggregation`. Each targets only its own
+  compute pool and can be called and retried independently.
+- **Manual pool suspend pattern**: completing a phase does NOT release its compute pool
+  quota. The operator must issue `ALTER COMPUTE POOL <pool> SUSPEND` after each phase
+  before calling the next phase. Do not skip this step under tight quota.
+- **Do not collapse back into overlapping fan-out**: do not revert to a single procedure
+  that holds all three pools simultaneously unless node quota has been raised and verified.
+- **No runtime probes in split procedures**: `run_evaluation_runtime_probes()` must be
+  called once by the operator before the first split-phase procedure. The split procedures
+  themselves do not re-run probes.
+- **`run_evaluation_pipeline()` sequencing change**: the monolithic pipeline was refactored
+  to use the same phase helpers; synthetic eval and prep are now sequential (prep → deepset
+  phase) rather than concurrent. Split procedures are the recommended path for tight quota.
 
 ## Benchmark Dataset and Dependency Boundary Guardrails
 
@@ -317,6 +398,22 @@ diagnostics are broken.
   Dependency boundary still applies inside those runtime images: `openml`
   belongs only to prep; benchmark shard runtimes must not need OpenML/Kaggle
   fetch APIs.
+- `_submit_eval()` in `run_evaluation_test.py` uses a module-level `_UNSET`
+  sentinel as the default for its `pip_requirements` parameter. Do not remove
+  this parameter or the sentinel. The Phase 4 baseline shard loop must always
+  pass `pip_requirements=list(BASELINE_EXTRA_PIP_REQUIREMENTS)` explicitly at
+  the call site — do not revert to implicit inference from `BENCHMARK_METHODS`.
+  The explicit passing is the guarantee that `catboost` is installed before
+  `evaluate.py` starts; removing it silently breaks baseline evaluation on any
+  managed runtime that does not include `catboost`.
+- Orchestration test invariants for `pip_requirements` (do not weaken):
+  - 5 runtime probes total; probe at index 2 is the CPU baseline probe and must
+    carry `pip_requirements == list(BASELINE_EXTRA_PIP_REQUIREMENTS)`.
+  - Probes at indices 0, 1, 3, 4 must carry no `pip_requirements`.
+  - All 3 baseline shard eval jobs (`BENCHMARK_METHODS == BASELINE_METHODS`) must
+    carry `pip_requirements == list(BASELINE_EXTRA_PIP_REQUIREMENTS)`.
+  - All other eval jobs (synthetic, DeepSet, AutoGluon, aggregate) must carry no
+    `pip_requirements`.
 - DeepSet benchmark detail rows must include `raw_features`,
   `processed_features`, `selected_features`, `feature_selector`, and
   `feature_cap`. The selector is deterministic train-only
@@ -352,14 +449,154 @@ diagnostics are broken.
       "metadata": {"source": "train.py", "pytorch_version": torch.__version__, ...},
   }
   ```
+- Canonical v2 checkpoints save `cfg` as a plain dict via `dataclasses.asdict(model.cfg)`.
+  Consumers must normalize `ckpt["cfg"]` back to `ModelConfig` before comparing architecture
+  fields. Do not compare dict-form checkpoint configs with `getattr(saved_cfg, field, None)`,
+  because it returns `None` for dict keys and causes false architecture mismatches in HPO.
+  Known failure signature: HPO reports `saved=None` for every architecture field while
+  printing `saved={'d_phi': 128, ...}` in the same error payload. Fix consumer-side
+  normalization first; do not regenerate `pretrain.pt` unless the checkpoint is missing `cfg`
+  or has a truly incompatible architecture.
 - `evaluate.py` loads checkpoints via `load_checkpoint_compat()`:
   1. `torch.load(..., weights_only=True)` — preferred; works for v2 checkpoints.
   2. `safe_globals([ModelConfig])` + `weights_only=True` — for legacy checkpoints.
   3. `weights_only=False` — only if `ALLOW_UNSAFE_TORCH_LOAD=true`; prints security warning.
+- `ALLOW_UNSAFE_TORCH_LOAD_FOR_LEGACY_CHECKPOINTS` in `run_evaluation_test.py` is **currently
+  `"true"`** as a temporary escape hatch for the legacy `best.pt` checkpoint (pre-v2 pickle
+  format that fails both `weights_only=True` paths in `load_checkpoint_compat()`). All eval
+  jobs receive `ALLOW_UNSAFE_TORCH_LOAD=true` via `_submit_eval()`.
+- **Guardrail**: whenever `best.pt` is a legacy pickle checkpoint (i.e., `load_checkpoint_compat()`
+  requires `weights_only=False`), `ALLOW_UNSAFE_TORCH_LOAD_FOR_LEGACY_CHECKPOINTS` MUST be
+  `"true"`. Do not set it back to `"false"` until `best.pt` has been migrated and confirmed
+  loadable with `weights_only=True` alone.
+- Revert to `"false"` only after running:
+  ```bash
+  python scripts/migrate_checkpoint.py --stage-name MODEL_STAGE --name best.pt
+  ```
+  and verifying evaluation completes without the `[SECURITY WARNING] ALLOW_UNSAFE_TORCH_LOAD`
+  log line. Also update the test assertion message in
+  `tests/test_run_evaluation_test_orchestration.py`.
+- `weights_only=False` can execute arbitrary code from a checkpoint. Only trusted internally
+  generated checkpoints should be loaded this way. Never set this for third-party checkpoints.
+- Migration command for Snowflake stage checkpoints:
+  ```bash
+  python scripts/migrate_checkpoint.py --stage-name MODEL_STAGE --name best.pt
+  python scripts/migrate_checkpoint.py --stage-name MODEL_STAGE --name pretrain.pt
+  # Backup written automatically to @MODEL_STAGE/checkpoints/best.pt.bak
+  ```
+- Migration command for local checkpoints:
+  ```bash
+  python scripts/migrate_checkpoint.py --path /tmp/best.pt
+  # Backup written to /tmp/best.pt.bak
+  ```
 - Do not default to `weights_only=False`. It can execute arbitrary code from a checkpoint.
 - Future checkpoint metadata must contain only primitive-safe values (str, int, float, bool,
   None, or nested lists/dicts of those types). No custom objects in metadata.
 - `train.py` uses `dataclasses.asdict(ckpt.cfg)` when saving so new checkpoints are v2-safe.
 - After staging updated `train.py` and `evaluate.py`, newly trained checkpoints will load
-  without any fallback. Existing legacy `best.pt` / `pretrain.pt` will be handled by the
-  `safe_globals` fallback transparently.
+  without any fallback. Existing legacy `best.pt` / `pretrain.pt` must be migrated using
+  `scripts/migrate_checkpoint.py` to eliminate the `[SECURITY WARNING] ALLOW_UNSAFE_TORCH_LOAD`
+  log lines.
+
+## Snowflake CatBoost Dependency Guardrails
+
+- CatBoost is not preinstalled in the Snowflake-managed Container Runtime (`2.5.0-py311`).
+  Always treat it as a custom PyPI dependency for ML Jobs.
+- Every CatBoost MLJob submission must pass BOTH `pip_requirements` AND
+  `external_access_integrations`. Passing only `pip_requirements` without the EAI will
+  fail with pip network errors or `ModuleNotFoundError` even though `pip_requirements`
+  was received by the container.
+- The project EAI for PyPI access is `TABPFN_CATBOOST_PYPI_EAI`, created using
+  `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`. Do not use `BENCHMARK_EXTERNAL_ACCESS` for
+  PyPI — that integration is scoped to OpenML and Kaggle hosts only.
+- Always pin the CatBoost version (`CATBOOST_VERSION = "1.2.10"`). Do not float to
+  unpinned `"catboost"`.
+- Notebook-level EAI toggles do not propagate into submitted ML Jobs. Never use
+  notebook import success as proof that a submitted probe can import CatBoost.
+- Do not use inline `pip install catboost` inside probe scripts or benchmark jobs.
+  CatBoost must be installed via the submission-time `pip_requirements` mechanism.
+- `CATBOOST_PYPI_EAI = "TABPFN_CATBOOST_PYPI_EAI"` is the canonical constant in
+  `run_evaluation_test.py`. Both the CPU baseline probe (probe index 2) and all 3
+  baseline shard eval jobs must carry this EAI.
+- Test invariants: baseline probe (index 2) and all baseline shard jobs assert
+  `external_access_integrations == [CATBOOST_PYPI_EAI]`; deepset and autogluon jobs
+  assert no `external_access_integrations`.
+
+---
+
+## Snowflake pip Dependency Guardrails (2.5.0-py311 Runtime)
+
+### Missing packages
+
+The `2.5.0-py311` Snowflake-managed runtime does **not** include these packages;
+they must be installed per-job:
+
+| Package | Pinned version | Constant |
+|---------|---------------|----------|
+| `catboost` | `1.2.10` | `CATBOOST_VERSION` / `BASELINE_EXTRA_PIP_REQUIREMENTS` |
+| `openml` | `0.15.1` | `OPENML_VERSION` / `PREP_EXTRA_PIP_REQUIREMENTS` |
+| `autogluon.tabular` | `1.3.0` | `AUTOGLUON_VERSION` / `AUTOGLUON_EXTRA_PIP_REQUIREMENTS` |
+
+> `openml` is resolved via **two paths**: the stored procedure `PACKAGES` clause (for
+> `CALL prepare_benchmark_datasets()`) AND `pip_requirements` in the ML Job (for
+> `run_evaluation_pipeline()` → `_submit_dataset_prep()`). Both paths are required.
+
+### One EAI rule
+
+`TABPFN_PYPI_EAI = "TABPFN_PYPI_EAI"` — used for **all** pip installs.
+Replaces the former `TABPFN_CATBOOST_PYPI_EAI`. Created in `sql/run_training_job.sql` Step 2c.
+
+### BENCHMARK_EXTERNAL_ACCESS vs PYPI_EAI
+
+- `BENCHMARK_EXTERNAL_ACCESS` — runtime API calls (OpenML downloads, Kaggle API). Network egress to external services.
+- `TABPFN_PYPI_EAI` — pip package install from PyPI. Uses `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`.
+- The dataset prep job (`prepare_benchmark_datasets.py`) needs **both**.
+
+### Canonical constants (scripts/run_evaluation_test.py)
+
+```python
+PYPI_EAI = "TABPFN_PYPI_EAI"
+BENCHMARK_EXTERNAL_ACCESS_EAI = "BENCHMARK_EXTERNAL_ACCESS"
+
+CATBOOST_VERSION = "1.2.10"
+BASELINE_EXTRA_PIP_REQUIREMENTS = [f"catboost=={CATBOOST_VERSION}"]
+
+OPENML_VERSION = "0.15.1"
+PREP_EXTRA_PIP_REQUIREMENTS = [f"openml=={OPENML_VERSION}"]
+
+AUTOGLUON_VERSION = "1.3.0"
+AUTOGLUON_EXTRA_PIP_REQUIREMENTS = [f"autogluon.tabular=={AUTOGLUON_VERSION}"]
+```
+
+### Pinning rule
+
+Always pin exact versions (`==`). Never use `>=` or unpinned requirements.
+Update only when the managed runtime image changes or a security fix is required.
+
+### Job allowlist / denylist
+
+Jobs that **must** carry `pip_requirements` + `TABPFN_PYPI_EAI`:
+- CPU baseline probe (probe index 2): `BASELINE_EXTRA_PIP_REQUIREMENTS`
+- Prep CPU runtime probe (probe index 3): `PREP_EXTRA_PIP_REQUIREMENTS`
+- AutoGluon CPU runtime probe (probe index 4): `AUTOGLUON_EXTRA_PIP_REQUIREMENTS`
+- CPU baseline shard jobs (×3): `BASELINE_EXTRA_PIP_REQUIREMENTS`
+- AutoGluon shard jobs (×30): `AUTOGLUON_EXTRA_PIP_REQUIREMENTS`
+- `prepare_benchmark_datasets.py` ML Job: `PREP_EXTRA_PIP_REQUIREMENTS` +
+  `["BENCHMARK_EXTERNAL_ACCESS", PYPI_EAI]`
+
+Jobs that **must not** carry `pip_requirements`:
+- GPU benchmark probe (0), CPU benchmark probe (1)
+- DeepSet GPU shard jobs, synthetic eval job, aggregate job
+
+### Test invariants
+
+- `probe_jobs[2].pip_requirements == list(BASELINE_EXTRA_PIP_REQUIREMENTS)`
+- `probe_jobs[3].pip_requirements == list(PREP_EXTRA_PIP_REQUIREMENTS)`
+- `probe_jobs[4].pip_requirements == list(AUTOGLUON_EXTRA_PIP_REQUIREMENTS)`
+- `probe_jobs[:2]` — no `pip_requirements`, no `external_access_integrations`
+- `probe_jobs[2/3/4].external_access_integrations == [PYPI_EAI]`
+- All baseline shard jobs: `external_access_integrations == [PYPI_EAI]`
+- All AutoGluon shard jobs: `pip_requirements == list(AUTOGLUON_EXTRA_PIP_REQUIREMENTS)` and `external_access_integrations == [PYPI_EAI]`
+- DeepSet, synthetic, aggregate jobs: no `pip_requirements`, no `external_access_integrations`
+- prep ML Job: `external_access_integrations == [BENCHMARK_EXTERNAL_ACCESS_EAI, PYPI_EAI]`
+  and `pip_requirements == list(PREP_EXTRA_PIP_REQUIREMENTS)`

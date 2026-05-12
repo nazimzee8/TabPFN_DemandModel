@@ -1,3 +1,4 @@
+import builtins
 import os
 import sys
 import types
@@ -18,6 +19,66 @@ import evaluate  # noqa: E402
 import prepare_benchmark_datasets as prepare  # noqa: E402
 
 EVALUATE_PATH = os.path.join(SRC_DIR, "evaluate.py")
+
+
+def test_openml_fetch_prepares_writable_config_paths_before_import(monkeypatch):
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+    makedirs_calls = []
+
+    def fake_makedirs(path, exist_ok=False):
+        makedirs_calls.append((
+            path,
+            exist_ok,
+            os.environ.get("XDG_CONFIG_HOME"),
+            os.environ.get("XDG_CACHE_HOME"),
+        ))
+
+    class FakeOpenMLConfig:
+        def __init__(self):
+            self.root_cache_directory = None
+
+        def set_root_cache_directory(self, path):
+            self.root_cache_directory = path
+
+    fake_config = FakeOpenMLConfig()
+    fake_openml = types.SimpleNamespace(
+        config=fake_config,
+        study=types.SimpleNamespace(
+            get_suite=lambda study_id: types.SimpleNamespace(tasks=[])
+        ),
+        tasks=types.SimpleNamespace(get_task=lambda task_id: None),
+    )
+
+    import_env = {}
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "openml":
+            import_env["HOME"] = os.environ.get("HOME")
+            import_env["XDG_CONFIG_HOME"] = os.environ.get("XDG_CONFIG_HOME")
+            import_env["XDG_CACHE_HOME"] = os.environ.get("XDG_CACHE_HOME")
+            return fake_openml
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(prepare.os, "makedirs", fake_makedirs)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert prepare._fetch_openml_datasets(target_n=1) == []
+
+    assert import_env == {
+        "HOME": "/tmp",
+        "XDG_CONFIG_HOME": "/tmp/.config",
+        "XDG_CACHE_HOME": "/tmp/.cache",
+    }
+    assert makedirs_calls == [
+        ("/tmp/.config/openml", True, "/tmp/.config", "/tmp/.cache"),
+        ("/tmp/.cache/openml", True, "/tmp/.config", "/tmp/.cache"),
+        ("/tmp/openml_cache", True, "/tmp/.config", "/tmp/.cache"),
+    ]
+    assert fake_config.root_cache_directory == "/tmp/openml_cache"
 
 
 class _LoadedDataset(dict):
