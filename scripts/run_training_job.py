@@ -5,6 +5,7 @@ Handler for the run_training_pipeline() Snowpark stored procedure.
 The Snowpark session is injected automatically by the stored procedure framework.
 """
 import json
+import os
 
 from snowflake.ml.jobs import submit_from_stage
 
@@ -15,6 +16,21 @@ SCRIPTS_STAGE = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 KAGGLE_STAGE = "@META_DATASET_STAGE/kaggle/"
 TRAIN_NUM_NODES = 10
+
+# Training data family — identifies the synthetic data suite used for this training run.
+# Production synthetic regression evaluation checkpoints use synthetic_regression_combined
+# (combined suite linear_all_v1, which includes primary + OOD data).
+# Override via TRAINING_DATA_FAMILY env var when launching a different training mode.
+DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
+    "TRAINING_DATA_FAMILY", "synthetic_regression_combined"
+)
+
+# MODEL3 architecture selectors — propagated to all training/HPO MLJob env_vars.
+# Default values preserve MODEL2 production behavior.
+# MODEL3 code paths only activate when MODEL_ARCH_VERSION="model3".
+DEFAULT_DEEPSET_MODEL_FAMILY  = os.getenv("DEEPSET_MODEL_FAMILY",  "market_aware")
+DEFAULT_MODEL_ARCH_VERSION    = os.getenv("MODEL_ARCH_VERSION",    "model2")
+DEFAULT_MODEL3_DESIGN_PATTERN = os.getenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
 
 
 def _wait_done(job, label, session):
@@ -189,6 +205,10 @@ def run_pipeline(session) -> str:
             "HOME": "/tmp",
             "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
             "STRICT_WORLD_SIZE_CHECK": "true",
+            "DEEPSET_MODEL_FAMILY":  DEFAULT_DEEPSET_MODEL_FAMILY,
+            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
+            "MODEL_ARCH_VERSION":    DEFAULT_MODEL_ARCH_VERSION,
+            "MODEL3_DESIGN_PATTERN": DEFAULT_MODEL3_DESIGN_PATTERN,
         },
         session=session,
     )
@@ -208,7 +228,13 @@ def run_pipeline(session) -> str:
         compute_pool=GPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=5,
-        env_vars={"HOME": "/tmp"},
+        env_vars={
+            "HOME": "/tmp",
+            "DEEPSET_MODEL_FAMILY":  DEFAULT_DEEPSET_MODEL_FAMILY,
+            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
+            "MODEL_ARCH_VERSION":    DEFAULT_MODEL_ARCH_VERSION,
+            "MODEL3_DESIGN_PATTERN": DEFAULT_MODEL3_DESIGN_PATTERN,
+        },
         session=session,
     )
     _wait_done(hpo_job, "HPO", session)
@@ -233,6 +259,10 @@ def run_pipeline(session) -> str:
             "HOME": "/tmp",
             "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
             "STRICT_WORLD_SIZE_CHECK": "true",
+            "DEEPSET_MODEL_FAMILY":  DEFAULT_DEEPSET_MODEL_FAMILY,
+            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
+            "MODEL_ARCH_VERSION":    DEFAULT_MODEL_ARCH_VERSION,
+            "MODEL3_DESIGN_PATTERN": DEFAULT_MODEL3_DESIGN_PATTERN,
         },
         session=session,
     )

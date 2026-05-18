@@ -25,7 +25,14 @@ BASE_D_PHI_CANDIDATES = [64, 128, 256, 512]      # kept for hpo_epoch_test.py
 BASE_D_RHO_CANDIDATES = [128, 256, 512, 1024]    # kept for hpo_epoch_test.py
 HPO_SPLIT_LIMITS      = {"train": 200, "val": 40}
 NUM_TRIALS            = 20
+HPO_MODEL_FAMILY      = os.environ.get("DEEPSET_MODEL_FAMILY", "market_aware")
 TRIAL_MAX_EPOCHS      = 30   # max epochs per HPO trial (early stopping via PATIENCE)
+
+# MODEL3 runtime selectors — propagated to HPO workers via env vars.
+# Default: MODEL_ARCH_VERSION="model2" preserves existing MODEL2 HPO behavior.
+# MODEL3 HPO is activated only when MODEL_ARCH_VERSION="model3".
+MODEL_ARCH_VERSION    = os.environ.get("MODEL_ARCH_VERSION",    "model2")
+MODEL3_DESIGN_PATTERN = os.environ.get("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
 
 
 # IMPORTANT:
@@ -167,6 +174,7 @@ def checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "n_sab_samp",
         "norm_feat",
         "norm_target",
+        "model_family",
     )
     return {
         field: {
@@ -420,7 +428,7 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
         import ray.tune as tune
         from train import (run_epoch, PATIENCE, N_HEADS, N_SAB_FEAT, N_SAB_SAMP,
                            NORM_FEAT, NORM_TARGET)
-        from model import DeepSetModel, ModelConfig
+        from model import DeepSetModel, ModelConfig, _instantiate_model
 
         if "snowflake.snowpark" in sys.modules:
             print(
@@ -469,8 +477,11 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
             d_phi=d_phi, d_rho=d_rho, pool=pool,
             n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
             norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout,
+            model_family=config.get("model_family", HPO_MODEL_FAMILY),
+            model_arch_version=MODEL_ARCH_VERSION,
+            model3_design_pattern=MODEL3_DESIGN_PATTERN,
         )
-        model     = DeepSetModel(cfg=cfg).to(device)
+        model     = _instantiate_model(cfg).to(device)
 
         if not pretrain_ckpt:
             raise RuntimeError("[HPO trial] Missing mandatory pretrain checkpoint payload")
@@ -597,11 +608,22 @@ def main():
     print("[HPO driver] published HPO payload and pretrain checkpoint to Ray object store", flush=True)
     _run_ray_object_store_preflight(ray)
 
+    # ── Guard: HPO only supports inductive training ────────────────────────────
+    if MODEL3_DESIGN_PATTERN == "transductive_completion":
+        raise ValueError(
+            "HPO does not support MODEL3_DESIGN_PATTERN='transductive_completion'. "
+            "Transductive completion requires a different training objective and cannot "
+            "be optimized through the inductive MSE objective in hpo.py. "
+            "Set MODEL3_DESIGN_PATTERN='inductive_forecasting' to use HPO, or train "
+            "a completion model directly via run_model_training()."
+        )
+
     # ── Ray Tune search space ─────────────────────────────────────────────────
     search_space = {
         "lr":           tune.loguniform(1e-4, 1e-2),
         "weight_decay": tune.loguniform(1e-5, 1e-3),
         "dropout":      tune.uniform(0.0, 0.3),
+        "model_family": HPO_MODEL_FAMILY,
     }
     print(
         "HPO Ray Tune config:",
@@ -649,12 +671,15 @@ def main():
     print("Best val_mse:", best_val_mse, flush=True)
 
     best_config = {
-        "lr":           float(best_config_raw["lr"]),
-        "weight_decay": float(best_config_raw["weight_decay"]),
-        "d_phi":        FIXED_D_PHI,
-        "d_rho":        FIXED_D_RHO,
-        "dropout":      float(best_config_raw["dropout"]),
-        "pool":         FIXED_POOL,
+        "lr":                   float(best_config_raw["lr"]),
+        "weight_decay":         float(best_config_raw["weight_decay"]),
+        "d_phi":                FIXED_D_PHI,
+        "d_rho":                FIXED_D_RHO,
+        "dropout":              float(best_config_raw["dropout"]),
+        "pool":                 FIXED_POOL,
+        "model_family":         best_config_raw.get("model_family", HPO_MODEL_FAMILY),
+        "model_arch_version":   MODEL_ARCH_VERSION,
+        "model3_design_pattern": MODEL3_DESIGN_PATTERN,
     }
 
     _upload_json_to_hpo("best_config.json", best_config)

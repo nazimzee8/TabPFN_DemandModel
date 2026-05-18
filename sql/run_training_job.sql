@@ -223,6 +223,40 @@ CREATE TRANSIENT TABLE IF NOT EXISTS BENCHMARK_DATASET_INDEX (
 )
 DATA_RETENTION_TIME_IN_DAYS = 0;
 
+-- Step 3c: Synthetic regression dataset index
+-- SYNTHETIC_REGRESSION_DATASET_INDEX is shared across all synthetic evaluation suites,
+-- differentiated by suite_id. It is rebuilt by prepare_synthetic_regression.py (in-distribution)
+-- and prepare_ood_regression.py (OOD pilot and full suite). Each prep job deletes only its own
+-- suite_id rows; the table is never dropped unless SYNTHETIC_REGRESSION_DROP_INDEX_TABLE=true.
+-- logical_dataset_key has zero-padded format: {suite_id}:{prior_regime}:{dataset_id:04d}
+-- source_suite_id: populated for combined suites (e.g. linear_all_v1) to record
+--   which source suite contributed each row; NULL for primary suites.
+CREATE TRANSIENT TABLE IF NOT EXISTS SYNTHETIC_REGRESSION_DATASET_INDEX (
+  suite_id             STRING,
+  suite_family         STRING,
+  dataset_id           NUMBER,
+  dataset_seed         NUMBER,
+  stage_path           STRING,
+  prior_name           STRING,
+  prior_version        STRING,
+  prior_regime         STRING,
+  split_seeds          ARRAY,
+  n_total              NUMBER,
+  n_train_default      NUMBER,
+  n_holdout_default    NUMBER,
+  p_signal             NUMBER,
+  p_noise              NUMBER,
+  p_total              NUMBER,
+  target_noise_scale   FLOAT,
+  training_size_anchor BOOLEAN,
+  feature_noise_level  NUMBER,
+  eval_weight          FLOAT,
+  payload_bytes        NUMBER,
+  created_at           TIMESTAMP_NTZ,
+  logical_dataset_key  STRING,
+  source_suite_id      STRING
+) DATA_RETENTION_TIME_IN_DAYS = 0;
+
 -- Populate/rebuild guidance:
 -- 1. Upload staged parquet to @META_DATASET_STAGE/{train,val,test}/.
 -- 2. Upload scripts to @MODEL_STAGE/scripts/.
@@ -344,6 +378,15 @@ CREATE OR REPLACE PROCEDURE build_meta_dataset_index()
 -- run_pretrain_pipeline() trains with default hyperparameters and writes
 -- @MODEL_STAGE/checkpoints/pretrain.pt. Run before run_hpo_pipeline() so
 -- HPO trials warm-start from the pre-trained weights.
+-- Zero-arg form uses env-var defaults (MODEL2 production behavior):
+--   CALL run_pretrain_pipeline();
+-- Parameterized form for MODEL3 training:
+--   CALL run_pretrain_pipeline(
+--       'market_exchangeable_icl',    -- DEEPSET_MODEL_FAMILY
+--       'synthetic_regression_combined',  -- TRAINING_DATA_FAMILY
+--       'model3',                     -- MODEL_ARCH_VERSION
+--       'inductive_forecasting'       -- MODEL3_DESIGN_PATTERN
+--   );
 CREATE OR REPLACE PROCEDURE run_pretrain_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -352,10 +395,32 @@ CREATE OR REPLACE PROCEDURE run_pretrain_pipeline()
   IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
   HANDLER = 'run_pretrain_job.run_pretrain_pipeline';
 
+CREATE OR REPLACE PROCEDURE run_pretrain_pipeline(
+  DEEPSET_MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_ARCH_VERSION STRING,
+  MODEL3_DESIGN_PATTERN STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_m3';
+
 -- run_hpo_pipeline() launches hpo.py on the GPU pool using Ray Tune for distributed HPO.
 -- Produces @MODEL_STAGE/hpo/best_config.json on success or hpo_failure.json
 -- if the Python driver starts and then fails. Per-trial errors appear in Ray
 -- worker logs (visible in Snowsight container logs), not in hpo_failure.json.
+-- best_config.json keys: lr, weight_decay, dropout, model_family (from HPO_MODEL_FAMILY,
+--   default "market_aware"), plus any architecture fields tuned (d_phi, d_rho, etc.).
+-- Note: HPO only supports inductive_forecasting; transductive_completion raises in hpo.py.
+-- Zero-arg:   CALL run_hpo_pipeline();
+-- Parameterized for MODEL3:
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'model3', 'inductive_forecasting'
+--   );
 CREATE OR REPLACE PROCEDURE run_hpo_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -364,8 +429,23 @@ CREATE OR REPLACE PROCEDURE run_hpo_pipeline()
   IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
   HANDLER = 'run_hpo_job.run_hpo_pipeline';
 
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
+  DEEPSET_MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_ARCH_VERSION STRING,
+  MODEL3_DESIGN_PATTERN STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_m3';
+
 -- run_model_training() reads @MODEL_STAGE/hpo/best_config.json, passes it to
 -- train.py as BEST_CONFIG, and produces @MODEL_STAGE/checkpoints/best.pt.
+-- Checkpoint metadata includes: model_family, task_type, training_data_family,
+--   best_val_mse, train_mse_at_best, best_epoch, pytorch_version.
 CREATE OR REPLACE PROCEDURE run_model_training()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -589,6 +669,368 @@ CREATE OR REPLACE PROCEDURE run_evaluation_aggregation(
   IMPORTS = ('@MODEL_STAGE/scripts/run_evaluation_test.py')
   HANDLER = 'run_evaluation_test.run_evaluation_aggregation';
 
+-- ============================================================
+-- Main Synthetic Regression Pipeline — Split-Phase Stored Procedures
+-- (linear_poisson_v1_recommended, 200 datasets, all methods)
+-- ============================================================
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_runtime_probes(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_runtime_probes';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_capacity_probe(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_prep(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_prep';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_deepset_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_deepset_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_aggregation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_aggregation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_pipeline(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_pipeline';
+
+-- Split-phase execution (recommended under tight quota):
+CALL run_synthetic_regression_prep('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_deepset_evaluation('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
+CALL run_synthetic_regression_baseline_evaluation('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_autogluon_evaluation('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_aggregation('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+-- All-in-one (convenience):
+-- CALL run_synthetic_regression_pipeline('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
+
+-- ============================================================
+-- OOD Full Suite Evaluation (ood_linear_full_v1, 200 datasets)
+-- ============================================================
+-- Runbook:
+--   1. Generate 200 OOD parquet files locally:
+--      python scripts/ood_regression/generate_ood_eval_data.py --n_datasets 200
+--   2. Stage all 200 OOD parquet files:
+--      PUT file://data/ood_regression/E/*.parquet @EVAL_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/F/*.parquet @EVAL_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/G/*.parquet @EVAL_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/H/*.parquet @EVAL_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/ood_manifest.json @EVAL_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   3. Stage updated Python scripts:
+--      PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://scripts/ood_regression/prepare_ood_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   4. Call procedure:
+--      CALL run_synthetic_regression_ood_full_evaluation('2.5.0-py311', '2.5.0-py311');
+--   5. Verify index:
+--      SELECT prior_regime, COUNT(*) AS n
+--      FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+--      WHERE suite_id = 'ood_linear_full_v1'
+--      GROUP BY prior_regime ORDER BY prior_regime;
+--      -- Expected: E/F/G/H each with 50 rows
+--   6. Verify outputs:
+--      LIST @EVALUATION_RESULTS_STAGE/ood_full/;
+--      -- Expected: synthetic_regression_model_comparison.csv,
+--      --           synthetic_regression_model_comparison_summary.csv,
+--      --           synthetic_regression_summary_by_regime.csv,
+--      --           synthetic_regression_chart_data_model_rank.csv
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_evaluation';
+
+-- OOD Full Suite — Split-Phase Procedures
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_prep(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_prep';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_deepset_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_deepset_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_baseline_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_autogluon_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_aggregation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_aggregation';
+
+-- OOD full split-phase execution (recommended under tight quota):
+CALL run_synthetic_regression_ood_full_prep('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_ood_full_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
+CALL run_synthetic_regression_ood_full_baseline_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_ood_full_autogluon_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_ood_full_aggregation('2.5.0-py311', '2.5.0-py311');
+
+-- ============================================================
+-- Combined Suite Evaluation (linear_all_v1, 400 datasets)
+-- ============================================================
+-- Runbook:
+--   Prerequisites (both source suites must already be indexed):
+--     CALL run_synthetic_regression_prep('<bench_rt>', '<bench_rt>', '<ag_rt>');
+--     CALL run_synthetic_regression_ood_full_evaluation('<bench_rt>', '<ag_rt>');
+--   1. Stage updated Python scripts:
+--      PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   2. Call procedure:
+--      CALL run_synthetic_regression_combined_evaluation('2.5.0-py311', '2.5.0-py311');
+--   3. Verify index (expect A/B/C/D/E/F/G/H each with 50 rows):
+--      SELECT prior_regime, COUNT(*) AS n
+--      FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+--      WHERE suite_id = 'linear_all_v1'
+--      GROUP BY prior_regime ORDER BY prior_regime;
+--   4. Verify source lineage:
+--      SELECT source_suite_id, COUNT(*) AS n
+--      FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+--      WHERE suite_id = 'linear_all_v1'
+--      GROUP BY source_suite_id ORDER BY source_suite_id;
+--      -- Expected: linear_poisson_v1_recommended=200, ood_linear_full_v1=200
+--   5. Verify outputs:
+--      LIST @EVALUATION_RESULTS_STAGE/combined/;
+--   6. Migration note — if SYNTHETIC_REGRESSION_DATASET_INDEX exists without source_suite_id:
+--      ALTER TABLE SYNTHETIC_REGRESSION_DATASET_INDEX ADD COLUMN IF NOT EXISTS source_suite_id STRING;
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_evaluation';
+
+-- Combined Suite — Split-Phase Procedures
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_prep(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_prep';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_deepset_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_deepset_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_aggregation';
+
+-- Combined split-phase execution (recommended under tight quota):
+CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311');
+
 CALL download_kaggle_to_stage();
 LIST @META_DATASET_STAGE/kaggle/;
 
@@ -654,6 +1096,7 @@ CALL run_pretrain_pipeline();
 LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain[.]pt';
 CALL run_hpo_pipeline();
 LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
+-- Inspect best_config.json; expected keys: lr, weight_decay, dropout, model_family, ...
 SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
 CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;

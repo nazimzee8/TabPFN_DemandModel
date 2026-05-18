@@ -1,0 +1,230 @@
+{
+  "status": "success",
+  "created_at_utc": "2026-05-15T19:23:51.105624+00:00",
+  "stage": "EVALUATION_RESULTS_STAGE",
+  "input_shards": [
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard0_of_30_detailed.csv",
+      "size_bytes": 14647
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard10_of_30_detailed.csv",
+      "size_bytes": 13572
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard11_of_30_detailed.csv",
+      "size_bytes": 13624
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard12_of_30_detailed.csv",
+      "size_bytes": 13669
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard13_of_30_detailed.csv",
+      "size_bytes": 13635
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard14_of_30_detailed.csv",
+      "size_bytes": 13626
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard15_of_30_detailed.csv",
+      "size_bytes": 13615
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard16_of_30_detailed.csv",
+      "size_bytes": 13584
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard17_of_30_detailed.csv",
+      "size_bytes": 13615
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard18_of_30_detailed.csv",
+      "size_bytes": 13589
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard19_of_30_detailed.csv",
+      "size_bytes": 13605
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard1_of_30_detailed.csv",
+      "size_bytes": 14586
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard20_of_30_detailed.csv",
+      "size_bytes": 13557
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard21_of_30_detailed.csv",
+      "size_bytes": 13577
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard22_of_30_detailed.csv",
+      "size_bytes": 13527
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard23_of_30_detailed.csv",
+      "size_bytes": 13614
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard24_of_30_detailed.csv",
+      "size_bytes": 13572
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard25_of_30_detailed.csv",
+      "size_bytes": 13532
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard26_of_30_detailed.csv",
+      "size_bytes": 13515
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard27_of_30_detailed.csv",
+      "size_bytes": 13575
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard28_of_30_detailed.csv",
+      "size_bytes": 13631
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard29_of_30_detailed.csv",
+      "size_bytes": 13620
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard2_of_30_detailed.csv",
+      "size_bytes": 14570
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard3_of_30_detailed.csv",
+      "size_bytes": 14546
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard4_of_30_detailed.csv",
+      "size_bytes": 14612
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard5_of_30_detailed.csv",
+      "size_bytes": 14623
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard6_of_30_detailed.csv",
+      "size_bytes": 14697
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard7_of_30_detailed.csv",
+      "size_bytes": 14561
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard8_of_30_detailed.csv",
+      "size_bytes": 14636
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard9_of_30_detailed.csv",
+      "size_bytes": 14693
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard0_of_10_detailed.csv",
+      "size_bytes": 43455
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard1_of_10_detailed.csv",
+      "size_bytes": 43510
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard2_of_10_detailed.csv",
+      "size_bytes": 43458
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard3_of_10_detailed.csv",
+      "size_bytes": 43579
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard4_of_10_detailed.csv",
+      "size_bytes": 43557
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard5_of_10_detailed.csv",
+      "size_bytes": 43579
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard6_of_10_detailed.csv",
+      "size_bytes": 43519
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard7_of_10_detailed.csv",
+      "size_bytes": 43445
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard8_of_10_detailed.csv",
+      "size_bytes": 43569
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/DeepSetModel-MC_shard9_of_10_detailed.csv",
+      "size_bytes": 43631
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard0_of_3_detailed.csv",
+      "size_bytes": 1366761
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard1_of_3_detailed.csv",
+      "size_bytes": 1354170
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard2_of_3_detailed.csv",
+      "size_bytes": 1355094
+    }
+  ],
+  "outputs": [
+    {
+      "name": "synthetic_regression_model_comparison.csv",
+      "size_bytes": 7330480,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_model_comparison_summary.csv",
+      "size_bytes": 6193,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_regime.csv",
+      "size_bytes": 17024,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_model_rank.csv",
+      "size_bytes": 183968,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_feature_noise.csv",
+      "size_bytes": 22078,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_training_size.csv",
+      "size_bytes": 392272,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_noise_features.csv",
+      "size_bytes": 13020,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_training_size.csv",
+      "size_bytes": 427852,
+      "written": true,
+      "conditional": true
+    }
+  ],
+  "validation": {
+    "required_columns_present": true,
+    "empty_inputs_detected": false,
+    "empty_outputs_detected": false
+  }
+}

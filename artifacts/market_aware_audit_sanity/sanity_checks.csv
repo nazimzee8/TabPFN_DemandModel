@@ -1,0 +1,13 @@
+check_name,passed,metric_name,metric_value
+check_permutation_invariance,True,max_abs_delta,4.023313522338867e-07
+check_permutation_invariance,True,row_delta,4.023313522338867e-07
+check_permutation_invariance,True,col_delta,3.5762786865234375e-07
+check_permutation_invariance,True,threshold,1e-05
+check_ridge_primal_dual_consistency,True,max_abs_delta,8.881784197001252e-16
+check_ridge_primal_dual_consistency,True,threshold,0.0001
+check_gate_range,True,n_contexts_checked,10
+check_ridge_expert_output_shape,True,shape_ok,True
+check_no_test_label_in_signature,True,has_y_test,False
+check_forward_smoke_small,True,n,20
+check_forward_smoke_small,True,p,5
+check_forward_smoke_small,True,m,8

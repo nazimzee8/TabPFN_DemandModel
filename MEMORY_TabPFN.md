@@ -601,3 +601,45 @@ Jobs that **must not** carry `pip_requirements`:
 - DeepSet, synthetic, aggregate jobs: no `pip_requirements`, no `external_access_integrations`
 - prep ML Job: `external_access_integrations == [BENCHMARK_EXTERNAL_ACCESS_EAI, PYPI_EAI]`
   and `pip_requirements == list(PREP_EXTRA_PIP_REQUIREMENTS)`
+
+## Guardrail: Query Collapse and Early Feature Compression
+
+The DeepSet model must not be evaluated solely through full benchmark aggregation before
+passing architecture sanity checks.
+
+Required pre-evaluation checks:
+1. Query sensitivity ratio.
+2. Sample permutation invariance.
+3. Feature permutation consistency.
+4. Duplicate-context stability.
+5. Simple linear recovery smoke test.
+6. Ridge diagnostic comparison.
+
+The architecture must preserve feature identity through sample-level evidence aggregation
+before pooling features.
+
+Explicit linear/ridge inductive bias is allowed only as a modular prior expert or residual
+baseline. It must not replace the neural market model. Future extensions must support sparse
+cross-price effects, low-rank market structures, treatment effects, seasonality, and
+market-demand priors.
+
+## Guardrail: Defer HPO Expansion Until Architecture Sanity Passes
+
+Do not broaden HPO over model width, pooling, SAB depth, or optimizer settings until the
+corrected architecture passes query sanity checks. The first priority is to eliminate query
+collapse and early feature compression. HPO expansion comes after the model demonstrates
+query-sensitive behavior on controlled synthetic contexts.
+
+## MarketAwareDeepSetModel Production Default Guardrails
+
+- `MarketAwareDeepSetModel` is the default production model (`DEEPSET_MODEL_FAMILY=market_aware`). Do not revert to `"deepset"` without an explicit ablation reason.
+- `load_best_deepset_checkpoint()` must always call `_instantiate_model(cfg)` — never hardcode the model class directly.
+- Sanity checks must be called with the same device as training: `run_all_checks(model=model, device=torch.device("cuda:0"))`.
+- `SYNREG_RUN_CHECKPOINT_GATES=true` and `SYNREG_CHECKPOINT_GATE_STRICT=true` are required defaults for all DeepSet synthetic regression shards. A failing gate (NaN/Inf, constant output, Ridge underperformance) invalidates evaluation results.
+- `TRAIN_RUN_SANITY_CHECKS=true` and `TRAIN_SANITY_CHECK_STRICT=true` run structural checks before `torch.compile()` and DDP wrapping. Do not disable without explicit justification.
+- `run_permutation_tests()` in `deepset_inference.py` is architecture-aware; dispatches to `market_aware` (Tests 1-5) or `deepset` (Tests 1-7) branches. Do not call with unknown `model_family`.
+- `best_config.json` from HPO must include `model_family` (written by `hpo.py`). `train.py` reads it from `BEST_CONFIG` env var.
+- Checkpoint `metadata` must include `best_val_mse`, `train_mse_at_best`, `best_epoch` for the train/val gap gate.
+- **TRAINING_DATA_FAMILY must be explicit in all Snowflake production submissions.** `run_training_job.py`, `run_model_training_job.py`, and `run_hpo_job.py` all default to `synthetic_regression_combined` (combined suite `linear_all_v1`). Use `unknown` only for local/dev runs. Production synthetic regression evaluation checkpoints must be tagged `synthetic_regression_combined`. `train.py` raises `ValueError` at module load time for invalid values.
+- **MODEL3 architecture selectors.** `MODEL_ARCH_VERSION="model2"` (default) preserves MODEL2 behavior. `MODEL3_DESIGN_PATTERN="inductive_forecasting"` (default) does NOT activate MODEL3 code unless `MODEL_ARCH_VERSION="model3"` is also set. All three submission scripts propagate `DEFAULT_MODEL_ARCH_VERSION` and `DEFAULT_MODEL3_DESIGN_PATTERN` through `env_vars`. MODEL3 combinations: `model3`+`inductive_forecasting`→`market_exchangeable_icl`; `model3`+`transductive_completion`→`market_exchangeable_completion`. MODEL3 checkpoints use format version 4.
+- **MODEL3 must not mutate MODEL2 classes.** `MarketAwareDeepSetModel` is unchanged. MODEL3 is implemented as `MarketExchangeableICLModel` and `MarketExchangeableCompletionModel` with shared primitives (`ExchangeableMatrixBlock`, `ColumnEncoder`, `CellEncoder`, `_masked_mean`). Factory `_instantiate_model(cfg)` routes all four families.

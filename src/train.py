@@ -31,7 +31,7 @@ except ImportError:
     WorkerResourceConfig = None
     get_context = None
 
-from model import DeepSetModel, ModelConfig
+from model import DeepSetModel, ModelConfig, _instantiate_model
 
 # ---------------------------------------------------------------------------
 # Key constants
@@ -53,8 +53,58 @@ WEIGHT_DECAY = 1e-4
 USE_AMP      = DEVICE == "cuda"
 
 USE_HUBER    = False   # off by default; toggle via hyper_params["use_huber"]
-LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse Î²
-HUBER_DELTA  = 1.0     # Î´ for Huber loss; robustness to Regime C heavy-tailed Îµ
+LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse β
+HUBER_DELTA  = 1.0     # δ for Huber loss; robustness to Regime C heavy-tailed ε
+
+DEEPSET_MODEL_FAMILY = os.environ.get("DEEPSET_MODEL_FAMILY", "market_aware")
+TRAINING_DATA_FAMILY = os.environ.get(
+    "TRAINING_DATA_FAMILY",
+    "unknown"
+)
+# Valid values: synthetic_regression_primary | synthetic_regression_ood
+#               | synthetic_regression_combined | market_mental_model | unknown
+_TRAINING_DATA_FAMILY_ALLOWED = frozenset({
+    "synthetic_regression_primary",
+    "synthetic_regression_ood",
+    "synthetic_regression_combined",
+    "market_mental_model",
+    "unknown",
+})
+if TRAINING_DATA_FAMILY not in _TRAINING_DATA_FAMILY_ALLOWED:
+    raise ValueError(
+        f"Invalid TRAINING_DATA_FAMILY={TRAINING_DATA_FAMILY!r}. "
+        f"Allowed values: {sorted(_TRAINING_DATA_FAMILY_ALLOWED)}"
+    )
+if TRAINING_DATA_FAMILY == "unknown" and (
+    os.environ.get("SNOWFLAKE_HOST", "") or os.environ.get("SF_PYTORCH_DISTRIBUTOR", "")
+):
+    print(
+        "[WARNING] TRAINING_DATA_FAMILY=unknown in a Snowflake environment. "
+        "Set TRAINING_DATA_FAMILY explicitly for production auditability. "
+        "Production synthetic regression evaluation checkpoints should use "
+        "TRAINING_DATA_FAMILY=synthetic_regression_combined.",
+        flush=True,
+    )
+
+TRAIN_RUN_SANITY_CHECKS    = os.environ.get("TRAIN_RUN_SANITY_CHECKS",    "true").lower() == "true"
+TRAIN_SANITY_CHECK_STRICT  = os.environ.get("TRAIN_SANITY_CHECK_STRICT",  "true").lower() == "true"
+TRAIN_SANITY_OUT_DIR       = os.environ.get("TRAIN_SANITY_OUT_DIR",       "/tmp/tabpfn_sanity")
+TRAIN_SANITY_WRITE_ALL_RANKS = os.environ.get("TRAIN_SANITY_WRITE_ALL_RANKS", "false").lower() == "true"
+
+# MODEL3 runtime selectors
+# Default: MODEL_ARCH_VERSION="model2" preserves existing MODEL2 behavior.
+# MODEL3 code paths only activate when MODEL_ARCH_VERSION="model3".
+MODEL_ARCH_VERSION    = os.environ.get("MODEL_ARCH_VERSION",    "model2")
+MODEL3_DESIGN_PATTERN = os.environ.get("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+if MODEL_ARCH_VERSION not in ("model2", "model3"):
+    raise ValueError(
+        f"Invalid MODEL_ARCH_VERSION={MODEL_ARCH_VERSION!r}. Valid: 'model2', 'model3'"
+    )
+if MODEL3_DESIGN_PATTERN not in ("inductive_forecasting", "transductive_completion"):
+    raise ValueError(
+        f"Invalid MODEL3_DESIGN_PATTERN={MODEL3_DESIGN_PATTERN!r}. "
+        "Valid: 'inductive_forecasting', 'transductive_completion'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +261,7 @@ def _checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "n_sab_samp",
         "norm_feat",
         "norm_target",
+        "model_family",
     )
     return {
         field: {
@@ -333,6 +384,41 @@ def upload_training_failure(exc, stage_path="@MODEL_STAGE/checkpoints/"):
             f"{type(upload_exc).__name__}: {upload_exc}",
             flush=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Train-time sanity gate
+# ---------------------------------------------------------------------------
+
+def _run_train_sanity_gate(model, device, rank, is_main):
+    """Run structural sanity checks on this rank's device before compile/DDP."""
+    if not TRAIN_RUN_SANITY_CHECKS:
+        return
+    from sanity_checks import run_all_checks, save_results
+
+    write_results = is_main or TRAIN_SANITY_WRITE_ALL_RANKS
+    out_dir = (
+        os.path.join(TRAIN_SANITY_OUT_DIR, f"rank{rank}")
+        if TRAIN_SANITY_WRITE_ALL_RANKS
+        else TRAIN_SANITY_OUT_DIR
+    )
+
+    print(f"[train_fn] running model sanity checks on device={device}", flush=True)
+    results = run_all_checks(model=model, device=torch.device(device))
+    all_passed = results.get("all_passed", False)
+
+    if write_results:
+        save_results(results, out_dir)
+
+    if all_passed:
+        print("[train_fn] sanity checks passed", flush=True)
+    else:
+        failed = [k for k, v in results.items()
+                  if isinstance(v, dict) and not v.get("passed", True)]
+        msg = f"[train_fn] sanity checks FAILED: {failed}"
+        print(msg, flush=True)
+        if TRAIN_SANITY_CHECK_STRICT:
+            raise RuntimeError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -466,20 +552,35 @@ def train_fn():
         dist.init_process_group(backend="nccl")
 
     # --- Model ---
+    model_family = hyper_params.get("model_family", DEEPSET_MODEL_FAMILY)
+    _arch_version = hyper_params.get("model_arch_version", MODEL_ARCH_VERSION)
+    _design_pattern = hyper_params.get("model3_design_pattern", MODEL3_DESIGN_PATTERN)
     cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool,
                         n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
-                        norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout)
-    model = DeepSetModel(cfg=cfg).to(device)
+                        norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout,
+                        model_family=model_family,
+                        model_arch_version=_arch_version,
+                        model3_design_pattern=_design_pattern)
+    print(
+        f"[train_fn] model_family={cfg.model_family} "
+        f"training_data_family={TRAINING_DATA_FAMILY} "
+        f"task_type=regression",
+        flush=True,
+    )
+    model = _instantiate_model(cfg).to(device)
     if pretrain_ckpt_stage_path:
         _load_pretrain_checkpoint(model, pretrain_ckpt_stage_path, cfg, device, rank)
+    _run_train_sanity_gate(model, device, rank, is_main)
     model = torch.compile(model, mode="reduce-overhead")
     model = DistributedDataParallel(model, device_ids=[local_rank])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler    = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    best_val_mse   = float("inf")
-    patience_count = 0
+    best_val_mse      = float("inf")
+    patience_count    = 0
+    best_epoch        = 0
+    train_mse_at_best = float("inf")
 
     for epoch in range(1, max_epochs + 1):
         train_mse = run_epoch(model, train_loader, optimizer, scaler, True,  device, use_amp,
@@ -495,20 +596,46 @@ def train_fn():
         if is_main:
             print(f"Epoch {epoch:3d}  val_mse={val_mse:.4f}")
             if val_mse < best_val_mse:
-                best_val_mse   = val_mse
-                patience_count = 0
+                best_val_mse      = val_mse
+                best_epoch        = epoch
+                train_mse_at_best = train_mse
+                patience_count    = 0
                 ckpt = model.module if isinstance(model, DistributedDataParallel) else model
                 ckpt = ckpt._orig_mod if hasattr(ckpt, "_orig_mod") else ckpt
                 import dataclasses as _dc
+                _m3_families = {"market_exchangeable_icl", "market_exchangeable_completion"}
+                if cfg.model_family in _m3_families:
+                    format_version = 4
+                elif cfg.model_family == "market_aware":
+                    format_version = 3
+                else:
+                    format_version = 2
+                _metadata = {
+                    "source": "train.py",
+                    "checkpoint_name": os.path.basename(checkpoint_output_name),
+                    "pytorch_version": torch.__version__,
+                    "model_family": cfg.model_family,
+                    "task_type": "regression",
+                    "training_entrypoint": "train.py",
+                    "training_data_family": TRAINING_DATA_FAMILY,
+                    "best_val_mse": float(best_val_mse),
+                    "train_mse_at_best": float(train_mse_at_best),
+                    "best_epoch": int(best_epoch),
+                }
+                # MODEL3 checkpoints carry additional metadata fields
+                if cfg.model_family in _m3_families:
+                    _metadata["model_arch_version"]    = MODEL_ARCH_VERSION
+                    _metadata["model3_design_pattern"] = MODEL3_DESIGN_PATTERN
+                    _metadata["task_objective"] = (
+                        "inductive_regression"
+                        if MODEL3_DESIGN_PATTERN == "inductive_forecasting"
+                        else "transductive_completion"
+                    )
                 torch.save({
-                    "checkpoint_format_version": 2,
+                    "checkpoint_format_version": format_version,
                     "cfg": _dc.asdict(ckpt.cfg),
                     "state_dict": ckpt.state_dict(),
-                    "metadata": {
-                        "source": "train.py",
-                        "checkpoint_name": os.path.basename(checkpoint_output_name),
-                        "pytorch_version": torch.__version__,
-                    },
+                    "metadata": _metadata,
                 }, checkpoint_output_name)
             else:
                 patience_count += 1

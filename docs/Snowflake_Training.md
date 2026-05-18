@@ -21,9 +21,12 @@ written back to Snowflake.
 7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_DATASET_STAGE/benchmark_prepared/`.
 8. **Call `run_pretrain_pipeline()`**. Pretrain writes mandatory
    `@MODEL_STAGE/checkpoints/pretrain.pt`; verify it before HPO starts.
-9. **Call `run_hpo_pipeline()`**. HPO requires `pretrain.pt`, tunes only `lr`,
+9. **Call `run_hpo_pipeline()`**. HPO requires `pretrain.pt`, tunes `lr`,
    `weight_decay`, and `dropout`, and writes `@MODEL_STAGE/hpo/best_config.json`.
-10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`.
+   The JSON also includes `model_family` (propagated from `HPO_MODEL_FAMILY`, default
+   `"market_aware"`). `train.py` reads `model_family` from `best_config.json` to
+   instantiate the correct model class.
+10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`. The saved checkpoint `metadata` includes `best_val_mse`, `train_mse_at_best`, and `best_epoch`.
 11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
 12. **Run evaluation** — two options depending on Snowflake account node quota:
     - **Split-phase (recommended under tight quota)**: call each phase independently
@@ -2144,3 +2147,90 @@ CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_
 | `ModuleNotFoundError: No module named 'autogluon'` in shard job | AutoGluon shard job missing `pip_requirements`/EAI | Verify AutoGluon shard loop passes both kwargs |
 | `Integration 'TABPFN_PYPI_EAI' does not exist` | EAI not created or wrong name | Re-run Step 2c in `sql/run_training_job.sql` |
 | Probe passes but shard job fails install | Version pin mismatch between constants and PyPI availability | Check `AUTOGLUON_VERSION` / `OPENML_VERSION` constants |
+
+---
+
+## OOD Full Suite Evaluation
+
+The OOD full suite (`ood_linear_full_v1`) runs the complete evaluation pipeline (DeepSet +
+baselines + AutoGluon) on 200 OOD datasets across 4 regimes (E/F/G/H, 50 per regime).
+
+### Dataset counts
+
+| Pool | Count | Description |
+|------|-------|-------------|
+| Source pool | 200 staged parquet files | 50 per regime E/F/G/H; generated locally, staged to `@EVAL_DATASET_STAGE/ood_parity/` |
+| Pilot indexed | 80 (20/regime) | Indexed under `ood_linear_pilot_v1`; DeepSet only |
+| Full suite indexed | 200 (50/regime) | Indexed under `ood_linear_full_v1`; all methods |
+
+### Step 1 — Generate 200 OOD parquet files locally
+
+`generate_ood_eval_data.py` is a **local-only CLI** and must **never** be staged to Snowflake.
+
+```bash
+python scripts/ood_regression/generate_ood_eval_data.py --n_datasets 200
+```
+
+Output: `data/ood_regression/{E,F,G,H}/dataset_NNNN.parquet` and `data/ood_regression/ood_manifest.json`
+
+### Step 2 — Stage all 200 OOD parquet files
+
+```sql
+PUT file://data/ood_regression/E/*.parquet @EVAL_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/F/*.parquet @EVAL_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/G/*.parquet @EVAL_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/H/*.parquet @EVAL_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/ood_manifest.json @EVAL_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+### Step 3 — Stage updated Python scripts
+
+```sql
+PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/ood_regression/prepare_ood_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+### Step 4 — Call the OOD full evaluation procedure
+
+```sql
+CALL run_synthetic_regression_ood_full_evaluation('2.5.0-py311', '2.5.0-py311');
+```
+
+This runs 5 phases sequentially:
+1. **OOD prep** — indexes 200 datasets under `ood_linear_full_v1`
+2. **DeepSet** — 10 GPU shards on `DEEPSET_GPU_POOL`
+3. **Baselines** — 3 CPU shards on `DEEPSET_CPU_POOL`
+4. **AutoGluon** — 30 CPU shards on `AUTOGLUON_CPU_POOL`
+5. **Aggregation** — 1 CPU job; outputs to `@EVALUATION_RESULTS_STAGE/ood_full/`
+
+### Step 5 — Verify index
+
+```sql
+SELECT prior_regime, COUNT(*) AS n
+FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+WHERE suite_id = 'ood_linear_full_v1'
+GROUP BY prior_regime ORDER BY prior_regime;
+-- Expected: E/F/G/H each with 50 rows
+```
+
+### Step 6 — Verify outputs
+
+```sql
+LIST @EVALUATION_RESULTS_STAGE/ood_full/;
+-- Expected files:
+--   synthetic_regression_model_comparison.csv
+--   synthetic_regression_model_comparison_summary.csv
+--   synthetic_regression_summary_by_regime.csv
+--   synthetic_regression_chart_data_model_rank.csv
+```
+
+### Environment variable reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OOD_REGRESSION_N_DATASETS` | 80 | Preferred: number of OOD datasets to index (must be divisible by 4) |
+| `OOD_REGRESSION_N_PILOT` | — | Legacy fallback for `OOD_REGRESSION_N_DATASETS`; still accepted |
+| `OOD_REGRESSION_SUITE_ID` | `ood_linear_pilot_v1` | Suite ID for indexed rows |

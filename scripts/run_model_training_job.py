@@ -3,6 +3,7 @@ Stored procedure handler for submitting only the model training MLJob.
 """
 
 import json
+import os
 
 from snowflake.ml.jobs import submit_from_stage
 
@@ -13,6 +14,20 @@ MODEL_STAGE = "@MODEL_STAGE"
 SCRIPTS_STAGE = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 TRAIN_NUM_NODES = 10
+
+# Training data family — identifies the synthetic data suite used for this training run.
+# Production synthetic regression evaluation checkpoints use synthetic_regression_combined
+# (combined suite linear_all_v1, which includes primary + OOD data).
+# Override via TRAINING_DATA_FAMILY env var when launching a different training mode.
+DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
+    "TRAINING_DATA_FAMILY", "synthetic_regression_combined"
+)
+
+# MODEL3 architecture selectors — propagated to the training MLJob env_vars.
+# Default values preserve MODEL2 production behavior.
+DEFAULT_DEEPSET_MODEL_FAMILY  = os.getenv("DEEPSET_MODEL_FAMILY",  "market_aware")
+DEFAULT_MODEL_ARCH_VERSION    = os.getenv("MODEL_ARCH_VERSION",    "model2")
+DEFAULT_MODEL3_DESIGN_PATTERN = os.getenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
 
 
 def _wait_done(job, label):
@@ -144,6 +159,10 @@ def run_model_training(session) -> str:
         "HOME":                      "/tmp",
         "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),   # 10 × 4 = 40
         "STRICT_WORLD_SIZE_CHECK":   "true",
+        "DEEPSET_MODEL_FAMILY":       DEFAULT_DEEPSET_MODEL_FAMILY,
+        "TRAINING_DATA_FAMILY":       DEFAULT_TRAINING_DATA_FAMILY,
+        "MODEL_ARCH_VERSION":         DEFAULT_MODEL_ARCH_VERSION,
+        "MODEL3_DESIGN_PATTERN":      DEFAULT_MODEL3_DESIGN_PATTERN,
     }
     if _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "pretrain.pt"):
         env_vars["PRETRAIN_CHECKPOINT_PATH"] = f"{MODEL_STAGE}/checkpoints/pretrain.pt"
@@ -167,6 +186,7 @@ def run_model_training(session) -> str:
             "EXPECTED_TRAIN_WORLD_SIZE":  env_vars["EXPECTED_TRAIN_WORLD_SIZE"],
             "STRICT_WORLD_SIZE_CHECK":    env_vars["STRICT_WORLD_SIZE_CHECK"],
             "CHECKPOINT_OUTPUT_NAME":     env_vars["CHECKPOINT_OUTPUT_NAME"],
+            "TRAINING_DATA_FAMILY":       env_vars["TRAINING_DATA_FAMILY"],
             "compute_pool":               GPU_POOL,
             "entrypoint":                 "train.py",
             "source":                     SCRIPTS_STAGE,
@@ -184,6 +204,7 @@ def run_model_training(session) -> str:
         "expected_train_world_size": int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"]),
         "strict_world_size_check":   env_vars["STRICT_WORLD_SIZE_CHECK"],
         "checkpoint_output_name":    env_vars["CHECKPOINT_OUTPUT_NAME"],
+        "training_data_family":      DEFAULT_TRAINING_DATA_FAMILY,
         "has_best_config":           True,
         "has_pretrain":              "PRETRAIN_CHECKPOINT_PATH" in env_vars,
         "compute_pool":              GPU_POOL,

@@ -1,0 +1,58 @@
+{
+  "check_permutation_invariance": {
+    "passed": true,
+    "max_abs_delta": 3.5762786865234375e-07,
+    "row_delta": 3.5762786865234375e-07,
+    "col_delta": 3.5762786865234375e-07,
+    "threshold": 1e-05
+  },
+  "check_ridge_primal_dual_consistency": {
+    "passed": true,
+    "max_abs_delta": 8.881784197001252e-16,
+    "threshold": 0.0001
+  },
+  "check_gate_range": {
+    "passed": true,
+    "n_contexts_checked": 10,
+    "gate_samples": [
+      {
+        "min": 0.5630673766136169,
+        "max": 0.5869916081428528
+      },
+      {
+        "min": 0.5677546262741089,
+        "max": 0.5815037488937378
+      },
+      {
+        "min": 0.5670561790466309,
+        "max": 0.573082685470581
+      }
+    ]
+  },
+  "check_ridge_expert_output_shape": {
+    "passed": true,
+    "expected_shape": "(5,)",
+    "shape_ok": true
+  },
+  "check_no_test_label_in_signature": {
+    "passed": true,
+    "param_names": [
+      "self",
+      "X_norm",
+      "y_norm",
+      "x_test_norm",
+      "lam"
+    ],
+    "has_y_test": false
+  },
+  "check_forward_smoke_small": {
+    "passed": true,
+    "n": 20,
+    "p": 5,
+    "m": 8,
+    "out_shape": [
+      8
+    ]
+  },
+  "all_passed": true
+}

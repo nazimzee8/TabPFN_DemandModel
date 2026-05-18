@@ -44,7 +44,11 @@ import torch.distributed as dist
 import pandas as pd
 from scipy import stats
 
-from model import DeepSetModel, ModelConfig, POOL_SCALE
+import autogluon_models as _autogluon_helpers
+import baseline_models as _baseline_helpers
+import deepset_inference as _deepset_helpers
+import evaluation_metrics as _metric_helpers
+from model import DeepSetModel, MarketAwareDeepSetModel, ModelConfig, POOL_SCALE, _instantiate_model
 from snowflake_io import materialize_meta_dataset_stage
 
 # SPCS home guard — redirect ~ to writable path before any Snowflake imports
@@ -464,7 +468,7 @@ def load_model(model_path):
     print(f"ModelConfig: {cfg}", flush=True)
     print(f"State dict tensors: {len(state_dict)}", flush=True)
 
-    model = DeepSetModel(cfg=cfg)
+    model = _instantiate_model(cfg)
     model.load_state_dict(state_dict)
     model.eval()
     print(f"Loaded model from {model_path}", flush=True)
@@ -1569,6 +1573,202 @@ def aggregate_benchmark_results(detailed_df):
     rank_summary_df = pd.DataFrame(rank_rows)
 
     return rank_summary_df, metric_summary_df
+
+
+# ---------------------------------------------------------------------------
+# Shared helper wrappers
+# ---------------------------------------------------------------------------
+
+def run_permutation_tests(model):
+    return _deepset_helpers.run_permutation_tests(model)
+
+
+def make_baseline_model(method, seed):
+    constructors = {
+        name: globals()[name]
+        for name in (
+            "xgb", "lgb", "CatBoostRegressor", "RandomForestRegressor",
+            "KNeighborsRegressor", "LinearRegression", "Ridge", "SVR",
+            "MLPRegressor", "StandardScaler", "Pipeline",
+        )
+        if name in globals()
+    }
+    return _baseline_helpers.make_baseline_model(
+        method,
+        seed,
+        import_errors=BENCHMARK_DEP_IMPORT_ERRORS,
+        constructors=constructors,
+        dependency_error_builder=benchmark_dependency_error_message,
+    )
+
+
+def get_baselines(seed, methods=None):
+    methods = CPU_BASELINE_METHODS if methods is None else list(methods)
+    return {method: make_baseline_model(method, seed) for method in methods}
+
+
+def select_deepset_context_indices(
+    n_train,
+    context_size,
+    seed,
+    context_index,
+    dataset_identity="benchmark",
+    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+):
+    return _deepset_helpers.select_deepset_context_indices(
+        n_train,
+        context_size,
+        seed,
+        context_index,
+        dataset_identity=dataset_identity,
+        context_ensembles=context_ensembles,
+    )
+
+
+def resolve_deepset_feature_cap(model, feature_cap=BENCHMARK_DEEPSET_FEATURE_CAP):
+    return _deepset_helpers.resolve_deepset_feature_cap(
+        model,
+        feature_cap=feature_cap,
+        default_cap=default_model_config().d_phi,
+    )
+
+
+def select_deepset_features_train_only(
+    X_train_p,
+    y_train,
+    X_test_p,
+    feature_cap,
+    feature_selector=BENCHMARK_DEEPSET_FEATURE_SELECTOR,
+):
+    return _deepset_helpers.select_deepset_features_train_only(
+        X_train_p,
+        y_train,
+        X_test_p,
+        feature_cap,
+        feature_selector,
+        f_regression_func=f_regression,
+    )
+
+
+def deepset_inference_device():
+    return _deepset_helpers.deepset_inference_device(require_cuda=BENCHMARK_REQUIRE_CUDA)
+
+
+def estimate_deepset_gpu_inference_bytes(
+    n_train_rows,
+    n_test_rows,
+    n_features,
+    context_size=None,
+    test_batch_size=None,
+    safety_factor=None,
+):
+    return _deepset_helpers.estimate_deepset_gpu_inference_bytes(
+        n_train_rows,
+        n_test_rows,
+        n_features,
+        context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE if context_size is None else context_size,
+        test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE if test_batch_size is None else test_batch_size,
+        safety_factor=(
+            BENCHMARK_DEEPSET_GPU_MEMORY_SAFETY_FACTOR
+            if safety_factor is None
+            else safety_factor
+        ),
+    )
+
+
+def deepset_gpu_memory_skip_reason(
+    X_train_np,
+    X_test_np,
+    device,
+    max_inference_bytes=None,
+    max_memory_fraction=None,
+):
+    return _deepset_helpers.deepset_gpu_memory_skip_reason(
+        X_train_np,
+        X_test_np,
+        device,
+        max_inference_bytes=(
+            BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES
+            if max_inference_bytes is None
+            else max_inference_bytes
+        ),
+        max_memory_fraction=(
+            BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION
+            if max_memory_fraction is None
+            else max_memory_fraction
+        ),
+    )
+
+
+def predict_deepset_mc_streamed(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    K=32,
+    test_batch_size=128,
+    device=None,
+):
+    return _deepset_helpers.predict_deepset_mc_streamed(
+        model,
+        X_train_np,
+        y_train_np,
+        X_test_np,
+        K=K,
+        test_batch_size=test_batch_size,
+        device=device,
+    )
+
+
+def predict_deepset_bounded_context_ensemble(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    seed,
+    dataset_identity="benchmark",
+    K=32,
+    context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
+    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+    test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
+    device=None,
+):
+    return _deepset_helpers.predict_deepset_bounded_context_ensemble(
+        model,
+        X_train_np,
+        y_train_np,
+        X_test_np,
+        seed,
+        dataset_identity=dataset_identity,
+        K=K,
+        context_size=context_size,
+        context_ensembles=context_ensembles,
+        test_batch_size=test_batch_size,
+        device=device,
+        context_selector=select_deepset_context_indices,
+        predictor=predict_deepset_mc_streamed,
+    )
+
+
+def rank_methods(metrics_matrix, higher_is_better=False):
+    return _metric_helpers.rank_methods(metrics_matrix, higher_is_better=higher_is_better)
+
+
+def ci95(vals):
+    return _metric_helpers.ci95(vals)
+
+
+def predict_autogluon(X_train_np, y_train_np, X_test_np):
+    return _autogluon_helpers.predict_autogluon(
+        X_train_np,
+        y_train_np,
+        X_test_np,
+        time_limit=AUTOGLUON_TIME_LIMIT,
+        presets="best_quality",
+        num_cpus=BENCHMARK_NUM_CPUS,
+        num_gpus=0,
+        verbosity=0,
+    )
 
 
 def _download_stage_file_to_dir(stage_path, local_dir):
