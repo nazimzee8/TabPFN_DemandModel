@@ -1,17 +1,21 @@
 ---
 name: machine-learning-pipeline
-description: Document and explain the DeepSet training and evaluation pipeline for this repo. Use when Codex needs to describe or update how synthetic meta-datasets are generated, how DeepSet is trained across many parquet datasets in Snowpark Container Services, how evaluate.py runs in the same SPCS container on unseen test data, or how the model is compared against the fixed ridge-regression baseline.
+description: Document and explain the MODEL3 (DeepSetICLModel) training and
+  evaluation pipeline for this repo. Use when Codex needs to describe or update how
+  synthetic meta-datasets are generated, how MODEL3 is trained across many parquet datasets
+  in Snowpark Container Services, how evaluate.py runs in the same SPCS container on
+  unseen test data, or how the model is compared against the fixed ridge-regression baseline.
 ---
 
 # Machine Learning Pipeline
 
 ## Overview
 
-Use this skill to explain the research workflow implemented in this repo for training and evaluating the DeepSet demand model inside Snowpark Container Services (SPCS).
+Use this skill to explain the research workflow implemented in this repo for training and evaluating the MODEL3 (DeepSetICLModel) demand model inside Snowpark Container Services (SPCS).
 
 Ground every explanation in the current code:
 - `generate_dgp.py` generates many single-task parquet files under `data/train`, `data/val`, and `data/test`.
-- `train.py` trains a `DeepSetModel` over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
+- `train.py` trains a `DeepSetICLModel` (MODEL3 ICL) over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
 - `hpo.py` selects a deterministic 200 train / 40 validation subset from
   `META_DATASET_INDEX`, runs a Ray worker Snowpark/session/stage preflight,
   materializes only those staged parquet payloads, and tunes only `lr`,
@@ -117,7 +121,7 @@ When documenting or patching Snowflake execution, include these runtime constrai
   `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and `AUTOGLUON_CPU_POOL` unless the
   account node quota has been raised and verified.
 - `run_evaluation_pipeline()` is phase-gated to avoid Snowflake node quota bursts:
-  DeepSet GPU shards (phase 3, 10 nodes) all finish before CPU baseline shards
+  MODEL3 ICL GPU shards (phase 3, 10 nodes) all finish before CPU baseline shards
   (phase 4, 3 nodes) start; CPU baseline shards finish before AutoGluon shards
   (phase 5) start. AutoGluon shards run in batches of `AUTOGLUON_MAX_CONCURRENT_SHARDS=30`
   (30 total, one full-concurrency batch when `AUTOGLUON_CPU_POOL MAX_NODES` and account quota allow it).
@@ -152,7 +156,7 @@ When documenting or patching Snowflake execution, include these runtime constrai
     `benchmark_parts/` files already exist on `@EVALUATION_RESULTS_STAGE`.
   - Do not collapse the phases back into a single overlapping fan-out under tight quota.
 
-## Explain How DeepSet Is Trained
+## Explain How the MODEL3 ICL Model Is Trained
 
 Describe `train.py` as training across many tasks, not rows from one dataset.
 
@@ -172,7 +176,7 @@ Call out these implementation details:
 - A DataLoader with 4 worker processes and `prefetch_factor=2` overlaps Parquet I/O with GPU computation.
 - The best checkpoint is saved via `model._orig_mod.state_dict()` (the unwrapped module inside `torch.compile`) and uploaded to `@MODEL_STAGE/checkpoints/`.
 
-When explaining the learned artifact, describe `best.pt` as the serialized state dict of the DeepSet architecture (saved via `model._orig_mod` to unwrap `torch.compile`) that is later reused for held-out evaluation.
+When explaining the learned artifact, describe `best.pt` as the serialized state dict of the MODEL3 ICL architecture (saved via `model._orig_mod` to unwrap `torch.compile`) that is later reused for held-out evaluation.
 
 ### HPO Design
 
@@ -266,12 +270,13 @@ When discussing the model architecture, note:
 - HPO enforces these expressivity constraints by scanning staged train/val
   metadata and failing before trials unless observed `max(p) <= 128` and
   `max(n_train) <= 256`.
-- **SAB (Self-Attention Block)** from Set Transformer replaces the simple linear
-  equivariance layer. At the feature level, features within each sample attend to
-  each other before feature pooling. At the sample level, training samples attend
-  to each other before sample pooling. This is strictly more expressive than the
-  original λI + γ/n·11ᵀ equivariance and is the mechanism by which "each sample
-  learns from the others before being aggregated."
+- **Core tensor `H: (m, n, p, d_phi)`** — market-batch × context rows × features × channel. This is the primary representation flowing through the MODEL3 ICL network.
+- **`ExchangeableMatrixBlock`** performs Hartford-style equivariant attention over rows and columns simultaneously, replacing the simple linear equivariance layer. `n_sab_feat` blocks are applied.
+- **`ColumnEncoder`** maps per-column statistics → `d_phi` embedding, producing a feature-level context representation.
+- **`CellEncoder`** maps `[x_norm, y_norm, q_norm]` → `d_phi` embedding per (market, sample, feature) triple.
+- **`DeepSetICLModel`** is the primary in-context learning variant; **`DeepSetCompletionModel`** is the completion variant. Both are instantiated through `_instantiate_model(cfg)`.
+- **`_instantiate_model(cfg)`** from `model.py` is always the instantiation entry point. Never instantiate model classes directly.
+- **ModelConfig** bundles all hyperparameters. Always instantiate via `_instantiate_model(ModelConfig(...))`. The checkpoint file `best.pt` format version 4 stores `{"state_dict": ..., "cfg": ..., "checkpoint_format_version": 4, "metadata": {...}}` so the exact architecture is reproducible from the file alone.
 - **Pooling** uses one of seven modes configured via `ModelConfig.pool`: `sum`,
   `mean`, `max`, `pna` (sum+mean+max+std), `learned` (softmax-weighted sum),
   `attn` (single-seed cross-attention / PMA), or `multipool` (pna + attn, for
@@ -279,17 +284,14 @@ When discussing the model architecture, note:
 - **Normalization**: `norm_feat=True` standardizes X_train columns per-context and
   applies the same statistics to x_test. `norm_target=True` standardizes y_train and
   denormalizes the output. Both are per-context (no global running statistics).
-- **ModelConfig** bundles all hyperparameters. Always instantiate via
-  `DeepSetModel(cfg=ModelConfig(...))`. The checkpoint file `best.pt` stores both
-  `state_dict` and `cfg` so the exact architecture is reproducible from the file alone.
 - Do not describe the pooling as "mean pooling" — the model uses PNA or another
   configured mode.
 - Do not claim d_phi=64 or d_rho=64 — defaults are 128 and 256.
-- Do not describe equivariance as a "scalar linear layer" — it is SAB by default.
+- Do not describe equivariance as a "scalar linear layer" — it is `ExchangeableMatrixBlock` by default.
 
 ## Explain How Generalization Is Evaluated
 
-Describe `evaluate.py` as the unseen-data evaluation step for the trained DeepSet checkpoint.
+Describe `evaluate.py` as the unseen-data evaluation step for the trained MODEL3 ICL checkpoint.
 
 State the evaluation contract clearly:
 - It loads `best.pt`.
@@ -297,25 +299,25 @@ State the evaluation contract clearly:
 - It materializes the held-out test split inside the Snowflake container and evaluates
   only `/tmp/data/test`.
 - It produces per-task records and then aggregates them by `prior_regime` and across all test tasks.
-- Prepared benchmark DeepSet rows use `DeepSetModel-MC bounded-context ensemble`,
+- Prepared benchmark MODEL3 rows use `MODEL3 ICL bounded-context ensemble`,
   not exact full-context inference: 90/10 split first, train-only preprocessing,
-  DeepSet-only train-only `train_f_regression` feature selection capped by
+  MODEL3-only train-only `train_f_regression` feature selection capped by
   `BENCHMARK_DEEPSET_FEATURE_CAP` (default `model.cfg.d_phi`), five deterministic
   non-overlapping train-only context windows capped at 200 rows, prediction-level
   averaging over the full capped test split, then one metric computation.
-- DeepSet benchmark detail rows include `raw_features`, `processed_features`,
+- MODEL3 benchmark detail rows include `raw_features`, `processed_features`,
   `selected_features`, `feature_selector`, and `feature_cap`; CPU baselines and
   AutoGluon still receive the full processed matrices.
 
 Use the repo's current metric names, but explain their meaning precisely:
-- `model_mse`: mean squared error between DeepSet predictions and `betaX_test` on unseen test tasks.
+- `model_mse`: mean squared error between MODEL3 ICL predictions and `betaX_test` on unseen test tasks.
 - `mean_model_mse`: average of `model_mse` across tasks within each regime and across the full test set.
 - `ols_mse`: current code label for the baseline error, but this is not true ordinary least squares.
 - `mean_ols_mse`: average baseline MSE across tasks within each regime and across the full test set.
-- `ratio_model_ols`: `mean_model_mse / mean_ols_mse`; values below `1.0` mean DeepSet outperforms the baseline on average.
+- `ratio_model_ols`: `mean_model_mse / mean_ols_mse`; values below `1.0` mean MODEL3 ICL outperforms the baseline on average.
 - `count`: number of evaluated tasks in each aggregate row.
 
-When interpreting generalization, emphasize that the main research question is whether DeepSet achieves lower MSE than the fixed linear baseline on unseen tasks sampled from the same synthetic task family.
+When interpreting generalization, emphasize that the main research question is whether the MODEL3 ICL model (`DeepSetICLModel`) achieves lower MSE than the fixed linear baseline on unseen tasks sampled from the same synthetic task family.
 
 ## Describe The Baseline Correctly
 
@@ -325,7 +327,7 @@ Explain it as:
 - Ridge regression with fixed L2 penalty `lambda = 1`
 - Closed-form estimator `(X^T X + I)^(-1) X^T y`
 - No hyperparameter tuning
-- Evaluated on the same unseen test tasks as DeepSet
+- Evaluated on the same unseen test tasks as MODEL3 ICL
 - Compared using MSE against the noiseless target `betaX_test`
 
 If you mention the code variable names, clarify that `ols_mse` and `mean_ols_mse` are legacy labels for this fixed ridge baseline.
@@ -335,7 +337,7 @@ If you mention the code variable names, clarify that `ols_mse` and `mean_ols_mse
 Include these caveats when discussing the current evaluation:
 - The evaluation target is `betaX_test`, the noiseless linear signal, not the noisy observed response.
 - The baseline is a fixed ridge model, not tuned ridge and not exact OLS.
-- The current report provides MSE summaries and the DeepSet-to-baseline ratio, but not confidence intervals, hypothesis tests, RMSE, MAE, R-squared, or calibration metrics.
+- The current report provides MSE summaries and the MODEL3 ICL-to-baseline ratio, but not confidence intervals, hypothesis tests, RMSE, MAE, R-squared, or calibration metrics.
 - The permutation checks validate symmetry and equivariance properties of the architecture; they do not themselves measure predictive generalization.
 
 ## Preferred Phrasing
@@ -344,18 +346,18 @@ Prefer wording like:
 - "The pipeline has three phases: pre-training with default hyperparameters writes `pretrain.pt`; HPO fine-tunes from `pretrain.pt` to find the best config; final training fine-tunes from `pretrain.pt` with `best_config.json` to produce `best.pt`."
 - "`CHECKPOINT_OUTPUT_NAME=pretrain.pt` in Phase 1 and `CHECKPOINT_OUTPUT_NAME=best.pt` (default) in Phase 3 distinguish the two `train.py` invocations."
 - "HPO warm-start is mandatory: every trial loads `@MODEL_STAGE/checkpoints/pretrain.pt`, and missing, inaccessible, or architecture-mismatched checkpoints fail the run."
-- "DeepSet is trained over many synthetic regression tasks stored as parquet meta-datasets."
+- "The MODEL3 ICL model (`DeepSetICLModel`) is trained over many synthetic regression tasks stored as parquet meta-datasets."
 - "`run_training_pipeline()` submits only HPO and training; `run_evaluation_pipeline()` separately consumes `@MODEL_STAGE/checkpoints/best.pt` for synthetic evaluation and benchmarks."
 - "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
 - "HPO runs RandomSearch over `lr`, `weight_decay`, and `dropout`: it selects a deterministic balanced subset from `META_DATASET_INDEX`, enforces `max(p) <= 128` and `max(n_train) <= 256`, then runs 20 trials (20 concurrent, 1 round on 5 GPU_NV_M nodes) using fixed `d_phi=128`, `d_rho=256`, and `pool='pna'`."
 - "The compute pool uses `DEEPSET_GPU_POOL` with `MAX_NODES = 10` for 5-node HPO and 10-node DDP training; this can exceed the earlier $5/hr budget cap."
-- "Generalization is assessed by comparing DeepSet test MSE against a fixed ridge-regression baseline on unseen datasets."
-- "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for DeepSet than for the baseline."
+- "Generalization is assessed by comparing MODEL3 ICL test MSE against a fixed ridge-regression baseline on unseen datasets."
+- "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for MODEL3 ICL than for the baseline."
 - "All m test rows are passed to the model in a single batched forward call; the model returns a vector of m scalar predictions."
 - "The DataLoader prefetches Parquet files across 4 worker processes so the A10G GPU is never waiting for data."
 - "phi maps each (y_i, x_ij, x_test_j) triple into a d_phi-dimensional embedding; d_phi must be at least as large as the number of features to preserve set information."
 - "PNA pooling (sum + mean + max + std) prevents multiset collisions that would cause distinct training contexts to share the same latent representation."
-- "SAB (Self-Attention Block) replaces the simple linear equivariance layer; features attend to each other before feature pooling, and samples attend to each other before sample pooling."
+- "`ExchangeableMatrixBlock` performs joint row-and-column equivariant attention over H: (m, n, p, d_phi); `n_sab_feat` blocks are applied."
 - "All hyperparameters are bundled in ModelConfig and stored alongside the checkpoint, making the architecture fully reproducible from best.pt alone."
 - "Feature and target normalization are applied per-context inside forward(), using statistics computed from X_train and y_train of the current task."
 - "Use pool='multipool' to ablate all aggregation statistics simultaneously."
@@ -367,9 +369,9 @@ Avoid wording like:
 - Per-row iteration language such as "for each test row k, the model predicts X_test[k]" — the model uses batched forward.
 - "mean pooling" as the sole descriptor — the model uses PNA (four aggregation statistics).
 - Claiming d_phi=64 or d_rho=64 are the defaults — they were raised to 128 and 256.
-- Describing the equivariance as a "scalar linear layer" or "λ/γ scaling" — the model uses SAB by default (n_sab_feat=1, n_sab_samp=1).
-- Instantiating the model with flat kwargs `DeepSetModel(d_phi=128, ...)` in new code — always use `DeepSetModel(cfg=ModelConfig(...))`.
-- Describing "best.pt" as a plain state dict — it now stores {"state_dict": ..., "cfg": ...}.
+- Describing the equivariance as a "scalar linear layer" or "λ/γ scaling" — the model uses `ExchangeableMatrixBlock` by default (n_sab_feat=1).
+- Instantiating the model directly as `DeepSetICLModel(cfg=cfg)` or `DeepSetCompletionModel(cfg=cfg)` — always use `_instantiate_model(cfg)` from `model.py`.
+- Describing "best.pt" as a plain state dict — it now stores `{"state_dict": ..., "cfg": ..., "checkpoint_format_version": 4, "metadata": {...}}`.
 - Describing training as single-GPU after this change.
 - Running `run_training_job.py` from the local machine or describing it as a locally-executed script — it runs as a Snowpark stored procedure handler inside Snowflake.
 - Citing `GPU_NV_L` as required for the default runbook; current guidance uses

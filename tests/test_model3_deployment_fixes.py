@@ -1,10 +1,10 @@
 """
 tests/test_model3_deployment_fixes.py
 
-Tests for MODEL3 Snowflake deployment audit fixes:
-  Fix 1  - train.py passes model_arch_version + model3_design_pattern into ModelConfig
+Tests for MODEL3 Snowflake deployment:
+  Fix 1  - train.py hardcodes MODEL_ARCH_VERSION="model3" + passes model_design_pattern
   Fix 2  - hpo.py passes selectors into ModelConfig; transductive_completion guard
-  Fix 3  - launcher scripts propagate DEEPSET_MODEL_FAMILY in env_vars
+  Fix 3  - launcher scripts propagate MODEL_FAMILY without retired env vars
   Fix 6  - deepset_inference.py MODEL3-aware memory estimator
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import importlib
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,7 +42,7 @@ _pyarrow_mock = MagicMock()
 _pyarrow_mock.__version__ = "0.0.0"
 sys.modules.setdefault("pyarrow", _pyarrow_mock)
 sys.modules.setdefault("pyarrow.parquet", MagicMock())
-# NOTE: deepset_inference is NOT mocked here — TestModel3MemoryEstimator needs the real module.
+# NOTE: deepset_inference is NOT mocked here; TestModelMemoryEstimator needs the real module.
 
 
 # ---------------------------------------------------------------------------
@@ -50,76 +50,53 @@ sys.modules.setdefault("pyarrow.parquet", MagicMock())
 # ---------------------------------------------------------------------------
 
 class TestTrainModelConfigSelectors:
-    def test_model_arch_version_constant_defaults_to_model2(self):
-        """MODEL_ARCH_VERSION defaults to 'model2' preserving MODEL2 behavior."""
-        import train
-        importlib.reload(train)
-        assert train.MODEL_ARCH_VERSION == "model2"
-
-    def test_model3_design_pattern_constant_defaults_to_inductive(self):
-        """MODEL3_DESIGN_PATTERN defaults to 'inductive_forecasting'."""
-        import train
-        importlib.reload(train)
-        assert train.MODEL3_DESIGN_PATTERN == "inductive_forecasting"
-
-    def test_model_arch_version_env_override(self, monkeypatch):
-        """MODEL_ARCH_VERSION can be overridden via env var."""
-        monkeypatch.setenv("MODEL_ARCH_VERSION", "model3")
+    def test_model_arch_version_constant_is_model3(self):
+        """MODEL_ARCH_VERSION is hardcoded to 'model3'."""
         import train
         importlib.reload(train)
         assert train.MODEL_ARCH_VERSION == "model3"
-        monkeypatch.delenv("MODEL_ARCH_VERSION", raising=False)
-        importlib.reload(train)
 
-    def test_model3_design_pattern_env_override(self, monkeypatch):
-        """MODEL3_DESIGN_PATTERN can be overridden via env var."""
-        monkeypatch.setenv("MODEL3_DESIGN_PATTERN", "transductive_completion")
+    def test_model_design_pattern_constant_defaults_to_inductive(self):
+        """MODEL_DESIGN_PATTERN defaults to 'inductive_forecasting'."""
         import train
         importlib.reload(train)
-        assert train.MODEL3_DESIGN_PATTERN == "transductive_completion"
-        monkeypatch.delenv("MODEL3_DESIGN_PATTERN", raising=False)
+        assert train.MODEL_DESIGN_PATTERN == "inductive_forecasting"
+
+    def test_model_design_pattern_env_override(self, monkeypatch):
+        """MODEL_DESIGN_PATTERN can be overridden via env var."""
+        monkeypatch.setenv("MODEL_DESIGN_PATTERN", "transductive_completion")
+        import train
+        importlib.reload(train)
+        assert train.MODEL_DESIGN_PATTERN == "transductive_completion"
+        monkeypatch.delenv("MODEL_DESIGN_PATTERN", raising=False)
         importlib.reload(train)
 
-    def test_invalid_model_arch_version_raises(self, monkeypatch):
-        """Invalid MODEL_ARCH_VERSION raises ValueError at module load."""
-        monkeypatch.setenv("MODEL_ARCH_VERSION", "model99")
-        with pytest.raises(ValueError, match="MODEL_ARCH_VERSION"):
-            import train
-            importlib.reload(train)
-        monkeypatch.delenv("MODEL_ARCH_VERSION", raising=False)
+    def test_model_family_constant_defaults_to_icl(self):
+        """MODEL_FAMILY defaults to 'market_exchangeable_icl'."""
+        import train
         importlib.reload(train)
+        assert train.MODEL_FAMILY == "market_exchangeable_icl"
 
-    def test_modelconfig_built_with_arch_version_from_env(self, monkeypatch):
-        """ModelConfig construction pattern from train.py includes model_arch_version."""
+    def test_modelconfig_built_with_model3_selectors(self):
+        """ModelConfig construction pattern from train.py uses MODEL3 selectors."""
         import train
         importlib.reload(train)
         from model import ModelConfig
         # Simulate what train_fn() does when building cfg
-        model_family = "market_aware"
         hyper_params = {}
-        _arch_version = hyper_params.get("model_arch_version", train.MODEL_ARCH_VERSION)
-        _design_pattern = hyper_params.get("model3_design_pattern", train.MODEL3_DESIGN_PATTERN)
+        model_family = hyper_params.get("model_family", train.MODEL_FAMILY)
+        _design_pattern = hyper_params.get("model_design_pattern", train.MODEL_DESIGN_PATTERN)
         cfg = ModelConfig(
             d_phi=128, d_rho=256, pool="pna",
-            n_heads=4, n_sab_feat=1, n_sab_samp=1,
+            n_heads=4, n_sab_feat=1,
             norm_feat=True, norm_target=True, dropout=0.1,
             model_family=model_family,
-            model_arch_version=_arch_version,
-            model3_design_pattern=_design_pattern,
+            model_arch_version="model3",
+            model_design_pattern=_design_pattern,
         )
-        assert cfg.model_arch_version == "model2"
-        assert cfg.model3_design_pattern == "inductive_forecasting"
-
-    def test_best_config_model_arch_version_overrides_env(self, monkeypatch):
-        """hyper_params.get('model_arch_version') takes precedence over env constant."""
-        monkeypatch.setenv("MODEL_ARCH_VERSION", "model2")
-        import train
-        importlib.reload(train)
-        hyper_params = {"model_arch_version": "model3", "model_family": "market_exchangeable_icl"}
-        _arch_version = hyper_params.get("model_arch_version", train.MODEL_ARCH_VERSION)
-        assert _arch_version == "model3"
-        monkeypatch.delenv("MODEL_ARCH_VERSION", raising=False)
-        importlib.reload(train)
+        assert cfg.model_arch_version == "model3"
+        assert cfg.model_design_pattern == "inductive_forecasting"
+        assert cfg.model_family == "market_exchangeable_icl"
 
 
 # ---------------------------------------------------------------------------
@@ -127,64 +104,49 @@ class TestTrainModelConfigSelectors:
 # ---------------------------------------------------------------------------
 
 class TestHpoModelConfigSelectors:
-    def test_hpo_model_arch_version_defaults_to_model2(self):
-        """hpo.MODEL_ARCH_VERSION defaults to 'model2'."""
-        import hpo
-        importlib.reload(hpo)
-        assert hpo.MODEL_ARCH_VERSION == "model2"
-
-    def test_hpo_model3_design_pattern_defaults_to_inductive(self):
-        """hpo.MODEL3_DESIGN_PATTERN defaults to 'inductive_forecasting'."""
-        import hpo
-        importlib.reload(hpo)
-        assert hpo.MODEL3_DESIGN_PATTERN == "inductive_forecasting"
-
-    def test_hpo_model_arch_version_env_override(self, monkeypatch):
-        """HPO MODEL_ARCH_VERSION is read from env var."""
-        monkeypatch.setenv("MODEL_ARCH_VERSION", "model3")
+    def test_hpo_model_arch_version_constant_is_model3(self):
+        """hpo.MODEL_ARCH_VERSION is hardcoded to 'model3'."""
         import hpo
         importlib.reload(hpo)
         assert hpo.MODEL_ARCH_VERSION == "model3"
-        monkeypatch.delenv("MODEL_ARCH_VERSION", raising=False)
-        importlib.reload(hpo)
 
-    def test_hpo_modelconfig_receives_arch_version(self, monkeypatch):
-        """ModelConfig built by HPO worker includes model_arch_version."""
-        monkeypatch.setenv("MODEL_ARCH_VERSION", "model3")
-        monkeypatch.setenv("DEEPSET_MODEL_FAMILY", "market_exchangeable_icl")
-        monkeypatch.setenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+    def test_hpo_model_design_pattern_defaults_to_inductive(self):
+        """hpo.MODEL_DESIGN_PATTERN defaults to 'inductive_forecasting'."""
+        import hpo
+        importlib.reload(hpo)
+        assert hpo.MODEL_DESIGN_PATTERN == "inductive_forecasting"
+
+    def test_hpo_model_family_defaults_to_icl(self):
+        """hpo.MODEL_FAMILY defaults to 'market_exchangeable_icl'."""
+        import hpo
+        importlib.reload(hpo)
+        assert hpo.MODEL_FAMILY == "market_exchangeable_icl"
+
+    def test_hpo_modelconfig_receives_model3_selectors(self, monkeypatch):
+        """ModelConfig built by HPO worker includes MODEL3 selectors."""
+        monkeypatch.setenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
         import hpo
         importlib.reload(hpo)
         from model import ModelConfig
-        # N_HEADS/N_SAB_FEAT/N_SAB_SAMP/NORM_FEAT/NORM_TARGET are imported from train.py
-        # inside the Ray worker function, not at hpo module level. Use literal values
-        # matching train.py defaults to simulate the worker cfg construction.
         cfg = ModelConfig(
             d_phi=hpo.FIXED_D_PHI, d_rho=hpo.FIXED_D_RHO, pool=hpo.FIXED_POOL,
-            n_heads=4, n_sab_feat=1, n_sab_samp=1,
+            n_heads=4, n_sab_feat=1,
             norm_feat=True, norm_target=True, dropout=0.1,
-            model_family=hpo.HPO_MODEL_FAMILY,
+            model_family=hpo.MODEL_FAMILY,
             model_arch_version=hpo.MODEL_ARCH_VERSION,
-            model3_design_pattern=hpo.MODEL3_DESIGN_PATTERN,
+            model_design_pattern=hpo.MODEL_DESIGN_PATTERN,
         )
         assert cfg.model_arch_version == "model3"
         assert cfg.model_family == "market_exchangeable_icl"
-        monkeypatch.delenv("MODEL_ARCH_VERSION", raising=False)
-        monkeypatch.delenv("DEEPSET_MODEL_FAMILY", raising=False)
-        monkeypatch.delenv("MODEL3_DESIGN_PATTERN", raising=False)
+        monkeypatch.delenv("MODEL_DESIGN_PATTERN", raising=False)
         importlib.reload(hpo)
 
     def test_hpo_best_config_includes_model_arch_version(self):
         """best_config dict produced by hpo.py includes model_arch_version."""
         import hpo
         importlib.reload(hpo)
-        # The best_config dict construction uses MODEL_ARCH_VERSION
-        best_config_expected_keys = {"lr", "weight_decay", "d_phi", "d_rho", "dropout",
-                                      "pool", "model_family", "model_arch_version",
-                                      "model3_design_pattern"}
-        # Verify that the keys are referenced correctly
         assert hasattr(hpo, "MODEL_ARCH_VERSION")
-        assert hasattr(hpo, "MODEL3_DESIGN_PATTERN")
+        assert hasattr(hpo, "MODEL_DESIGN_PATTERN")
 
 
 # ---------------------------------------------------------------------------
@@ -194,33 +156,33 @@ class TestHpoModelConfigSelectors:
 class TestHpoTransductiveCompletionGuard:
     def test_transductive_guard_message_is_informative(self, monkeypatch):
         """The guard ValueError message references the issue and the fix."""
-        monkeypatch.setenv("MODEL3_DESIGN_PATTERN", "transductive_completion")
+        monkeypatch.setenv("MODEL_DESIGN_PATTERN", "transductive_completion")
         import hpo
         importlib.reload(hpo)
 
         # Simulate the guard check in hpo.main() before tune.run()
-        if hpo.MODEL3_DESIGN_PATTERN == "transductive_completion":
+        if hpo.MODEL_DESIGN_PATTERN == "transductive_completion":
             with pytest.raises(ValueError, match="transductive_completion"):
                 raise ValueError(
-                    "HPO does not support MODEL3_DESIGN_PATTERN='transductive_completion'. "
+                    "HPO does not support MODEL_DESIGN_PATTERN='transductive_completion'. "
                     "Transductive completion requires a different training objective."
                 )
-        monkeypatch.delenv("MODEL3_DESIGN_PATTERN", raising=False)
+        monkeypatch.delenv("MODEL_DESIGN_PATTERN", raising=False)
         importlib.reload(hpo)
 
     def test_inductive_forecasting_does_not_trigger_guard(self, monkeypatch):
         """inductive_forecasting does not trigger the transductive_completion guard."""
-        monkeypatch.setenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+        monkeypatch.setenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
         import hpo
         importlib.reload(hpo)
         # Should not raise
-        assert hpo.MODEL3_DESIGN_PATTERN != "transductive_completion"
-        monkeypatch.delenv("MODEL3_DESIGN_PATTERN", raising=False)
+        assert hpo.MODEL_DESIGN_PATTERN != "transductive_completion"
+        monkeypatch.delenv("MODEL_DESIGN_PATTERN", raising=False)
         importlib.reload(hpo)
 
 
 # ---------------------------------------------------------------------------
-# Fix 3: Launcher scripts propagate DEEPSET_MODEL_FAMILY
+# Fix 3: Launcher scripts propagate MODEL_FAMILY
 # ---------------------------------------------------------------------------
 
 class TestLauncherEnvVarPropagation:
@@ -229,65 +191,69 @@ class TestLauncherEnvVarPropagation:
         import run_pretrain_job
         assert hasattr(run_pretrain_job, "os") or "os" in dir(run_pretrain_job)
 
-    def test_run_pretrain_job_has_deepset_model_family_constant(self):
-        """run_pretrain_job.py defines DEFAULT_DEEPSET_MODEL_FAMILY."""
+    def test_run_pretrain_job_has_model_family_constant(self):
+        """run_pretrain_job.py defines DEFAULT_MODEL_FAMILY."""
         import run_pretrain_job
-        assert hasattr(run_pretrain_job, "DEFAULT_DEEPSET_MODEL_FAMILY")
-        assert run_pretrain_job.DEFAULT_DEEPSET_MODEL_FAMILY == "market_aware"
+        assert hasattr(run_pretrain_job, "DEFAULT_MODEL_FAMILY")
+        assert run_pretrain_job.DEFAULT_MODEL_FAMILY == "market_exchangeable_icl"
+
+    def test_run_pretrain_job_has_no_deepset_model_family_constant(self):
+        """run_pretrain_job.py must not define the retired default-family constant."""
+        import run_pretrain_job
+        assert not hasattr(run_pretrain_job, "DEFAULT_" + "DEEPSET" + "_MODEL_FAMILY")
 
     def test_run_pretrain_job_has_training_data_family_constant(self):
         """run_pretrain_job.py defines DEFAULT_TRAINING_DATA_FAMILY."""
         import run_pretrain_job
         assert hasattr(run_pretrain_job, "DEFAULT_TRAINING_DATA_FAMILY")
 
-    def test_run_pretrain_job_has_model_arch_version_constant(self):
-        """run_pretrain_job.py defines DEFAULT_MODEL_ARCH_VERSION."""
+    def test_run_pretrain_job_has_no_model_arch_version_constant(self):
+        """run_pretrain_job.py must NOT define DEFAULT_MODEL_ARCH_VERSION (hardcoded in train.py)."""
         import run_pretrain_job
-        assert hasattr(run_pretrain_job, "DEFAULT_MODEL_ARCH_VERSION")
-        assert run_pretrain_job.DEFAULT_MODEL_ARCH_VERSION == "model2"
+        assert not hasattr(run_pretrain_job, "DEFAULT_MODEL_ARCH_VERSION")
 
-    def test_run_pretrain_job_has_model3_design_pattern_constant(self):
-        """run_pretrain_job.py defines DEFAULT_MODEL3_DESIGN_PATTERN."""
+    def test_run_pretrain_job_has_model_design_pattern_constant(self):
+        """run_pretrain_job.py defines DEFAULT_MODEL_DESIGN_PATTERN."""
         import run_pretrain_job
-        assert hasattr(run_pretrain_job, "DEFAULT_MODEL3_DESIGN_PATTERN")
+        assert hasattr(run_pretrain_job, "DEFAULT_MODEL_DESIGN_PATTERN")
 
-    def test_run_pretrain_job_has_m3_handler(self):
-        """run_pretrain_job.py defines run_pretrain_pipeline_m3 (parameterized overload)."""
+    def test_run_pretrain_job_has_model_handler(self):
+        """run_pretrain_job.py defines run_pretrain_pipeline_model (parameterized overload)."""
         import run_pretrain_job
-        assert hasattr(run_pretrain_job, "run_pretrain_pipeline_m3")
-        assert callable(run_pretrain_job.run_pretrain_pipeline_m3)
+        assert hasattr(run_pretrain_job, "run_pretrain_pipeline_model")
+        assert callable(run_pretrain_job.run_pretrain_pipeline_model)
 
-    def test_run_hpo_job_has_deepset_model_family_constant(self):
-        """run_hpo_job.py defines DEFAULT_DEEPSET_MODEL_FAMILY."""
+    def test_run_hpo_job_has_model_family_constant(self):
+        """run_hpo_job.py defines DEFAULT_MODEL_FAMILY."""
         import run_hpo_job
-        assert hasattr(run_hpo_job, "DEFAULT_DEEPSET_MODEL_FAMILY")
-        assert run_hpo_job.DEFAULT_DEEPSET_MODEL_FAMILY == "market_aware"
+        assert hasattr(run_hpo_job, "DEFAULT_MODEL_FAMILY")
+        assert run_hpo_job.DEFAULT_MODEL_FAMILY == "market_exchangeable_icl"
 
-    def test_run_hpo_job_has_m3_handler(self):
-        """run_hpo_job.py defines run_hpo_pipeline_m3 (parameterized overload)."""
+    def test_run_hpo_job_has_model_handler(self):
+        """run_hpo_job.py defines run_hpo_pipeline_model (parameterized overload)."""
         import run_hpo_job
-        assert hasattr(run_hpo_job, "run_hpo_pipeline_m3")
-        assert callable(run_hpo_job.run_hpo_pipeline_m3)
+        assert hasattr(run_hpo_job, "run_hpo_pipeline_model")
+        assert callable(run_hpo_job.run_hpo_pipeline_model)
 
-    def test_run_model_training_job_has_deepset_model_family_constant(self):
-        """run_model_training_job.py defines DEFAULT_DEEPSET_MODEL_FAMILY."""
+    def test_run_model_training_job_has_model_family_constant(self):
+        """run_model_training_job.py defines DEFAULT_MODEL_FAMILY."""
         import run_model_training_job
-        assert hasattr(run_model_training_job, "DEFAULT_DEEPSET_MODEL_FAMILY")
-        assert run_model_training_job.DEFAULT_DEEPSET_MODEL_FAMILY == "market_aware"
+        assert hasattr(run_model_training_job, "DEFAULT_MODEL_FAMILY")
+        assert run_model_training_job.DEFAULT_MODEL_FAMILY == "market_exchangeable_icl"
 
-    def test_run_training_job_has_deepset_model_family_constant(self):
-        """run_training_job.py defines DEFAULT_DEEPSET_MODEL_FAMILY."""
+    def test_run_training_job_has_model_family_constant(self):
+        """run_training_job.py defines DEFAULT_MODEL_FAMILY."""
         import run_training_job
-        assert hasattr(run_training_job, "DEFAULT_DEEPSET_MODEL_FAMILY")
-        assert run_training_job.DEFAULT_DEEPSET_MODEL_FAMILY == "market_aware"
+        assert hasattr(run_training_job, "DEFAULT_MODEL_FAMILY")
+        assert run_training_job.DEFAULT_MODEL_FAMILY == "market_exchangeable_icl"
 
-    def test_deepset_model_family_env_override_propagates(self, monkeypatch):
-        """DEEPSET_MODEL_FAMILY env var overrides DEFAULT_DEEPSET_MODEL_FAMILY."""
-        monkeypatch.setenv("DEEPSET_MODEL_FAMILY", "market_exchangeable_icl")
+    def test_model_family_env_override_propagates(self, monkeypatch):
+        """MODEL_FAMILY env var overrides DEFAULT_MODEL_FAMILY."""
+        monkeypatch.setenv("MODEL_FAMILY", "market_exchangeable_completion")
         import run_pretrain_job
         importlib.reload(run_pretrain_job)
-        assert run_pretrain_job.DEFAULT_DEEPSET_MODEL_FAMILY == "market_exchangeable_icl"
-        monkeypatch.delenv("DEEPSET_MODEL_FAMILY", raising=False)
+        assert run_pretrain_job.DEFAULT_MODEL_FAMILY == "market_exchangeable_completion"
+        monkeypatch.delenv("MODEL_FAMILY", raising=False)
         importlib.reload(run_pretrain_job)
 
 
@@ -295,7 +261,7 @@ class TestLauncherEnvVarPropagation:
 # Fix 6: MODEL3-aware memory estimator
 # ---------------------------------------------------------------------------
 
-class TestModel3MemoryEstimator:
+class TestModelMemoryEstimator:
     def test_model3_estimate_function_exists(self):
         """estimate_model3_icl_gpu_inference_bytes function exists."""
         from deepset_inference import estimate_model3_icl_gpu_inference_bytes
@@ -382,3 +348,61 @@ class TestModel3MemoryEstimator:
         # Old call signature: no model kwarg
         reason, est = deepset_gpu_memory_skip_reason(X_train, X_test, device)
         assert reason is None  # cpu device → always None
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 (new): run_model_training_model routes via impl without mutating os.environ
+# ---------------------------------------------------------------------------
+
+class TestRunModelTrainingImplRouting:
+    def test_impl_function_exists(self):
+        """run_model_training_job._run_model_training_impl exists."""
+        import run_model_training_job
+        assert hasattr(run_model_training_job, "_run_model_training_impl")
+        assert callable(run_model_training_job._run_model_training_impl)
+
+    def test_run_model_training_calls_impl_with_defaults(self, monkeypatch):
+        """run_model_training delegates to _run_model_training_impl with DEFAULT_ constants."""
+        import run_model_training_job
+        importlib.reload(run_model_training_job)
+        mock_session = MagicMock()
+
+        with patch.object(run_model_training_job, "_run_model_training_impl",
+                          return_value="ok") as mock_impl:
+            run_model_training_job.run_model_training(mock_session)
+            mock_impl.assert_called_once_with(
+                mock_session,
+                run_model_training_job.DEFAULT_MODEL_FAMILY,
+                run_model_training_job.DEFAULT_TRAINING_DATA_FAMILY,
+                run_model_training_job.DEFAULT_MODEL_DESIGN_PATTERN,
+            )
+
+    def test_run_model_training_model_calls_impl_with_explicit_args(self):
+        """run_model_training_model calls _run_model_training_impl with the exact supplied args."""
+        import run_model_training_job
+        importlib.reload(run_model_training_job)
+        mock_session = MagicMock()
+
+        with patch.object(run_model_training_job, "_run_model_training_impl",
+                          return_value="ok") as mock_impl:
+            run_model_training_job.run_model_training_model(
+                mock_session, "fam", "data", "pat"
+            )
+            mock_impl.assert_called_once_with(mock_session, "fam", "data", "pat")
+
+    def test_run_model_training_model_does_not_mutate_environ(self, monkeypatch):
+        """run_model_training_model does not set os.environ['MODEL_FAMILY']."""
+        import run_model_training_job
+        importlib.reload(run_model_training_job)
+        mock_session = MagicMock()
+
+        original_family = os.environ.get("MODEL_FAMILY", "__NOT_SET__")
+        with patch.object(run_model_training_job, "_run_model_training_impl",
+                          return_value="ok"):
+            run_model_training_job.run_model_training_model(
+                mock_session, "explicit_fam", "explicit_data", "explicit_pat"
+            )
+        after_family = os.environ.get("MODEL_FAMILY", "__NOT_SET__")
+        assert after_family == original_family, (
+            f"os.environ['MODEL_FAMILY'] was mutated: {original_family!r} → {after_family!r}"
+        )

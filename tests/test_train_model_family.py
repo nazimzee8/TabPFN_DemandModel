@@ -1,7 +1,7 @@
 """
 tests/test_train_model_family.py
 
-Tests for Phase 1: MarketAwareDeepSetModel as production default in train.py.
+Tests for MODEL3 (DeepSetICLModel) as production default in train.py.
 All tests mock DDP, Snowflake I/O, and DataLoader to avoid real infrastructure.
 """
 from __future__ import annotations
@@ -20,20 +20,19 @@ if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
 
-def test_default_model_family_constant_is_market_aware():
-    """DEEPSET_MODEL_FAMILY module constant defaults to 'market_aware'."""
+def test_default_model_family_constant_is_market_exchangeable_icl():
+    """MODEL_FAMILY module constant defaults to 'market_exchangeable_icl'."""
     import train
-    # Reload in case a previous test mutated the environment
-    assert train.DEEPSET_MODEL_FAMILY == "market_aware"
+    assert train.MODEL_FAMILY == "market_exchangeable_icl"
 
 
-def test_env_deepset_overrides_default(monkeypatch):
-    """Setting DEEPSET_MODEL_FAMILY=deepset env var overrides the default."""
-    monkeypatch.setenv("DEEPSET_MODEL_FAMILY", "deepset")
+def test_env_model_family_overrides_default(monkeypatch):
+    """Setting MODEL_FAMILY env var to 'market_exchangeable_completion' overrides the default."""
+    monkeypatch.setenv("MODEL_FAMILY", "market_exchangeable_completion")
     import importlib
     import train
     importlib.reload(train)
-    assert train.DEEPSET_MODEL_FAMILY == "deepset"
+    assert train.MODEL_FAMILY == "market_exchangeable_completion"
     # Restore
     importlib.reload(train)
 
@@ -66,10 +65,14 @@ def test_checkpoint_metadata_includes_task_type_and_training_entrypoint(monkeypa
     # Build a minimal cfg and model
     from model import ModelConfig, _instantiate_model
     cfg = ModelConfig(
-        model_family="market_aware",
-        d_sample=32,
-        n_sab_feat=1,
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=64,
+        d_rho=128,
+        pool="pna",
         n_heads=4,
+        n_sab_feat=1,
         norm_feat=True,
         norm_target=True,
         dropout=0.0,
@@ -80,7 +83,7 @@ def test_checkpoint_metadata_includes_task_type_and_training_entrypoint(monkeypa
     import dataclasses as _dc
     checkpoint_output_name = os.path.join(tmp_dir, "ckpt.pt")
     torch.save({
-        "checkpoint_format_version": 3,
+        "checkpoint_format_version": 4,
         "cfg": _dc.asdict(model.cfg),
         "state_dict": model.state_dict(),
         "metadata": {
@@ -98,19 +101,20 @@ def test_checkpoint_metadata_includes_task_type_and_training_entrypoint(monkeypa
     assert loaded["metadata"]["task_type"] == "regression"
     assert loaded["metadata"]["training_entrypoint"] == "train.py"
     assert "training_data_family" in loaded["metadata"]
+    assert loaded["checkpoint_format_version"] == 4
 
 
-def test_best_config_model_family_deepset_overrides_default(monkeypatch):
-    """When BEST_CONFIG has model_family=deepset, the cfg uses deepset."""
+def test_best_config_model_family_overrides_default(monkeypatch):
+    """When BEST_CONFIG has model_family=market_exchangeable_completion, the cfg uses it."""
     import json
     import importlib
     import train
     importlib.reload(train)
 
-    best_config = {"model_family": "deepset"}
+    best_config = {"model_family": "market_exchangeable_completion"}
     hyper_params = best_config
-    model_family = hyper_params.get("model_family", train.DEEPSET_MODEL_FAMILY)
-    assert model_family == "deepset"
+    model_family = hyper_params.get("model_family", train.MODEL_FAMILY)
+    assert model_family == "market_exchangeable_completion"
 
 
 def test_checkpoint_metadata_includes_training_metrics():
@@ -122,10 +126,14 @@ def test_checkpoint_metadata_includes_training_metrics():
 
     from model import ModelConfig, _instantiate_model
     cfg = ModelConfig(
-        model_family="market_aware",
-        d_sample=32,
-        n_sab_feat=1,
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=64,
+        d_rho=128,
+        pool="pna",
         n_heads=4,
+        n_sab_feat=1,
         norm_feat=True,
         norm_target=True,
         dropout=0.0,
@@ -137,7 +145,7 @@ def test_checkpoint_metadata_includes_training_metrics():
     tmp_dir = tempfile.mkdtemp()
     checkpoint_output_name = os.path.join(tmp_dir, "ckpt.pt")
     torch.save({
-        "checkpoint_format_version": 3,
+        "checkpoint_format_version": 4,
         "cfg": _dc.asdict(model.cfg),
         "state_dict": model.state_dict(),
         "metadata": {

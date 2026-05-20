@@ -762,9 +762,9 @@ psi.layers.2.weight   psi.layers.2.bias
 
 ```python
 import torch
-from model import DeepSetModel   # same architecture definition
+from model import retired MODEL1 model   # same architecture definition
 
-model = DeepSetModel(d_phi=64, d_rho=64)
+model = retired MODEL1 model(d_phi=64, d_rho=64)
 model.load_state_dict(torch.load("best.pt", map_location="cpu"))
 model.eval()
 

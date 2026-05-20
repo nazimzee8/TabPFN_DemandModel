@@ -1,14 +1,14 @@
 """
 evaluate.py
 
-Evaluate a saved DeepSetModel checkpoint:
+Evaluate a saved DeepSetICLModel checkpoint:
   1. Permutation-invariance tests (7 synthetic)
-  2. Synthetic DGP evaluation: DeepSetModel vs OLS, stratified by regime (A/B/C/D)
+  2. Synthetic DGP evaluation: MODEL3-ICL vs OLS, stratified by regime (A/B/C/D)
   3. MC dropout noise assessment on synthetic DGP
-  4. Prepared OpenML + Kaggle regression benchmark: DeepSetModel-MC vs 9 baselines
+  4. Prepared OpenML + Kaggle regression benchmark: MODEL3-ICL-MC vs 9 baselines
      (prepared manifest datasets, 10 reps, 90/10 split, <=10k samples, <=500 features, 95% CI)
      Datasets are prepared by prepare_benchmark_datasets.py before benchmark shards run.
-     Methods: DeepSetModel-MC, XGBoost, LightGBM, CatBoost, RandomForest,
+     Methods: MODEL3-ICL-MC, XGBoost, LightGBM, CatBoost, RandomForest,
               KNN, LinearRegression, Ridge, SVR, MLP, AutoGluon
 
 Usage (inside container or locally):
@@ -48,7 +48,7 @@ import autogluon_models as _autogluon_helpers
 import baseline_models as _baseline_helpers
 import deepset_inference as _deepset_helpers
 import evaluation_metrics as _metric_helpers
-from model import DeepSetModel, MarketAwareDeepSetModel, ModelConfig, POOL_SCALE, _instantiate_model
+from model import ModelConfig, POOL_SCALE, _instantiate_model
 from snowflake_io import materialize_meta_dataset_stage
 
 # SPCS home guard — redirect ~ to writable path before any Snowflake imports
@@ -165,7 +165,7 @@ BENCHMARK_DEEPSET_EMPTY_CACHE = _env_flag("BENCHMARK_DEEPSET_EMPTY_CACHE", "true
 EVAL_RESULTS_STAGE = os.environ.get("EVAL_RESULTS_STAGE", "@EVALUATION_RESULTS_STAGE")
 CHECKPOINT_STAGE = os.environ.get("CHECKPOINT_STAGE", "@MODEL_STAGE/checkpoints/")
 ALL_BENCHMARK_METHODS = [
-    "DeepSetModel-MC",
+    "MODEL3-ICL-MC",
     "XGBoost",
     "LightGBM",
     "CatBoost",
@@ -200,7 +200,7 @@ BASELINE_METHOD_DEPS = {
     "MLP": ("sklearn",),
 }
 BENCHMARK_METHOD_DEPS = {
-    "DeepSetModel-MC": ("sklearn",),
+    "MODEL3-ICL-MC": ("sklearn",),
     **BASELINE_METHOD_DEPS,
     "AutoGluon": ("sklearn",),
 }
@@ -288,23 +288,9 @@ def load_parquet(path):
 
 
 # ---------------------------------------------------------------------------
-# Dispatch helpers for equivariant layers
+# (MODEL2 dispatch helpers apply_feat_equiv / apply_samp_equiv removed —
+#  MODEL3 ExchangeableMatrixBlock is called directly inside model.forward())
 # ---------------------------------------------------------------------------
-
-def apply_feat_equiv(model, h):
-    """h: (n, p, d) → (n, p, d). Dispatches to SAB or linear equivariance."""
-    if model.cfg.n_sab_feat > 0:
-        return model.sab_feat(h)
-    mean_i = h.mean(dim=1, keepdim=True)
-    return model.lambda_feat * h + model.gamma_feat * mean_i
-
-
-def apply_samp_equiv(model, r):
-    """r: (n, d) → (n, d). Dispatches to SAB or linear equivariance."""
-    if model.cfg.n_sab_samp > 0:
-        return model.sab_samp(r.unsqueeze(0)).squeeze(0)
-    mean_j = r.mean(dim=0, keepdim=True)
-    return model.lambda_samp * r + model.gamma_samp * mean_j
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +335,16 @@ def model_config_from_payload(payload):
 
 def default_model_config():
     """
-    Canonical default config for bare state-dict checkpoints (legacy format 0).
-    Matches the defaults used during the original training run.
+    Canonical default ModelConfig used when a checkpoint carries no cfg.
+    Returns a valid MODEL3 ICL config with standard training defaults.
     """
     return ModelConfig(
         d_phi=128, d_rho=256, pool="pna", dropout=0.1,
-        n_sab_feat=0, n_sab_samp=0,
-        norm_feat=False, norm_target=False,
+        n_sab_feat=1,
+        norm_feat=True, norm_target=True,
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
     )
 
 
@@ -791,51 +780,12 @@ def run_permutation_tests(model):
             model(X_train, y_train, x_test),
             model(X_train[:, pi_col], y_train, x_test[pi_col]), atol=1e-5)
 
-        # Test 3 — sample equivariance: apply_samp_equiv(r[π]) == apply_samp_equiv(r)[π]
-        r, pi = torch.randn(n, D_RHO), torch.randperm(n)
-        results["Test 3 (sample equiv equivariance)"] = torch.allclose(
-            apply_samp_equiv(model, r[pi]),
-            apply_samp_equiv(model, r)[pi], atol=1e-5)
-
-        # Test 4 — feature equivariance: apply_feat_equiv(h[:,π,:]) == apply_feat_equiv(h)[:,π,:]
-        h, pi_feat = torch.randn(n, p, D_PHI), torch.randperm(p)
-        results["Test 4 (feature equiv equivariance)"] = torch.allclose(
-            apply_feat_equiv(model, h[:, pi_feat, :]),
-            apply_feat_equiv(model, h)[:, pi_feat, :], atol=1e-5)
-
-        # Test 5 — mean-pool after sample equiv is permutation invariant
-        r, pi = torch.randn(n, D_RHO), torch.randperm(n)
-        results["Test 5 (sample invariance after pool)"] = torch.allclose(
-            apply_samp_equiv(model, r).mean(dim=0),
-            apply_samp_equiv(model, r[pi]).mean(dim=0), atol=1e-5)
-
-        if cfg.n_sab_samp == 0:
-            # Test 6 (linear mode) — Θ = λI + γ/n·11ᵀ matrix form
-            r   = torch.randn(n, D_RHO)
-            lam = model.lambda_samp.item()
-            gam = model.gamma_samp.item()
-            theta = lam * torch.eye(n) + (gam / n) * torch.ones(n, n)
-            results["Test 6 (Theta matrix form)"] = torch.allclose(
-                apply_samp_equiv(model, r), theta @ r, atol=1e-5)
-
-            # Test 7 (linear mode) — mean after permuted equiv == mean after equiv
-            r, pi = torch.randn(n, D_RHO), torch.randperm(n)
-            results["Test 7 (mean after permuted equiv)"] = torch.allclose(
-                apply_samp_equiv(model, r[pi]).mean(dim=0),
-                apply_samp_equiv(model, r).mean(dim=0), atol=1e-5)
-        else:
-            # Test 6 (SAB mode) — SAB_samp equivariance via raw module
-            r, pi = torch.randn(n, D_RHO), torch.randperm(n)
-            rb    = r.unsqueeze(0)                  # (1, n, d_rho)
-            results["Test 6 (SAB sample equivariance)"] = torch.allclose(
-                model.sab_samp(rb[:, pi, :]).squeeze(0),
-                model.sab_samp(rb).squeeze(0)[pi], atol=1e-4)
-
-            # Test 7 (SAB mode) — SAB_feat equivariance via raw module
-            h, pi_feat = torch.randn(n, p, D_PHI), torch.randperm(p)
-            results["Test 7 (SAB feature equivariance)"] = torch.allclose(
-                model.sab_feat(h[:, pi_feat, :]),
-                model.sab_feat(h)[:, pi_feat, :], atol=1e-4)
+        # Test 3 — multi-query batch: output shape and values match single-query
+        x_batch = torch.stack([x_test, x_test])      # (2, p)
+        out_single = model(X_train, y_train, x_test)
+        out_batch  = model(X_train, y_train, x_batch)
+        results["Test 3 (batch query consistency)"] = torch.allclose(
+            out_single.expand(2), out_batch, atol=1e-5)
 
     print("\nPermutation Invariance Tests:")
     all_pass = True
@@ -1240,7 +1190,7 @@ def predict_deepset_bounded_context_ensemble(
     device=None,
 ):
     """
-    DeepSetModel-MC bounded-context benchmark prediction.
+    MODEL3-ICL-MC bounded-context benchmark prediction.
 
     Deterministic train-only contexts each predict the same full processed test
     split; predictions are averaged once before metrics are computed.
@@ -2069,8 +2019,8 @@ def run_prepared_benchmark(
     """
     selected_methods = methods or ALL_BENCHMARK_METHODS
     validate_benchmark_dependencies(selected_methods)
-    if "DeepSetModel-MC" in selected_methods and model is None:
-        raise ValueError("DeepSetModel-MC benchmark requires a loaded model.")
+    if "MODEL3-ICL-MC" in selected_methods and model is None:
+        raise ValueError("MODEL3-ICL-MC benchmark requires a loaded model.")
 
     manifest = load_prepared_benchmark_manifest(manifest_stage_path)
     datasets_meta = manifest["datasets"]
@@ -2118,7 +2068,7 @@ def run_prepared_benchmark(
 
     deepset_device = (
         deepset_inference_device()
-        if "DeepSetModel-MC" in selected_methods
+        if "MODEL3-ICL-MC" in selected_methods
         else None
     )
 
@@ -2166,7 +2116,7 @@ def run_prepared_benchmark(
                     processed_matrix_bytes,
                 )
 
-                if "DeepSetModel-MC" in selected_methods:
+                if "MODEL3-ICL-MC" in selected_methods:
                     feature_cap = resolve_deepset_feature_cap(model)
                     deepset_feature_meta = {
                         "raw_features": raw_features,
@@ -2178,24 +2128,24 @@ def run_prepared_benchmark(
                     }
                     if cpu_skip_reason:
                         print(
-                            f"  [SKIP DeepSetModel-MC] {name}: {cpu_skip_reason}",
+                            f"  [SKIP MODEL3-ICL-MC] {name}: {cpu_skip_reason}",
                             flush=True,
                         )
                         all_rows.append(skipped_benchmark_row(
                             nan_row,
-                            "DeepSetModel-MC",
+                            "MODEL3-ICL-MC",
                             cpu_skip_reason,
                             **deepset_feature_meta,
                         ))
                     elif int(X_train_p.shape[0]) < int(BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES):
                         print(
-                            f"  [FAIL DeepSetModel-MC] {name}: fewer train rows than "
+                            f"  [FAIL MODEL3-ICL-MC] {name}: fewer train rows than "
                             "non-overlapping DeepSet contexts",
                             flush=True,
                         )
                         all_rows.append({
                             **nan_row,
-                            "method": "DeepSetModel-MC",
+                            "method": "MODEL3-ICL-MC",
                             **deepset_feature_meta,
                         })
                     else:
@@ -2222,12 +2172,12 @@ def run_prepared_benchmark(
                                 deepset_feature_meta["estimated_gpu_inference_bytes"] = estimated_gpu_bytes
                             if gpu_skip_reason:
                                 print(
-                                    f"  [SKIP DeepSetModel-MC] {name}: {gpu_skip_reason}",
+                                    f"  [SKIP MODEL3-ICL-MC] {name}: {gpu_skip_reason}",
                                     flush=True,
                                 )
                                 all_rows.append(skipped_benchmark_row(
                                     nan_row,
-                                    "DeepSetModel-MC",
+                                    "MODEL3-ICL-MC",
                                     gpu_skip_reason,
                                     **deepset_feature_meta,
                                 ))
@@ -2247,23 +2197,23 @@ def run_prepared_benchmark(
                                 )
                                 m     = compute_metrics(y_test, preds)
                                 all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                                  "source": source, "method": "DeepSetModel-MC",
+                                                  "source": source, "method": "MODEL3-ICL-MC",
                                                   **m, **deepset_feature_meta})
                         except torch.cuda.OutOfMemoryError as exc:
                             if BENCHMARK_DEEPSET_EMPTY_CACHE and torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                            print(f"  [SKIP DeepSetModel-MC] {name}: cuda_oom: {exc}", flush=True)
+                            print(f"  [SKIP MODEL3-ICL-MC] {name}: cuda_oom: {exc}", flush=True)
                             all_rows.append(skipped_benchmark_row(
                                 nan_row,
-                                "DeepSetModel-MC",
+                                "MODEL3-ICL-MC",
                                 "cuda_oom",
                                 **deepset_feature_meta,
                             ))
                         except Exception as exc:
-                            print(f"  [FAIL DeepSetModel-MC] {name}: {exc}")
+                            print(f"  [FAIL MODEL3-ICL-MC] {name}: {exc}")
                             all_rows.append({
                                 **nan_row,
-                                "method": "DeepSetModel-MC",
+                                "method": "MODEL3-ICL-MC",
                                 **deepset_feature_meta,
                             })
 
@@ -2558,7 +2508,7 @@ def upload_to_snowflake(local_path: str, stage_path: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate DeepSetModel checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate DeepSetICLModel checkpoint.")
     parser.add_argument("--model_path",  default=os.environ.get("MODEL_PATH", "best.pt"),
                         help="Path to model checkpoint.")
     parser.add_argument("--data_dir",    default=os.environ.get("DATA_DIR", "/tmp/data"),
@@ -2602,7 +2552,7 @@ def main():
 
         needs_model = (
             args.mode in ("full", "synthetic")
-            or "DeepSetModel-MC" in selected_methods
+            or "MODEL3-ICL-MC" in selected_methods
         )
         model = load_model(args.model_path) if needs_model else None
 

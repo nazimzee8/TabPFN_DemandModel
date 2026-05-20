@@ -178,7 +178,7 @@ def test_evaluation_orchestrator_submits_combined_baseline_shards(monkeypatch):
     ]
     deepset_jobs = [
         c for c in eval_jobs
-        if c["env_vars"].get("BENCHMARK_METHOD") == "DeepSetModel-MC"
+        if c["env_vars"].get("BENCHMARK_METHOD") == "MODEL3-ICL-MC"
     ]
     autogluon_jobs = [
         c for c in eval_jobs
@@ -537,7 +537,7 @@ def test_evaluation_orchestrator_failed_compute_pool_fails_before_submit(monkeyp
 
 def _event_phase(ep, env):
     if ep == "evaluate.py":
-        if env.get("BENCHMARK_METHOD") == "DeepSetModel-MC": return "deepset"
+        if env.get("BENCHMARK_METHOD") == "MODEL3-ICL-MC": return "deepset"
         if env.get("BENCHMARK_METHODS"):                      return "baseline"
         if env.get("BENCHMARK_METHOD") == "AutoGluon":        return "autogluon"
         if env.get("EVAL_MODE") == "aggregate":               return "aggregate"
@@ -631,7 +631,7 @@ def test_run_deepset_evaluation_submits_synthetic_and_shards(monkeypatch):
 
     eval_jobs = [c for c in submit_calls if c["entrypoint"] == "evaluate.py"]
     synthetic = [c for c in eval_jobs if c["env_vars"].get("EVAL_MODE") == "synthetic"]
-    deepset   = [c for c in eval_jobs if c["env_vars"].get("BENCHMARK_METHOD") == "DeepSetModel-MC"]
+    deepset   = [c for c in eval_jobs if c["env_vars"].get("BENCHMARK_METHOD") == "MODEL3-ICL-MC"]
     other     = [c for c in eval_jobs if c not in synthetic and c not in deepset]
 
     assert len(synthetic) == 1

@@ -8,12 +8,12 @@ Do not delete or rename this file.
 
 ## 1. Project Overview
 
-TabPFN DemandModel is a DeepSet tabular regression model trained and evaluated entirely within
+TabPFN DemandModel is a MODEL3-ICL tabular regression model trained and evaluated entirely within
 Snowflake Snowpark Container Services (SPCS). The model is trained on synthetic linear-regression
 priors and benchmarked against ten classical baselines plus AutoGluon on both an in-distribution
 synthetic suite and an OOD parity pilot suite. The primary deliverables are model comparison
-summaries (DeepSet vs. baselines on MSE, rank, win rate) and stability charts demonstrating
-DeepSet's robustness to feature noise and consistent performance across training set sizes.
+summaries (MODEL3-ICL vs. baselines on MSE, rank, win rate) and stability charts demonstrating
+MODEL3-ICL's robustness to feature noise and consistent performance across training set sizes.
 
 ---
 
@@ -36,7 +36,7 @@ results/                Local downloaded evaluation artifacts
 
 - **Python 3.11** — Snowflake managed runtime image `2.5.0-py311`
 - **Snowflake Snowpark + SPCS MLJob API** — `submit_from_stage`, `PyTorchDistributor`
-- **PyTorch** — DeepSet model; checkpoint v2 format
+- **PyTorch** — MODEL3-ICL model; checkpoint v4 format
 - **Ray Tune** — HPO: 20 trials, 5 nodes, 4 concurrent/node (= 20 one-GPU trial slots)
 - **scikit-learn, XGBoost, LightGBM** — preinstalled in `2.5.0-py311`
 - **CatBoost `1.2.10`** — NOT preinstalled; pip-installed per baseline shard job via `TABPFN_PYPI_EAI`
@@ -47,7 +47,7 @@ results/                Local downloaded evaluation artifacts
 
 | Pool | Nodes | GPU | Purpose |
 |------|-------|-----|---------|
-| `DEEPSET_GPU_POOL` | MAX=10, GPU_NV_M | 4×A10G/node | Training, HPO, DeepSet eval shards |
+| `DEEPSET_GPU_POOL` | MAX=10, GPU_NV_M | 4×A10G/node | Training, HPO, MODEL3-ICL eval shards |
 | `DEEPSET_CPU_POOL` | MAX=3, CPU_X64_M | — | Prep, baseline shards, aggregation |
 | `AUTOGLUON_CPU_POOL` | MAX=30, CPU_X64_M | — | AutoGluon shards |
 
@@ -63,15 +63,15 @@ results/                Local downloaded evaluation artifacts
 |-------|----------|
 | `@META_DATASET_STAGE` | Benchmark metadata index + prepared `.npz` splits (`benchmark_prepared/`) |
 | `@MODEL_STAGE/scripts/` | All runnable MLJob code from `src/*.py` and `scripts/*.py` (flat, no subdirectories) |
-| `@MODEL_STAGE/hpo/` | `best_config.json` on HPO success; `hpo_failure.json` on failure |
-| `@MODEL_STAGE/checkpoints/` | `pretrain.pt`, `best.pt` (v2 format) |
+| `@MODEL_STAGE/hpo/` | `best_config_ridge_residual.json` (sweep 1), `best_config_architecture.json` (sweep 2), `best_config.json` (merged final); `hpo_failure.json` on failure |
+| `@MODEL_STAGE/checkpoints/` | `pretrain.pt`, `best.pt` (v4 format) |
 | `@EVALUATION_RESULTS_STAGE` | All evaluation output CSVs, charts, manifests |
 | `@EVALUATION_RESULTS_STAGE/regression/{suite_id}/` | Synthetic regression shard part CSVs (path scoped by `SYNREG_RESULTS_STAGE` env var) |
-| `@EVALUATION_RESULTS_STAGE/ood_parity/` | OOD pilot DeepSet-only shard part CSVs |
+| `@EVALUATION_RESULTS_STAGE/ood_parity/` | OOD pilot MODEL3-ICL-only shard part CSVs |
 | `@EVALUATION_RESULTS_STAGE/ood_full/` | OOD full suite (ood_linear_full_v1) aggregation outputs |
 | `@MLJOB_PAYLOAD_STAGE` | Ephemeral MLJob payloads (managed by `submit_from_stage`) |
-| `@EVAL_DATASET_STAGE/primary/` | In-distribution synthetic parquet files (200 datasets) |
-| `@EVAL_DATASET_STAGE/ood_parity/{E,F,G,H}/` | OOD parity source pool — 200 parquet files (50 per regime); serves both pilot (80-row subset) and full suite (all 200 rows) |
+| `@EVALUATION_DATASET_STAGE/primary/` | In-distribution synthetic parquet files (200 datasets) |
+| `@EVALUATION_DATASET_STAGE/ood_parity/{E,F,G,H}/` | OOD parity source pool — 200 parquet files (50 per regime); serves both pilot (80-row subset) and full suite (all 200 rows) |
 | `@EPOCH_STAGE` | Epoch calibration artifacts (`hpo_timing.json`, `train_timing.json`) |
 
 **Invariants:**
@@ -79,7 +79,7 @@ results/                Local downloaded evaluation artifacts
   `{suite_id}` in `SYNREG_RESULTS_STAGE`, which is an env var value, not a hardcoded string).
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands — causes silent read failures.
 - `@META_DATASET_STAGE` must never be read or written by any OOD script.
-- `@EVAL_DATASET_STAGE` must never hold production training parquet.
+- `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
 ---
 
@@ -109,14 +109,14 @@ the Snowflake prep jobs run. Their rows are indexed into the **same**
 - Generates 200 parquet files across 4 regimes (A/B/C/D, 50 per regime)
 - Default `suite_id=linear_poisson_v1_recommended`
 - Writes `generated_locally=true, format="parquet"` manifest
-- Output: `data/primary/`; stage: `@EVAL_DATASET_STAGE/primary/`
+- Output: `data/primary/`; stage: `@EVALUATION_DATASET_STAGE/primary/`
 - Extended NPZ suites (`feature_noise`, `training_size`, `target_noise`) are generated
   inside `prepare_synthetic_regression.py` in Snowflake, not here
 
 **`scripts/ood_regression/generate_ood_eval_data.py`** — OOD parity suite
 - Generates **200** parquet files (50/regime); source pool for both pilot (80 indexed) and full
   suite (200 indexed); invoke with `--n_datasets 200`
-- Output: `data/ood_regression/{E,F,G,H}/`; stage: `@EVAL_DATASET_STAGE/ood_parity/{E,F,G,H}/`
+- Output: `data/ood_regression/{E,F,G,H}/`; stage: `@EVALUATION_DATASET_STAGE/ood_parity/{E,F,G,H}/`
 - Also prints required SnowSQL PUT commands
 - `generate_ood_eval_data.py` is a local-only CLI and must **never** be staged to Snowflake
 
@@ -133,7 +133,7 @@ the Snowflake prep jobs run. Their rows are indexed into the **same**
 
 ### Step 5a — OOD pilot indexing (`prepare_ood_regression.py` — Snowflake job, pilot)
 
-- Reads OOD manifest from `@EVAL_DATASET_STAGE/ood_parity/ood_manifest.json`
+- Reads OOD manifest from `@EVALUATION_DATASET_STAGE/ood_parity/ood_manifest.json`
 - Invoked with `OOD_REGRESSION_N_DATASETS=80` (preferred; `OOD_REGRESSION_N_PILOT=80` as legacy
   fallback): inserts 80 OOD rows (20 per regime E/F/G/H) under `suite_id=ood_linear_pilot_v1`
 - Uses `DELETE WHERE suite_id=ood_linear_pilot_v1` for its own truncation; never touches
@@ -168,7 +168,7 @@ always filters `WHERE suite_id = SYNREG_SUITE_ID` — controlling which suite ru
 
 ---
 
-## 6. Model Architecture (DeepSet)
+## 6. Model Architecture (MODEL3 — DeepSetICLModel)
 
 - **Bounded-context ensemble**: 5 random context windows × 200 training rows per window
 - **MC dropout**: K=8 forward passes per (sample, window)
@@ -180,9 +180,20 @@ always filters `WHERE suite_id = SYNREG_SUITE_ID` — controlling which suite ru
 - Baselines and AutoGluon receive full un-capped feature matrices
 - Reference: `src/model.py`, `src/evaluate_synthetic_regression.py`
 
+**Gated Ridge Expert (enabled by default):**
+- `use_ridge_expert=True` by default in `ModelConfig`; prediction form: `ridge + gate × neural`
+- `ridge_lambda=1.0` (default); tuned via HPO as `tune.loguniform(1e-3, 1e1)`
+- `gate_hidden_dim=64` (default); fixed during HPO, not tuned
+- `RidgeExpert` is stateless — zero trainable parameters; no `nn.Parameter` or `nn.Module`
+- Gate sigmoid output in `(0, 1)`; gate MLP trains via gradient descent; ridge path is analytic
+- `best_config.json` always includes `use_ridge_expert`, `ridge_lambda`, `gate_hidden_dim`
+- Architecture mismatch check (in both `hpo.py` and `train.py`) includes `use_ridge_expert` and
+  `gate_hidden_dim`; a pretrain checkpoint trained with ridge expert disabled will not warm-start a
+  ridge-expert-enabled model (mismatch detected, training starts from scratch)
+
 **Permutation test gate:** `run_permutation_tests(model)` is called immediately after
 checkpoint load. If any of the 7 permutation-invariance tests fail, evaluation aborts with
-a `RuntimeError`. This gate ensures the checkpoint actually implements DeepSet invariance.
+a `RuntimeError`. This gate ensures the checkpoint actually implements MODEL3-ICL invariance.
 
 ---
 
@@ -203,7 +214,9 @@ Three-phase pipeline, each submitted as an MLJob:
   Snowpark session inside a trial worker.
 - Report metrics as `tune.report({"val_mse": value})` (dict-style); never keyword-style
 - `tune.run(metric="val_mse", mode="min")`; `best_config.json` keys: `lr, weight_decay,
-  d_phi, d_rho, dropout, pool`
+  d_phi, d_rho, dropout, pool, n_sab_feat, use_ridge_expert, ridge_lambda, gate_hidden_dim,
+  use_huber, huber_delta, lambda_l1, hpo_sweep_mode`
+- `HPO_SWEEP_MODE` controls which search space is used (see HPO sweep strategy section below)
 - Writes `@MODEL_STAGE/hpo/best_config.json`; inspect `hpo_failure.json` first on failure
 - Do not fetch Ray checkpoints directly; read only via Snowflake stage path
 
@@ -212,19 +225,19 @@ Three-phase pipeline, each submitted as an MLJob:
 - Topology: 10 nodes × 4 workers = world size 40
 - `EXPECTED_TRAIN_WORLD_SIZE=40`, `STRICT_WORLD_SIZE_CHECK=true`
 - SQL-sharded by DDP rank: `MOD(ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1, world_size) = rank`
-- Warm-starts from `pretrain.pt`; writes `@MODEL_STAGE/checkpoints/best.pt` (v2 format)
+- Warm-starts from `pretrain.pt`; writes `@MODEL_STAGE/checkpoints/best.pt` (v4 format)
 - Checkpoint loading: always use `load_checkpoint_compat()` with three fallback paths:
-  1. `weights_only=True` (preferred, v2 checkpoints)
+  1. `weights_only=True` (preferred, v4 checkpoints)
   2. `safe_globals([ModelConfig]) + weights_only=True` (legacy pickled cfg)
   3. `weights_only=False` (only if `ALLOW_UNSAFE_TORCH_LOAD=true`)
 - `ALLOW_UNSAFE_TORCH_LOAD_FOR_LEGACY_CHECKPOINTS` is currently `"true"` as a temporary
   escape hatch. Revert to `"false"` only after running `scripts/migrate_checkpoint.py`
   and verifying no `[SECURITY WARNING]` log lines appear.
 
-**Checkpoint v2 format (canonical):**
+**Checkpoint v4 format (canonical):**
 ```python
 {
-    "checkpoint_format_version": 2,
+    "checkpoint_format_version": 4,
     "cfg": dataclasses.asdict(model.cfg),   # plain dict, NOT ModelConfig instance
     "state_dict": model.state_dict(),
     "metadata": {"source": "train.py", "pytorch_version": torch.__version__, ...},
@@ -242,6 +255,103 @@ If `Failed to mmap`, `activeQueryTracker`, or `Unable to create mmap-ed active q
 appear in logs **and** Python boundary markers are absent, treat as Snowflake MLJob/Ray/
 Prometheus runtime startup failure — do not rewrite model code.
 
+### HPO sweep strategy for MODEL3-ICL with Ridge Expert
+
+`HPO_SWEEP_MODE` selects between two search spaces (set via `HPO_SWEEP_MODE` env var before job
+submission; default `ridge_residual`):
+
+| Mode | Architecture | Tuned hyperparameters |
+|------|-------------|----------------------|
+| `ridge_residual` (default) | Fixed: `d_phi=128`, `n_sab_feat=1` | `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim`, `use_huber`, `huber_delta`, `lambda_l1` |
+| `architecture` | `d_phi ∈ {64,128,192,256}`, `n_sab_feat ∈ {1,2}` | Frozen from ridge_residual baseline; only `d_phi` and `n_sab_feat` are tuned |
+
+**Sweep outputs:**
+- `best_config_ridge_residual.json` — sweep-1-specific best config (optimizer/regularization).
+- `best_config_architecture.json` — sweep-2-specific best config (architecture candidates only).
+- `best_config.json` — final merged config:
+  - After `ridge_residual`: same content as `best_config_ridge_residual.json`.
+  - After `architecture`: merged from both sweeps; `d_phi`/`n_sab_feat` from sweep 2, all
+    other params from sweep 1; `_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture`
+    record provenance.
+
+**`HPO_BASELINE_CONFIG_STAGE_PATH`:**
+Required when `HPO_SWEEP_MODE=architecture`. Must point to
+`@MODEL_STAGE/hpo/best_config_ridge_residual.json` (written by sweep 1).
+The driver downloads this config before Ray init; Ray workers never open a Snowpark session.
+
+**`_meta` structure in merged `best_config.json`:**
+```json
+{
+  "_meta": {
+    "sweeps": {
+      "ridge_residual": {
+        "stage_path": "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
+        "best_val_mse": <float>,
+        "pretrain_warm_start_policy": "fail_on_mismatch"
+      },
+      "architecture": {
+        "stage_path": "@MODEL_STAGE/hpo/best_config_architecture.json",
+        "best_val_mse": <float>,
+        "pretrain_warm_start_policy": "allow_cold_start_on_arch_mismatch",
+        "d_phi": <int>,
+        "n_sab_feat": <int>
+      }
+    },
+    "merged_from": [
+      "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
+      "@MODEL_STAGE/hpo/best_config_architecture.json"
+    ],
+    "best_val_mse": <float from architecture sweep>
+  }
+}
+```
+
+**Operational order:**
+1. Run `ridge_residual` first (default). Architecture fixed at known-good size; easiest to
+   reproduce and debug. Writes `best_config_ridge_residual.json`.
+2. Run `model_ddp_memory_probe` at worst-case shape (`d_phi=256, n_blocks=2`) — **mandatory**
+   gate before architecture sweep. Failure here stops the pipeline.
+3. Run `architecture` only after the memory probe passes. Pass
+   `HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_ridge_residual.json`.
+   Writes `best_config_architecture.json` and merged `best_config.json`.
+4. Final training reads merged `best_config.json`.
+
+**Pretrain checkpoint mismatch policy** (`PRETRAIN_LOAD_POLICY`):
+- `ridge_residual` → `require_match`: raise on architecture mismatch (set automatically by
+  `run_model_training_job.py` based on `best_config.hpo_sweep_mode`).
+- `architecture` → `allow_cold_start_on_arch_mismatch`: log and cold-start if the pretrain
+  checkpoint's architecture differs from the new best config.
+
+**Fixed across both sweep spaces:**
+- `d_rho=256` — not wired into the active forward pass (uses `H.mean(dim=1)`, not `SetPool`).
+  Change only after wiring `d_rho` into the model.
+- `pool="pna"` — `SetPool` not called in the current ICL forward path.
+- `use_ridge_expert=True` — fixed `True` in both modes.
+
+**Ridge Expert statelessness:** coefficients are task-local, closed-form, and non-trainable.
+`gate_hidden_dim` is the only Ridge Expert architectural tunable; it is in both sweep spaces via
+`tune.choice([32, 64, 128])`.
+
+**SQL overloads:**
+```sql
+-- 4-arg: explicit sweep mode (baseline path from env var)
+CALL run_hpo_pipeline(
+    'market_exchangeable_icl',
+    'synthetic_regression_combined',
+    'inductive_forecasting',
+    'ridge_residual'   -- or 'architecture'
+);
+
+-- 5-arg: explicit sweep mode + baseline config path (recommended for architecture sweep)
+CALL run_hpo_pipeline(
+    'market_exchangeable_icl',
+    'synthetic_regression_combined',
+    'inductive_forecasting',
+    'architecture',
+    '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
+);
+```
+
 ---
 
 ## 8. Benchmark Evaluation Architecture
@@ -255,7 +365,7 @@ Orchestrated by `scripts/run_evaluation_test.py`.
 | 0 | Runtime probes — serialised (one at a time); validate each environment |
 | 1+2 | Capacity probes — GPU → CPU → AutoGluon (non-overlapping) |
 | 3 | Prep — 1 CPU job (`prepare_benchmark_datasets.py`) |
-| 4 | DeepSet GPU shards — 10 shards, `DEEPSET_GPU_POOL` |
+| 4 | MODEL3-ICL GPU shards — 10 shards, `DEEPSET_GPU_POOL` |
 | 5 | Baseline CPU shards — 3 shards, `DEEPSET_CPU_POOL`; `catboost==1.2.10` + EAI |
 | 6 | AutoGluon shards — 30 shards, `AUTOGLUON_CPU_POOL`; `autogluon.tabular==1.3.0` + EAI |
 | 7 | Aggregation — 1 CPU job |
@@ -273,7 +383,7 @@ Orchestrated by `scripts/run_evaluation_test.py`.
 | CPU baseline probe (2) | `catboost==1.2.10` | `TABPFN_PYPI_EAI` |
 | Prep CPU probe (3) | `openml==0.15.1` | `TABPFN_PYPI_EAI` |
 | AutoGluon CPU probe (4) | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` |
-| DeepSet GPU shards | none | none |
+| MODEL3-ICL GPU shards | none | none |
 | Baseline shard jobs (×3) | `catboost==1.2.10` | `TABPFN_PYPI_EAI` |
 | AutoGluon shard jobs (×30) | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` |
 | Aggregate job | none | none |
@@ -298,10 +408,10 @@ Orchestrated by `scripts/run_synthetic_regression_evaluation.py`.
 
 | Suite | `suite_id` | Datasets | Seeds | Regimes | Methods |
 |-------|-----------|----------|-------|---------|---------|
-| In-distribution primary | `linear_poisson_v1_recommended` | 200 | [0–4] | A/B/C/D | DeepSet + 10 baselines + AutoGluon |
-| OOD parity pilot | `ood_linear_pilot_v1` | 80 | [0–2] | E/F/G/H | DeepSet only |
-| OOD full suite | `ood_linear_full_v1` | 200 | [0–2] | E/F/G/H | DeepSet + 10 baselines + AutoGluon |
-| Combined (primary + OOD) | `linear_all_v1` | 400 | [0–2] | A/B/C/D/E/F/G/H | DeepSet + 10 baselines + AutoGluon |
+| In-distribution primary | `linear_poisson_v1_recommended` | 200 | [0–4] | A/B/C/D | MODEL3-ICL + 10 baselines + AutoGluon |
+| OOD parity pilot | `ood_linear_pilot_v1` | 80 | [0–2] | E/F/G/H | MODEL3-ICL only |
+| OOD full suite | `ood_linear_full_v1` | 200 | [0–2] | E/F/G/H | MODEL3-ICL + 10 baselines + AutoGluon |
+| Combined (primary + OOD) | `linear_all_v1` | 400 | [0–2] | A/B/C/D/E/F/G/H | MODEL3-ICL + 10 baselines + AutoGluon |
 | Feature noise (NPZ) | same as primary | 80×6 | [0–2] | A/B/C/D | All |
 | Training size (NPZ) | same as primary | 40×8 | [0–2] | A/B/C/D | All |
 | Target noise (NPZ) | same as primary | 40×5 | [0–2] | A/B/C/D | All |
@@ -313,13 +423,13 @@ Orchestrated by `scripts/run_synthetic_regression_evaluation.py`.
 | 1 | Runtime probes (serialised) |
 | 2 | Capacity probes (GPU → CPU → AG, non-overlapping) |
 | 3 | Prep — 1 CPU job (`prepare_synthetic_regression.py`) |
-| 4 | DeepSet GPU shards (10, `DEEPSET_GPU_POOL`) — `SYNREG_RESULTS_STAGE=@EVALUATION_RESULTS_STAGE/regression/{suite_id}` |
+| 4 | MODEL3-ICL GPU shards (10, `DEEPSET_GPU_POOL`) — `SYNREG_RESULTS_STAGE=@EVALUATION_RESULTS_STAGE/regression/{suite_id}` |
 | 5 | Baseline CPU shards (3, `DEEPSET_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
 | 6 | AutoGluon shards (30, `AUTOGLUON_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
 | 7 | Aggregation (1 CPU job) — reads from suite-specific prefix; validates `suite_id` in all rows |
-| 8 | OOD pilot runs as separate procedure: `run_synthetic_regression_ood_deepset_pilot` (only DeepSet, 5 GPU shards, results → `@EVALUATION_RESULTS_STAGE/ood_parity/`) |
-| 9 | OOD full suite runs as separate procedure: `run_synthetic_regression_ood_full_evaluation` (prep + DeepSet + baselines + AutoGluon + aggregation for 200-dataset OOD suite; aggregation outputs → `SYNREG_OUTPUT_STAGE=@EVALUATION_RESULTS_STAGE/ood_full`) |
-| 10 | Combined suite runs as separate procedure: `run_synthetic_regression_combined_evaluation` (combined prep + DeepSet + baselines + AutoGluon + aggregation for 400-dataset combined suite; aggregation outputs → `@EVALUATION_RESULTS_STAGE/combined`; requires both `linear_poisson_v1_recommended` and `ood_linear_full_v1` to be indexed first) |
+| 8 | OOD pilot runs as separate procedure: `run_synthetic_regression_ood_deepset_pilot` (only MODEL3-ICL, 5 GPU shards, results → `@EVALUATION_RESULTS_STAGE/ood_parity/`) |
+| 9 | OOD full suite runs as separate procedure: `run_synthetic_regression_ood_full_evaluation` (prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 200-dataset OOD suite; aggregation outputs → `SYNREG_OUTPUT_STAGE=@EVALUATION_RESULTS_STAGE/ood_full`) |
+| 10 | Combined suite runs as separate procedure: `run_synthetic_regression_combined_evaluation` (combined prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 400-dataset combined suite; aggregation outputs → `@EVALUATION_RESULTS_STAGE/combined`; requires both `linear_poisson_v1_recommended` and `ood_linear_full_v1` to be indexed first) |
 
 ### Split-phase stored procedures
 
@@ -376,17 +486,63 @@ ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 CALL run_synthetic_regression_ood_full_aggregation('2.5.0-py311', '2.5.0-py311');
 ```
 
-**Combined suite (`linear_all_v1`):**
+**Combined suite (`linear_all_v1`) — distributed AutoGluon default:**
 ```sql
+-- Step 0: capacity probes (recommended before first run or after pool changes)
+CALL run_synthetic_regression_combined_baseline_capacity_probe('2.5.0-py311', '2.5.0-py311', 6);
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+CALL run_synthetic_regression_combined_autogluon_capacity_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+
+-- Step 1: combined split phases
 CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
 CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311');
+-- 6 clusters x 4 workers = 24 concurrent CPU_X64_M nodes; 1 CPU per AutoGluon fit task
+CALL run_synthetic_regression_combined_autogluon_evaluation(
+  '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality',
+  'evaluate_synthetic_regression_autogluon_ray.py'
+);
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311');
+-- Aggregation expects N=6 AutoGluon shard files (must match cluster_shards above)
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
 ```
+
+### Combined AutoGluon distributed work-item architecture (linear_all_v1):
+
+**Default configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | 6 | Number of logical shard files written |
+| `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` | 4 | `target_instances` per MLJob cluster |
+| `AUTOGLUON_TASK_CPUS` | 1 | CPUs per individual AutoGluon fit |
+| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Max simultaneous MLJob clusters |
+| `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
+| `SYNREG_AUTOGLUON_ENTRYPOINT` | `evaluate_synthetic_regression_autogluon_ray.py` | Ray entrypoint |
+
+**Architecture guardrails:**
+
+- AutoGluon is distributed across **independent work items**, not a single multi-node AutoGluon
+  fit. Each MLJob cluster runs one logical shard; Ray distributes the shard's work items across
+  the cluster's `target_instances` nodes.
+- The driver process inside each MLJob writes exactly **one** output file:
+  `AutoGluon_shard{i}_of_{N}_detailed.csv`. Worker Ray tasks never write stage files.
+- Aggregation must expect `SYNREG_EXPECTED_AG_SHARDS=N` matching `SYNREG_AUTOGLUON_CLUSTER_SHARDS`.
+  With the recommended default: `N=6`.
+- **Always run capacity probes** (`run_synthetic_regression_combined_autogluon_capacity_probe`)
+  before increasing `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` or `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS`.
+  Default requests: 6 concurrent clusters × 4 workers = **24 CPU_X64_M nodes**.
+- `evaluate_synthetic_regression_autogluon_ray.py` **fails fast** if Ray cannot initialise across
+  `target_instances > 1`. It does not silently fall back to single-node mode (which would write
+  duplicate shard files from each instance).
+- `MODEL_ARCH_VERSION` is **not** a Snowflake SQL/runtime selector. The model default is
+  MODEL3/DeepSet ICL. Internal checkpoint metadata may contain `model_arch_version='model3'`
+  for compatibility — do not remove that without updating all validation and tests.
+- `run_model_training` accepts the same explicit runtime lineage variables as pretrain and HPO:
+  `MODEL_FAMILY`, `TRAINING_DATA_FAMILY`, `MODEL_DESIGN_PATTERN`.
 
 ### Critical invariants:
 
@@ -415,7 +571,7 @@ CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311')
   zero-padded format when the index row has no value
 - All-method suites (`linear_poisson_v1_recommended`, `ood_linear_full_v1`, `linear_all_v1`)
   enforce shard completeness when `SYNREG_EXPECTED_DEEPSET_SHARDS` > 0 in the aggregation job;
-  a missing DeepSet/baseline/AutoGluon shard raises RuntimeError before aggregation writes any output
+  a missing MODEL3-ICL/baseline/AutoGluon shard raises RuntimeError before aggregation writes any output
 - Combined suite (`linear_all_v1`) is an index-level composition only — no parquet files are merged
   or rewritten; `prepare_combined_suite()` copies rows from the primary in-distribution suite
   (family=`primary`) and the full OOD suite, remapping `suite_id`, `source_suite_id`, `split_seeds`,
@@ -475,12 +631,12 @@ All final files written to `@EVALUATION_RESULTS_STAGE/`.
 
 | File | Description |
 |------|-------------|
-| `synthetic_regression_chart_data_noise_features.csv` | x=noise_level, y=relative_degradation — DeepSet stability vs. baselines |
-| `synthetic_regression_chart_data_training_size.csv` | x=n_train, y=relative_improvement — DeepSet sample efficiency |
+| `synthetic_regression_chart_data_noise_features.csv` | x=noise_level, y=relative_degradation — MODEL3-ICL stability vs. baselines |
+| `synthetic_regression_chart_data_training_size.csv` | x=n_train, y=relative_improvement — MODEL3-ICL sample efficiency |
 | `synthetic_regression_chart_data_model_rank.csv` | x=method, y=mean_rank — overall ranking |
 
 The two stability charts (`noise_features` and `training_size`) are the primary visual
-evidence for DeepSet's resistance to noise and consistent performance across training set sizes.
+evidence for MODEL3-ICL's resistance to noise and consistent performance across training set sizes.
 
 ### OOD full suite outputs (written to `@EVALUATION_RESULTS_STAGE/ood_full/`):
 
@@ -521,9 +677,9 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   write part CSVs.
 - **Index queries** always include a stable compound `ORDER BY`; never query without ordering.
 - **pip requirements:** only baseline and AutoGluon jobs carry `pip_requirements` and
-  `external_access_integrations`. DeepSet GPU jobs and the aggregation job carry neither.
+  `external_access_integrations`. MODEL3-ICL GPU jobs and the aggregation job carry neither.
 - **All pip jobs** use the single `TABPFN_PYPI_EAI` integration.
-- **Checkpoints:** always write v2 format (plain dict `cfg`); always load via
+- **Checkpoints:** always write v4 format (plain dict `cfg`); always load via
   `load_checkpoint_compat()`.
 - **Tests:** mock Snowflake sessions with `MagicMock` + `side_effect`; use `patch` for env flags;
   never import Snowflake at module level in tests. Row mocks must support both `as_dict()` and
@@ -539,7 +695,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   model package failure does not break a shard for another method.
 - **Entrypoint boundaries:** `evaluate_synthetic_regression.py` must never import from
   `evaluate.py`. Entrypoint scripts are runnable orchestration surfaces, not shared
-  libraries; reusable DeepSet, baseline, AutoGluon, and ranking code belongs in stable
+  libraries; reusable MODEL3-ICL, baseline, AutoGluon, and ranking code belongs in stable
   `src/*.py` helper modules.
 - **Script staging:** all scripts staged flat to `@MODEL_STAGE/scripts/` — including OOD
   scripts from `scripts/ood_regression/` (no subdirectories on stage).
@@ -551,17 +707,14 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   `SYNTHETIC_REGRESSION_DATASET_INDEX` rows because downstream evaluation code expects
   lowercase keys such as `stage_path`, `split_seeds`, `dataset_id`, `suite_id`,
   `suite_family`, and `prior_regime`.
-- **Model family routing:** Never hardcode `DeepSetModel(cfg=cfg)` in `evaluate.py`,
-  `train.py`, or `hpo.py`. Always call `_instantiate_model(cfg)` from `model.py`.
-  Routing is determined by `cfg.model_family` ("deepset" | "market_aware").
+- **Model family routing:** Never hardcode `DeepSetICLModel(cfg=cfg)` or
+  `DeepSetCompletionModel(cfg=cfg)` directly. Always call `_instantiate_model(cfg)`
+  from `model.py`. Routing is determined by `cfg.model_family`
+  ("market_exchangeable_icl" | "market_exchangeable_completion").
 - **`_checkpoint_architecture_mismatches` fields:** Must include `"model_family"` alongside
   the other 8 structural fields. A mismatch on `model_family` aborts warm-start.
-- **Checkpoint version:** `MarketAwareDeepSetModel` checkpoints save
-  `checkpoint_format_version=3`. `DeepSetModel` checkpoints keep version 2.
-  Never save a `market_aware` model with version 2.
-- **`n_sab_sample_per_feature` guard:** Default is 0. Do not set > 0 in production
-  evaluation without first verifying `p <= 10` or adding chunking over the `m*p` batch dim.
-  At `m=128, p=128, n=200`, enabling SAB over n produces a 2.6 GB fp32 attention matrix.
+- **Checkpoint version:** MODEL3 checkpoints always save `checkpoint_format_version=4`.
+  Never save with version 2 or 3 (legacy MODEL2 values).
 
 ---
 
@@ -571,9 +724,9 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 - Never materialise full benchmark datasets locally inside an MLJob; use `@META_DATASET_STAGE` paths.
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands (causes silent read failures).
-- OOD scripts never touch `@META_DATASET_STAGE`; only `@EVAL_DATASET_STAGE`.
-- `data/ood_regression/` is the local directory; `@EVAL_DATASET_STAGE/ood_parity/` is the stage prefix.
-- `@EVAL_DATASET_STAGE` must never hold production training parquet.
+- OOD scripts never touch `@META_DATASET_STAGE`; only `@EVALUATION_DATASET_STAGE`.
+- `data/ood_regression/` is the local directory; `@EVALUATION_DATASET_STAGE/ood_parity/` is the stage prefix.
+- `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
 ### Index safety
 
@@ -593,7 +746,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 ### Evaluation phase gating
 
-- DeepSet shards must complete before baselines submit; baselines before AutoGluon;
+- MODEL3-ICL shards must complete before baselines submit; baselines before AutoGluon;
   all three before aggregation.
 - Runtime probes are serialised (one at a time; wait for each before next).
 - Capacity probes are phase-gated: GPU → CPU → AG (non-overlapping).
@@ -617,7 +770,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 | openml | `0.15.1` | `OPENML_VERSION` / `PREP_EXTRA_PIP_REQUIREMENTS` |
 
 - Always pin exact versions (`==`). Never use `>=` or unpinned requirements.
-- DeepSet GPU jobs: no pip, no EAI.
+- MODEL3-ICL GPU jobs: no pip, no EAI.
 - Aggregation job: no pip, no EAI.
 - `autogluon.tabular` stays lazily imported inside `predict_autogluon()`.
 
@@ -633,7 +786,8 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 ### Checkpoint safety
 
 - Never save `ModelConfig` objects directly in PyTorch checkpoints (breaks `weights_only=True`).
-- Always serialize `cfg` as `dataclasses.asdict(model.cfg)` (plain dict). Checkpoint format version: v3 for `market_aware`, v2 for `deepset`. Use `checkpoint_format_version = 3 if cfg.model_family == "market_aware" else 2`.
+- Always serialize `cfg` as `dataclasses.asdict(model.cfg)`. Checkpoint format version
+  is always `4` for MODEL3. Use `checkpoint_format_version = 4`.
 - Consumers must normalise `ckpt["cfg"]` dict back to `ModelConfig` before comparing fields.
 - `weights_only=False` can execute arbitrary code — only for internally trusted checkpoints;
   never for third-party checkpoints.
@@ -695,7 +849,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 ## Guardrail: Query Collapse and Early Feature Compression
 
-The DeepSet model must not be evaluated solely through full benchmark aggregation before
+The MODEL3-ICL model must not be evaluated solely through full benchmark aggregation before
 passing architecture sanity checks.
 
 Required pre-evaluation checks:
@@ -721,19 +875,21 @@ corrected architecture passes query sanity checks. The first priority is to elim
 collapse and early feature compression. HPO expansion comes after the model demonstrates
 query-sensitive behavior on controlled synthetic contexts.
 
-## Guardrail: MarketAwareDeepSetModel is the Production Default
+## Guardrail: DeepSetICLModel (MODEL3) is the Only Supported Model
 
-`MarketAwareDeepSetModel` is the default production model for all synthetic regression training,
-OOD synthetic regression, and future market mental model prior training.
-`DeepSetModel` is available only for compatibility and ablation. Do not revert
-`DEEPSET_MODEL_FAMILY` to `"deepset"` without an explicit ablation reason.
+`DeepSetICLModel` is the sole production model for all synthetic regression
+training, OOD synthetic regression, and future market mental model prior training.
+Retired model classes have been removed from the codebase and must not be
+reintroduced. Do not set `MODEL_FAMILY` to any retired value
+("deepset", "market_aware"). `normalize_checkpoint_cfg()` raises `RuntimeError` for
+checkpoints carrying retired family values.
 
 ## Guardrail: Synthetic Regression Evaluation Must Instantiate from Checkpoint cfg
 
 `load_best_deepset_checkpoint()` in `evaluate_synthetic_regression.py` must always call
-`_instantiate_model(cfg)` — never hardcode `DeepSetModel(cfg=cfg)` or
-`MarketAwareDeepSetModel(cfg=cfg)`. The model class is determined by `cfg.model_family`
-from the checkpoint.
+`_instantiate_model(cfg)` — never hardcode `DeepSetICLModel(cfg=cfg)` or
+`DeepSetCompletionModel(cfg=cfg)`. The model class is determined by
+`cfg.model_family` from the checkpoint.
 
 ## Guardrail: Device-Aware Sanity Checks
 
@@ -758,17 +914,19 @@ underperformance) that would invalidate evaluation results.
 
 ## Guardrail: run_permutation_tests() Is Architecture-Aware
 
-`run_permutation_tests()` in `src/deepset_inference.py` dispatches to a `market_aware` or
-`deepset` branch based on `cfg.model_family`. Never call it with a model whose `model_family`
-is absent or unknown — it will raise `ValueError`. Tests 3-5 for `market_aware` cover feature
-equivariance, finite output, and batch-query shape; Tests 3-7 for `deepset` cover sample and
-feature equivariance. The function always restores the model's original training mode.
+`run_permutation_tests()` in `src/deepset_inference.py` dispatches to a
+`market_exchangeable_icl` or `market_exchangeable_completion` branch based on
+`cfg.model_family`. Never call it with a model whose `model_family` is absent or
+unknown — it will raise `ValueError`. Tests for ICL cover row/column permutation
+invariance, finite output, and batch-query shape. Completion tests cover row/column
+equivariance and output shape (n, p). The function always restores the model's
+original training mode.
 
 ## Guardrail: HPO Must Propagate model_family Into best_config.json
 
-`src/hpo.py` defaults to `HPO_MODEL_FAMILY = os.environ.get("DEEPSET_MODEL_FAMILY", "market_aware")`.
+`src/hpo.py` defaults to `MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "market_exchangeable_icl")`.
 The `model_family` key is written into every `best_config.json` uploaded to `@MODEL_STAGE/hpo/`.
-`train.py` reads it via `hyper_params.get("model_family", DEEPSET_MODEL_FAMILY)`. Do not allow
+`train.py` reads it via `hyper_params.get("model_family", MODEL_FAMILY)`. Do not allow
 `best_config.json` to be uploaded without a `model_family` key.
 
 ## Guardrail: Checkpoint Metadata Includes Training Metrics
@@ -801,32 +959,40 @@ set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting t
 
 ## Guardrail: MODEL3 Architecture Selectors Must Be Propagated Explicitly
 
-`MODEL_ARCH_VERSION` and `MODEL3_DESIGN_PATTERN` must be set explicitly in all production
-Snowflake training submissions when running MODEL3. Default values (`model2` / `inductive_forecasting`)
-preserve MODEL2 behavior.
+`MODEL_DESIGN_PATTERN` must be set explicitly in all production Snowflake training
+submissions. `MODEL_FAMILY` defaults to `"market_exchangeable_icl"` (MODEL3 ICL).
 
 **Key rules:**
-- `MODEL_ARCH_VERSION="model2"` (default) routes to `MarketAwareDeepSetModel`. MODEL3 code paths
-  do NOT activate unless `MODEL_ARCH_VERSION="model3"`.
-- `MODEL3_DESIGN_PATTERN="inductive_forecasting"` (default) does NOT trigger MODEL3 unless
-  `MODEL_ARCH_VERSION="model3"` is also set.
-- Required MODEL3 combinations:
-  - `model3` + `inductive_forecasting` → `model_family="market_exchangeable_icl"` → `MarketExchangeableICLModel`
-  - `model3` + `transductive_completion` → `model_family="market_exchangeable_completion"` → `MarketExchangeableCompletionModel`
+- `MODEL_DESIGN_PATTERN="inductive_forecasting"` (default) → `model_family="market_exchangeable_icl"` → `DeepSetICLModel`
+- `MODEL_DESIGN_PATTERN="transductive_completion"` requires `MODEL_FAMILY="market_exchangeable_completion"` → `DeepSetCompletionModel`
 - MODEL3 checkpoints use `checkpoint_format_version=4` and must include `model_arch_version`,
-  `model3_design_pattern`, and `task_objective` in checkpoint metadata.
-- Do not mix MODEL2 and MODEL3 selectors (e.g., `model_arch_version="model2"` with a MODEL3 family).
-  `ModelConfig.__post_init__` raises `ValueError` for invalid combinations.
-- `run_training_job.py`, `run_model_training_job.py`, and `run_hpo_job.py` each expose
-  `DEFAULT_MODEL_ARCH_VERSION` and `DEFAULT_MODEL3_DESIGN_PATTERN` constants that propagate
+  `model_design_pattern`, and `task_objective` in checkpoint metadata.
+- `run_model_training_job.py`, `run_pretrain_job.py`, and `run_hpo_job.py` each expose
+  `DEFAULT_MODEL_FAMILY` and `DEFAULT_MODEL_DESIGN_PATTERN` constants that propagate
   through `env_vars` to all MLJob children.
 
-## Guardrail: MODEL3 Must Not Mutate MODEL2 Classes
+## Guardrail: Run MODEL3 DDP Memory Probe Before Training
 
-`MarketAwareDeepSetModel` is the current production model and must not be modified in place
-to add MODEL3 behavior. MODEL3 is implemented as separate classes:
-- `MarketExchangeableICLModel` — inductive forecasting
-- `MarketExchangeableCompletionModel` — transductive completion
+Run `CALL run_model_ddp_memory_probe(...)` with `RUN_BACKWARD=TRUE` before every MODEL3
+pretrain / HPO / final-training submission when shape parameters change.
 
-Shared primitives (`ExchangeableMatrixBlock`, `ColumnEncoder`, `CellEncoder`, `_masked_mean`)
-are module-level additions to `model.py` and do not alter existing class behavior.
+**Key rules:**
+- Always use `RUN_BACKWARD=TRUE`. MODEL3 meta-training uses back-propagation; a forward-only
+  probe understates peak memory by the 20/8 = 2.5× activation-factor ratio.
+- The static memory estimate `H_bytes = m * n * p * d_phi * 4` (float32) is computed before
+  any tensor allocation. If `H_bytes * 20 * 1.5 > CUDA_total * 0.9`, the probe raises before
+  OOM instead of crashing a running training job.
+- Probe results are uploaded to `@MODEL_STAGE/diagnostics/model_ddp_memory_probe.json`.
+  Read them with `SELECT $1 FROM @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json
+  (FILE_FORMAT => (TYPE = JSON));`
+- Probe handler is `run_model_training_job.run_model_ddp_memory_probe`. The procedure
+  signature and handler are defined in `sql/run_training_job.sql`; the probe script is
+  `scripts/model_ddp_memory_probe.py`.
+
+**Example probe call:**
+```sql
+CALL run_model_ddp_memory_probe(
+    'inductive_forecasting', 'market_exchangeable_icl',
+    200, 128, 128, 128, 1, TRUE
+);
+```

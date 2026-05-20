@@ -42,7 +42,7 @@ def _make_part_rows(
     mse_values: dict of (dataset_id, method) -> mse override
     """
     if methods is None:
-        methods = ["DeepSetModel-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
     if mse_values is None:
         mse_values = {}
 
@@ -75,8 +75,8 @@ def _make_part_rows(
                     "selected_features": 5,
                     "feature_selector": "none",
                     "feature_cap": 128,
-                    "context_windows": 5 if method == "DeepSetModel-MC" else None,
-                    "context_window_size": 200 if method == "DeepSetModel-MC" else None,
+                    "context_windows": 5 if method == "MODEL3-ICL-MC" else None,
+                    "context_window_size": 200 if method == "MODEL3-ICL-MC" else None,
                     "mse_betaX": mse,
                     "rmse_betaX": rmse,
                     "mae_betaX": rmse * 0.8,
@@ -186,7 +186,7 @@ class TestAggregationIngest:
         DeepSet part has context_windows=5; baseline part missing context_windows.
         After concat: baseline rows should have NaN/None for context_windows.
         """
-        rows_ds = _make_part_rows(1, 1, ["DeepSetModel-MC"])
+        rows_ds = _make_part_rows(1, 1, ["MODEL3-ICL-MC"])
         rows_bl = _make_part_rows(1, 1, ["FixedRidgeLambda1"])
         # Remove context_windows from baseline
         for r in rows_bl:
@@ -202,10 +202,10 @@ class TestAggregationIngest:
 class TestAggregationStatusPreservation:
     def test_aggregation_preserves_skipped_rows(self):
         """status='skipped' rows must be preserved in the canonical output."""
-        rows = _make_part_rows(2, 1, ["DeepSetModel-MC", "FixedRidgeLambda1"])
+        rows = _make_part_rows(2, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"])
         # Mark first dataset DeepSet as skipped
         for r in rows:
-            if r["dataset_id"] == 0 and r["method"] == "DeepSetModel-MC":
+            if r["dataset_id"] == 0 and r["method"] == "MODEL3-ICL-MC":
                 r["status"] = "skipped"
                 r["skip_reason"] = "gpu_oom:memory_exceeded"
                 r["mse_betaX"] = float("nan")
@@ -238,7 +238,7 @@ class TestAggregationStatusPreservation:
 class TestRanking:
     def test_ranking_uses_valid_rows_only(self):
         """NaN mse_betaX rows get rank=NaN; valid rows get integer ranks."""
-        rows = _make_part_rows(1, 1, ["DeepSetModel-MC", "FixedRidgeLambda1"])
+        rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"])
         # Make DeepSet invalid
         rows[0]["mse_betaX"] = float("nan")
         rows[0]["rmse_betaX"] = float("nan")
@@ -351,13 +351,13 @@ class TestRanking:
 class TestReferenceRatios:
     def test_ratio_to_fixed_ridge_correct(self):
         """FixedRidge mse=1.0, DeepSet mse=0.5 → ratio=0.5."""
-        rows = _make_part_rows(1, 1, ["DeepSetModel-MC", "FixedRidgeLambda1"],
-                               mse_values={(0, "DeepSetModel-MC"): 0.5,
+        rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"],
+                               mse_values={(0, "MODEL3-ICL-MC"): 0.5,
                                            (0, "FixedRidgeLambda1"): 1.0})
         df = pd.DataFrame(rows)
 
         ref = df[df["method"] == "FixedRidgeLambda1"]["mse_betaX"].values[0]
-        ds_mse = df[df["method"] == "DeepSetModel-MC"]["mse_betaX"].values[0]
+        ds_mse = df[df["method"] == "MODEL3-ICL-MC"]["mse_betaX"].values[0]
         ratio = ds_mse / ref
         assert math.isclose(ratio, 0.5, rel_tol=1e-9)
 
@@ -398,7 +398,7 @@ class TestFeatureNoiseStability:
             noise_levels = [0, 10, 25, 50, 75, 100]
         rows = []
         for nl in noise_levels:
-            for method in ["DeepSetModel-MC", "FixedRidgeLambda1"]:
+            for method in ["MODEL3-ICL-MC", "FixedRidgeLambda1"]:
                 rows.append({
                     "suite_family": "feature_noise",
                     "dataset_id": 0,
@@ -412,7 +412,7 @@ class TestFeatureNoiseStability:
                     "mse_betaX": 0.5 + nl * 0.01,
                     "rmse_betaX": math.sqrt(0.5 + nl * 0.01),
                     "r2_betaX": max(0, 0.8 - nl * 0.005),
-                    "rank_mse_betaX": 1.0 if method == "DeepSetModel-MC" else 2.0,
+                    "rank_mse_betaX": 1.0 if method == "MODEL3-ICL-MC" else 2.0,
                     "processed_features": 5 + nl,
                     "selected_features": min(5 + nl, 128),
                     "feature_cap": 128,
@@ -465,7 +465,7 @@ class TestTrainingSizeSummary:
             n_train_values = [25, 50, 100, 200, 500, 1000, 2000, 4832]
         rows = []
         for nt in n_train_values:
-            for method in ["DeepSetModel-MC", "FixedRidgeLambda1"]:
+            for method in ["MODEL3-ICL-MC", "FixedRidgeLambda1"]:
                 is_anchor = (nt == 4832)
                 rows.append({
                     "suite_family": "training_size",
@@ -482,7 +482,7 @@ class TestTrainingSizeSummary:
                     "mse_betaX": max(0.01, 1.0 - math.log(nt) * 0.05),
                     "rmse_betaX": math.sqrt(max(0.01, 1.0 - math.log(nt) * 0.05)),
                     "r2_betaX": min(0.99, math.log(nt) * 0.05),
-                    "rank_mse_betaX": 1.0 if method == "DeepSetModel-MC" else 2.0,
+                    "rank_mse_betaX": 1.0 if method == "MODEL3-ICL-MC" else 2.0,
                     "status": "ok",
                 })
         return rows
@@ -594,7 +594,7 @@ class TestAggregationSmokeTest:
         2 datasets × 2 seeds × 4 methods.
         model_comparison_summary must have 4 rows (one per method).
         """
-        methods = ["DeepSetModel-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
         rows = _make_part_rows(2, 2, methods)
         df = pd.DataFrame(rows)
 
@@ -611,16 +611,16 @@ class TestAggregationSmokeTest:
 
     def test_deepset_ratio_columns_computable(self):
         """DeepSet ratio columns can be computed when FixedRidgeLambda1 is present."""
-        methods = ["DeepSetModel-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
         rows = _make_part_rows(1, 1, methods, mse_values={
-            (0, "DeepSetModel-MC"): 0.3,
+            (0, "MODEL3-ICL-MC"): 0.3,
             (0, "FixedRidgeLambda1"): 0.6,
             (0, "XGBoost"): 0.4,
             (0, "AutoGluon"): 0.35,
         })
         df = pd.DataFrame(rows)
         fr_mse = df[df["method"] == "FixedRidgeLambda1"]["mse_betaX"].values[0]
-        ds_mse = df[df["method"] == "DeepSetModel-MC"]["mse_betaX"].values[0]
+        ds_mse = df[df["method"] == "MODEL3-ICL-MC"]["mse_betaX"].values[0]
         ratio = ds_mse / fr_mse
         assert math.isclose(ratio, 0.5, rel_tol=1e-9)
 
@@ -643,8 +643,8 @@ class TestAggregationIsolation:
         import tempfile
         import shutil
 
-        good_rows = _make_part_rows(2, 1, ["DeepSetModel-MC"])
-        bad_rows = _make_part_rows(1, 1, ["DeepSetModel-MC"])
+        good_rows = _make_part_rows(2, 1, ["MODEL3-ICL-MC"])
+        bad_rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC"])
         for r in bad_rows:
             r["suite_id"] = "some_other_suite"
 
@@ -747,7 +747,7 @@ class TestShardCompleteness:
         return [f"@EVALUATION_RESULTS_STAGE/regression/suite/{n}" for n in names]
 
     def _all_deepset(self, n: int) -> list[str]:
-        return [f"DeepSetModel-MC_shard{i}_of_{n}_detailed.csv" for i in range(n)]
+        return [f"MODEL3-ICL-MC_shard{i}_of_{n}_detailed.csv" for i in range(n)]
 
     def _all_baseline(self, n: int) -> list[str]:
         return [f"baselines_shard{i}_of_{n}_detailed.csv" for i in range(n)]

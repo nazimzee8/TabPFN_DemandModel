@@ -79,7 +79,7 @@ def _make_session_for_model_training(tmp_dir: str, best_config: dict | None = No
     sql(...).collect() returns [] for all LIST queries.
     """
     cfg = best_config or {
-        "lr": 1e-3, "weight_decay": 1e-4, "dropout": 0.1, "model_family": "market_aware"
+        "lr": 1e-3, "weight_decay": 1e-4, "dropout": 0.1, "model_family": "market_exchangeable_icl"
     }
     session = MagicMock()
 
@@ -98,7 +98,7 @@ def _make_session_for_model_training(tmp_dir: str, best_config: dict | None = No
 def _make_session_for_pipeline(tmp_dir: str, best_config: dict | None = None):
     """Minimal session mock for run_training_job.run_pipeline()."""
     cfg = best_config or {
-        "lr": 1e-3, "weight_decay": 1e-4, "dropout": 0.1, "model_family": "market_aware"
+        "lr": 1e-3, "weight_decay": 1e-4, "dropout": 0.1, "model_family": "market_exchangeable_icl"
     }
     session = MagicMock()
 
@@ -158,6 +158,7 @@ class TestRunPipelinePropagation:
         with patch("run_training_job.submit_from_stage",
                    side_effect=_make_fake_submit(submitted)), \
              patch("run_training_job._wait_done"), \
+             patch("run_training_job._validate_meta_dataset_index"), \
              patch("run_training_job._stage_file_exists", return_value=True), \
              patch("run_training_job._list_stage", return_value=[]):
             run_training_job.run_pipeline(session)
@@ -266,6 +267,21 @@ class TestRunModelTrainingPropagation:
         jobs = self._collect_jobs(monkeypatch)
         assert "TRAINING_DATA_FAMILY" in jobs[0].env_vars
 
+    def test_model_family_env_var_present(self, monkeypatch):
+        """MODEL_FAMILY must be in env_vars."""
+        jobs = self._collect_jobs(monkeypatch)
+        assert "MODEL_FAMILY" in jobs[0].env_vars
+
+    def test_deepset_model_family_env_var_absent(self, monkeypatch):
+        """Retired model-family env var must not be in env_vars."""
+        jobs = self._collect_jobs(monkeypatch)
+        assert "DEEPSET" + "_MODEL_FAMILY" not in jobs[0].env_vars
+
+    def test_model_arch_version_env_var_absent(self, monkeypatch):
+        """MODEL_ARCH_VERSION must NOT be in env_vars (hardcoded in train.py)."""
+        jobs = self._collect_jobs(monkeypatch)
+        assert "MODEL_ARCH_VERSION" not in jobs[0].env_vars
+
 
 # ---------------------------------------------------------------------------
 # Tests: run_hpo_job.py — DEFAULT_TRAINING_DATA_FAMILY constant + propagation
@@ -294,4 +310,25 @@ class TestRunHpoJobPropagation:
 
         assert len(submitted) == 1
         assert submitted[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        importlib.reload(run_hpo_job)
+
+    def test_hpo_job_has_model_family_not_deepset_model_family(self, monkeypatch):
+        """HPO job uses MODEL_FAMILY env var; MODEL_ARCH_VERSION is absent."""
+        monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
+        importlib.reload(run_hpo_job)
+
+        submitted: list[_FakeJob] = []
+        session = MagicMock()
+        session.sql.return_value.collect.side_effect = lambda: []
+
+        with patch("run_hpo_job.submit_from_stage",
+                   side_effect=_make_fake_submit(submitted)), \
+             patch("run_hpo_job._wait_done"), \
+             patch("run_hpo_job._list_stage", return_value=[]):
+            run_hpo_job.run_hpo_pipeline(session)
+
+        job = submitted[0]
+        assert "MODEL_FAMILY" in job.env_vars, "MODEL_FAMILY missing from HPO job env_vars"
+        assert "DEEPSET" + "_MODEL_FAMILY" not in job.env_vars, "Retired model-family env var in HPO job env_vars"
+        assert "MODEL_ARCH_VERSION" not in job.env_vars, "MODEL_ARCH_VERSION in HPO job env_vars (must be hardcoded)"
         importlib.reload(run_hpo_job)

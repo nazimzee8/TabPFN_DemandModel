@@ -27,7 +27,7 @@ import sanity_checks  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def test_check_permutation_invariance_passes():
-    """check_permutation_invariance passes on a fresh MarketAwareDeepSetModel."""
+    """check_permutation_invariance passes on a fresh DeepSetICLModel."""
     result = sanity_checks.check_permutation_invariance(model=None)
     assert result["passed"], (
         f"check_permutation_invariance failed: {result}"

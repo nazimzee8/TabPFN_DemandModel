@@ -1,9 +1,9 @@
 """
 model.py
 
-DeepSetModel: a permutation-equivariant neural network for in-context
-regression, operating over a training set (X_train, y_train) and one or
-more test points x_test.
+DeepSetICLModel: a Hartford-style exchangeable neural network for
+in-context regression (MODEL3 inductive forecasting), operating over a training
+set (X_train, y_train) and one or more test points x_test.
 """
 
 import dataclasses
@@ -49,97 +49,73 @@ POOL_SCALE = {
 
 @dataclasses.dataclass
 class ModelConfig:
-    d_phi:       int   = 128   # phi output dim; must be >= p
-    d_rho:       int   = 256   # rho output dim; must be >= n
+    d_phi:       int   = 128   # channel dimension d_model for ExchangeableMatrixBlocks
+    d_rho:       int   = 256   # kept for checkpoint compatibility
     pool:        str   = "pna"
     n_heads:     int   = 4     # attention heads in SAB / AttentionPool
-    n_sab_feat:  int   = 1     # SAB layers at feature level (0 = linear equivariance)
-    n_sab_samp:  int   = 1     # SAB layers at sample level (0 = linear equivariance)
+    n_sab_feat:  int   = 1     # number of ExchangeableMatrixBlocks (>=1)
     norm_feat:   bool  = True  # standardize X_train columns per-context
     norm_target: bool  = True  # standardize y_train per-context; denormalize output
     dropout:     float = 0.1
-    feature_aggregation_order: str = "legacy_feature_pool_first"
-    # "legacy_feature_pool_first" | "sample_evidence_first"
-    # Missing field in old cfg dicts maps to "legacy_feature_pool_first" (default).
 
-    # New fields — MarketAwareDeepSetModel only
-    model_family:             str   = "deepset"  # "deepset" | "market_aware" | "market_exchangeable_icl" | "market_exchangeable_completion"
-    d_sample:                 int   = 64         # phi_sample output dim (must be divisible by n_heads when sample attn used)
-    n_sab_sample_per_feature: int   = 0          # SAB layers over n within each (q,j) slot — keep 0 (memory: see §Memory Guard)
-    sample_pool:              str   = "attn"     # pooling over n: "attn" | "pna" | "mean"
-    use_ridge_expert:         bool  = False      # enable RidgeExpert + gate
-    ridge_lambda:             float = 1.0        # ridge regularisation λ (must be > 0)
-    residual_scale_init:      float = 0.1        # init value of learned residual_scale scalar
-    gate_hidden_dim:          int   = 64         # gate_head MLP hidden dim
+    # Model family and design pattern
+    model_family:          str   = "market_exchangeable_icl"   # "market_exchangeable_icl" | "market_exchangeable_completion"
+    use_ridge_expert:      bool  = True       # enable RidgeExpert + gate
+    ridge_lambda:          float = 1.0        # ridge regularisation λ (must be > 0)
+    gate_hidden_dim:       int   = 64         # gate_head MLP hidden dim
 
-    # MODEL3 selectors — default values preserve MODEL2 behavior
-    model_arch_version:    str = "model2"               # "model2" | "model3"
-    model3_design_pattern: str = "inductive_forecasting" # "inductive_forecasting" | "transductive_completion"
+    # MODEL3 selectors
+    model_arch_version:    str = "model3"                # always "model3"
+    model_design_pattern: str = "inductive_forecasting" # "inductive_forecasting" | "transductive_completion"
 
     def __post_init__(self):
         if self.pool not in VALID_POOLS:
             raise ValueError(f"Invalid pool '{self.pool}'. Valid: {sorted(VALID_POOLS)}")
         # n_heads divisibility only matters when attention is actually used
-        uses_heads = (self.n_sab_feat > 0 or self.n_sab_samp > 0
-                      or self.pool in ("attn", "multipool"))
+        uses_heads = (self.n_sab_feat > 0 or self.pool in ("attn", "multipool"))
         if uses_heads:
             if self.d_phi % self.n_heads != 0:
                 raise ValueError(f"d_phi={self.d_phi} must be divisible by n_heads={self.n_heads}")
             if self.d_rho % self.n_heads != 0:
                 raise ValueError(f"d_rho={self.d_rho} must be divisible by n_heads={self.n_heads}")
         _VALID_FAMILIES = frozenset({
-            "deepset", "market_aware",
             "market_exchangeable_icl", "market_exchangeable_completion",
         })
         if self.model_family not in _VALID_FAMILIES:
             raise ValueError(
                 f"Invalid model_family: {self.model_family!r}. Valid: {sorted(_VALID_FAMILIES)}"
             )
-        if self.sample_pool not in POOL_SCALE:
-            raise ValueError(f"Invalid sample_pool: {self.sample_pool!r}")
-        if self.model_family == "market_aware" and self.n_sab_sample_per_feature > 0:
-            if self.d_sample % self.n_heads != 0:
-                raise ValueError(
-                    f"d_sample={self.d_sample} must be divisible by n_heads={self.n_heads}"
-                )
-        if self.feature_aggregation_order not in (
-            "legacy_feature_pool_first", "sample_evidence_first"
-        ):
-            raise ValueError(
-                f"Invalid feature_aggregation_order: {self.feature_aggregation_order!r}"
-            )
-        # MODEL3 selector validation
-        if self.model_arch_version not in ("model2", "model3"):
+        if self.model_arch_version != "model3":
             raise ValueError(
                 f"Invalid model_arch_version: {self.model_arch_version!r}. "
-                "Valid: 'model2', 'model3'"
+                "Valid: 'model3'"
             )
-        if self.model3_design_pattern not in ("inductive_forecasting", "transductive_completion"):
+        if self.model_design_pattern not in ("inductive_forecasting", "transductive_completion"):
             raise ValueError(
-                f"Invalid model3_design_pattern: {self.model3_design_pattern!r}. "
+                f"Invalid model_design_pattern: {self.model_design_pattern!r}. "
                 "Valid: 'inductive_forecasting', 'transductive_completion'"
             )
-        # MODEL3 families require model_arch_version="model3"
-        _MODEL3_FAMILIES = frozenset({"market_exchangeable_icl", "market_exchangeable_completion"})
-        if self.model_family in _MODEL3_FAMILIES and self.model_arch_version != "model3":
-            raise ValueError(
-                f"model_family={self.model_family!r} requires model_arch_version='model3', "
-                f"got model_arch_version={self.model_arch_version!r}"
-            )
         # MODEL3 family/pattern consistency
-        if self.model_arch_version == "model3":
-            if (self.model3_design_pattern == "inductive_forecasting"
-                    and self.model_family != "market_exchangeable_icl"):
-                raise ValueError(
-                    f"model3_design_pattern='inductive_forecasting' requires "
-                    f"model_family='market_exchangeable_icl', got {self.model_family!r}"
-                )
-            if (self.model3_design_pattern == "transductive_completion"
-                    and self.model_family != "market_exchangeable_completion"):
-                raise ValueError(
-                    f"model3_design_pattern='transductive_completion' requires "
-                    f"model_family='market_exchangeable_completion', got {self.model_family!r}"
-                )
+        if (self.model_design_pattern == "inductive_forecasting"
+                and self.model_family != "market_exchangeable_icl"):
+            raise ValueError(
+                f"model_design_pattern='inductive_forecasting' requires "
+                f"model_family='market_exchangeable_icl', got {self.model_family!r}"
+            )
+        if (self.model_design_pattern == "transductive_completion"
+                and self.model_family != "market_exchangeable_completion"):
+            raise ValueError(
+                f"model_design_pattern='transductive_completion' requires "
+                f"model_family='market_exchangeable_completion', got {self.model_family!r}"
+            )
+        if self.use_ridge_expert and self.ridge_lambda <= 0:
+            raise ValueError(
+                f"ridge_lambda must be > 0 when use_ridge_expert=True, got {self.ridge_lambda}"
+            )
+        if self.gate_hidden_dim <= 0:
+            raise ValueError(
+                f"gate_hidden_dim must be positive, got {self.gate_hidden_dim}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -251,171 +227,6 @@ class SetPool(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# DeepSetModel
-# ---------------------------------------------------------------------------
-
-class DeepSetModel(nn.Module):
-    """
-    Permutation-equivariant deep-set model for in-context regression.
-
-    Instantiate via ModelConfig for full control:
-        cfg = ModelConfig(d_phi=128, d_rho=256, pool="pna", ...)
-        model = DeepSetModel(cfg=cfg)
-
-    Legacy flat-kwargs path (backward compat, no SAB, no normalization):
-        model = DeepSetModel(d_phi=128, d_rho=256, pool="pna")
-    """
-
-    def __init__(self, cfg: ModelConfig = None, *,
-                 d_phi=128, d_rho=256, pool="pna", dropout=0.1):
-        super().__init__()
-        if cfg is None:
-            # Backward-compat path: replicates original behavior exactly
-            cfg = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool, dropout=dropout,
-                              n_sab_feat=0, n_sab_samp=0,
-                              norm_feat=False, norm_target=False, n_heads=4)
-        self.cfg = cfg
-
-        self.phi = build_mlp(3, cfg.d_phi, cfg.d_phi, cfg.dropout)
-
-        # Feature equivariance
-        if cfg.n_sab_feat > 0:
-            self.sab_feat = nn.Sequential(
-                *[SAB(cfg.d_phi, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_sab_feat)])
-        else:
-            self.lambda_feat = nn.Parameter(torch.tensor(1.0))
-            self.gamma_feat  = nn.Parameter(torch.tensor(0.1))
-
-        self.feat_pool = SetPool(cfg.d_phi, cfg.pool, cfg.n_heads, cfg.dropout)
-        rho_in = POOL_SCALE[cfg.pool] * cfg.d_phi
-
-        self.rho = build_mlp(rho_in, cfg.d_rho, cfg.d_rho, cfg.dropout)
-
-        # Sample equivariance
-        if cfg.n_sab_samp > 0:
-            self.sab_samp = nn.Sequential(
-                *[SAB(cfg.d_rho, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_sab_samp)])
-        else:
-            self.lambda_samp = nn.Parameter(torch.tensor(1.0))
-            self.gamma_samp  = nn.Parameter(torch.tensor(0.1))
-
-        self.samp_pool = SetPool(cfg.d_rho, cfg.pool, cfg.n_heads, cfg.dropout)
-        psi_in = POOL_SCALE[cfg.pool] * cfg.d_rho
-
-        self.psi = build_mlp(psi_in, 1, cfg.d_rho // 2, cfg.dropout)
-
-    @staticmethod
-    def _pna_pool(x: torch.Tensor, dim: int) -> torch.Tensor:
-        """Backward-compat static method. Concatenate [sum, mean, max, std] over `dim`."""
-        s   = x.sum(dim=dim)
-        mu  = x.mean(dim=dim)
-        mx  = x.max(dim=dim).values
-        std = x.std(dim=dim, unbiased=False)
-        return torch.cat([s, mu, mx, std], dim=-1)
-
-    def forward(self, X_train: torch.Tensor, y_train: torch.Tensor,
-                x_test: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            X_train : (n, p) float tensor — training features
-            y_train : (n,)   float tensor — training labels
-            x_test  : (p,) or (m, p) float tensor — test feature vector(s)
-
-        Returns:
-            Scalar tensor if x_test is (p,); shape (m,) if x_test is (m, p).
-        """
-        n, p   = X_train.shape
-        single = x_test.ndim == 1
-        if single:
-            x_test = x_test.unsqueeze(0)      # (1, p)
-        m = x_test.shape[0]
-        EPS = 1e-8
-
-        # --- Feature normalization (per-context) ---
-        if self.cfg.norm_feat:
-            f_mean  = X_train.mean(dim=0)                              # (p,)
-            f_std   = X_train.std(dim=0, unbiased=False).clamp(min=EPS)
-            X_train = (X_train - f_mean) / f_std                      # (n, p)
-            x_test  = (x_test  - f_mean) / f_std                      # (m, p)
-
-        # --- Target normalization (per-context) ---
-        y_mean = y_std = None
-        if self.cfg.norm_target:
-            y_mean  = y_train.mean()
-            y_std   = y_train.std(unbiased=False).clamp(min=EPS)
-            y_train = (y_train - y_mean) / y_std                      # (n,)
-
-        # --- Step 1: Build inp and apply phi ---
-        y_e  = y_train.view(1, n, 1).expand(m, n, p)
-        X_e  = X_train.view(1, n, p).expand(m, n, p)
-        xt_e = x_test.view(m, 1, p).expand(m, n, p)
-        inp  = torch.stack([y_e, X_e, xt_e], dim=3)                  # (m, n, p, 3)
-        h    = self.phi(inp)                                           # (m, n, p, d_phi)
-
-        if self.cfg.feature_aggregation_order == "sample_evidence_first":
-            # Step 3 (new): aggregate sample evidence per feature via simple mean,
-            # keeping feature identity. No new modules — uses mean(dim=1 of n-axis).
-            h_perm = h.permute(0, 2, 1, 3)           # (m, p, n, d_phi)
-            h_ev   = h_perm.mean(dim=2)              # (m, p, d_phi) — feature identity preserved
-
-            # Step 4 (new): Feature SAB/equivariance on collapsed evidence
-            if self.cfg.n_sab_feat > 0:
-                h_ev = self.sab_feat(h_ev)           # (m, p, d_phi)
-            else:
-                h_ev = (self.lambda_feat * h_ev
-                        + self.gamma_feat * h_ev.mean(1, keepdim=True))  # (m, p, d_phi)
-
-            # Step 5 (new): Feature pool — feat_pool treats p as set, d_phi as feature dim
-            h_feat = self.feat_pool(h_ev)            # (m, rho_in)
-
-            # Step 6 (new): rho (MLP, applies per-element, works on (m, rho_in))
-            r = self.rho(h_feat)                     # (m, d_rho)
-
-            # Step 7 (new): psi — samp_pool needs (batch, set, d); use n=1 to match psi_in
-            r_pool = self.samp_pool(r.unsqueeze(1))  # (m, psi_in); pna: [sum,mean,max,std] of n=1
-            raw = self.psi(r_pool).squeeze(-1)       # (m,)
-
-        else:  # legacy_feature_pool_first — existing code unchanged
-            # --- Step 2: Feature equivariance ---
-            if self.cfg.n_sab_feat > 0:
-                h_flat = h.contiguous().view(m * n, p, self.cfg.d_phi)
-                h_flat = self.sab_feat(h_flat)                            # (m*n, p, d_phi)
-                h      = h_flat.view(m, n, p, self.cfg.d_phi)
-            else:
-                mean_i = h.mean(dim=2, keepdim=True)
-                h      = self.lambda_feat * h + self.gamma_feat * mean_i  # (m, n, p, d_phi)
-
-            # --- Step 3: Feature pool ---
-            h_flat = h.contiguous().view(m * n, p, self.cfg.d_phi)
-            h_feat = self.feat_pool(h_flat)                               # (m*n, rho_in)
-            rho_in = POOL_SCALE[self.cfg.pool] * self.cfg.d_phi
-            h_feat = h_feat.view(m, n, rho_in)                           # (m, n, rho_in)
-
-            # --- Step 4: rho per sample ---
-            r = self.rho(h_feat)                                          # (m, n, d_rho)
-
-            # --- Step 5: Sample equivariance ---
-            if self.cfg.n_sab_samp > 0:
-                r = self.sab_samp(r)                                      # (m, n, d_rho)
-            else:
-                mean_j = r.mean(dim=1, keepdim=True)
-                r      = self.lambda_samp * r + self.gamma_samp * mean_j  # (m, n, d_rho)
-
-            # --- Step 6: Sample pool ---
-            r_pool = self.samp_pool(r)                                    # (m, psi_in)
-
-            # --- Step 7: psi ---
-            raw = self.psi(r_pool).squeeze(-1)                            # (m,)
-
-        # --- Step 8: Denormalize ---
-        y_hat = raw * y_std + y_mean if self.cfg.norm_target else raw
-
-        return y_hat.squeeze(0) if single else y_hat
-
-
-# ---------------------------------------------------------------------------
 # RidgeExpert (stateless, no nn.Module parameters)
 # ---------------------------------------------------------------------------
 
@@ -446,160 +257,6 @@ class RidgeExpert:
             alpha = torch.linalg.solve(K, y_norm)              # (n,)
             beta  = X_norm.T @ alpha                           # (p,)
         return x_test_norm @ beta                              # (m,)
-
-
-# ---------------------------------------------------------------------------
-# MarketAwareDeepSetModel
-# ---------------------------------------------------------------------------
-
-class MarketAwareDeepSetModel(nn.Module):
-    """
-    Permutation-equivariant deep-set model that aggregates sample evidence
-    per feature before pooling features, preserving feature identity for
-    cross-feature interactions.
-
-    Key difference from DeepSetModel: pooling order is reversed. Sample
-    evidence is aggregated within each (query, feature) slot first, then
-    features interact via SAB or linear equivariance.
-
-    Instantiate via ModelConfig with model_family="market_aware":
-        cfg = ModelConfig(model_family="market_aware", d_sample=64, ...)
-        model = MarketAwareDeepSetModel(cfg=cfg)
-    """
-
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.cfg = cfg
-
-        # TOKEN_DIM = 6: (y, X_ij, xq_j, X_ij*xq_j, X_ij*y, |X_ij-xq_j|)
-        self.phi_sample = build_mlp(6, cfg.d_sample, cfg.d_sample, cfg.dropout)
-
-        # Optional SAB over n (n_sab_sample_per_feature > 0)
-        if cfg.n_sab_sample_per_feature > 0:
-            self.sab_sample = nn.Sequential(*[
-                SAB(cfg.d_sample, cfg.n_heads, cfg.dropout)
-                for _ in range(cfg.n_sab_sample_per_feature)
-            ])
-
-        # Pool over n
-        self.sample_pool_layer = SetPool(cfg.d_sample, cfg.sample_pool, cfg.n_heads, cfg.dropout)
-        d_feat = POOL_SCALE[cfg.sample_pool] * cfg.d_sample
-        self._d_feat = d_feat
-
-        # Feature SAB over p
-        if cfg.n_sab_feat > 0:
-            self.sab_feat = nn.Sequential(*[
-                SAB(d_feat, cfg.n_heads, cfg.dropout)
-                for _ in range(cfg.n_sab_feat)
-            ])
-        else:
-            self.lambda_feat = nn.Parameter(torch.tensor(1.0))
-            self.gamma_feat  = nn.Parameter(torch.tensor(0.1))
-
-        # Prediction head
-        self.beta_head         = build_mlp(d_feat, 1, d_feat // 2, cfg.dropout)
-        self.residual_scale    = nn.Parameter(torch.tensor(cfg.residual_scale_init))
-        self.feat_summary_pool = SetPool(d_feat, "pna", cfg.n_heads, cfg.dropout)
-        self.residual_head     = build_mlp(POOL_SCALE["pna"] * d_feat, 1,
-                                           POOL_SCALE["pna"] * d_feat // 2, cfg.dropout)
-        self.gate_head         = build_mlp(d_feat, 1, cfg.gate_hidden_dim, cfg.dropout)
-
-        # Ridge expert
-        if cfg.use_ridge_expert:
-            self._ridge = RidgeExpert()
-
-    def forward(self, X_train: torch.Tensor, y_train: torch.Tensor,
-                x_test: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            X_train : (n, p) float tensor — training features
-            y_train : (n,)   float tensor — training labels
-            x_test  : (p,) or (m, p) float tensor — test feature vector(s)
-
-        Returns:
-            Scalar tensor if x_test is (p,); shape (m,) if x_test is (m, p).
-        """
-        n, p   = X_train.shape
-        single = x_test.ndim == 1
-        if single:
-            x_test = x_test.unsqueeze(0)   # (1, p)
-        m = x_test.shape[0]
-        EPS = 1e-8
-
-        # --- Step 1: Normalize (identical to DeepSetModel) ---
-        if self.cfg.norm_feat:
-            f_mean  = X_train.mean(dim=0)
-            f_std   = X_train.std(dim=0, unbiased=False).clamp(min=EPS)
-            X_norm  = (X_train - f_mean) / f_std
-            xq_norm = (x_test  - f_mean) / f_std
-        else:
-            X_norm  = X_train
-            xq_norm = x_test
-
-        y_mean = y_std = None
-        if self.cfg.norm_target:
-            y_mean  = y_train.mean()
-            y_std   = y_train.std(unbiased=False).clamp(min=EPS)
-            y_norm  = (y_train - y_mean) / y_std
-        else:
-            y_norm  = y_train
-
-        # --- Step 2: Build 6-feature tokens per (query, feature, sample) ---
-        # y_e:  (m, p, n)
-        y_e  = y_norm.view(1, 1, n).expand(m, p, n)
-        # Xi_e: (m, p, n) — X_norm.T is (p, n)
-        Xi_e = X_norm.T.unsqueeze(0).expand(m, p, n)
-        # xq_e: (m, p, n) — x_test feature j broadcast over samples
-        xq_e = xq_norm.unsqueeze(2).expand(m, p, n)
-
-        tokens = torch.stack([
-            y_e,
-            Xi_e,
-            xq_e,
-            Xi_e * xq_e,
-            Xi_e * y_e,
-            (Xi_e - xq_e).abs(),
-        ], dim=3)                                    # (m, p, n, 6)
-        flat = tokens.view(m * p, n, 6)              # (m*p, n, 6)
-
-        # --- Step 3: Sample evidence per feature ---
-        h  = self.phi_sample(flat)                   # (m*p, n, d_sample)
-        if self.cfg.n_sab_sample_per_feature > 0:
-            h = self.sab_sample(h)                   # (m*p, n, d_sample)
-        ev = self.sample_pool_layer(h)               # (m*p, d_feat)
-        ev = ev.view(m, p, self._d_feat)             # (m, p, d_feat)  ← feature identity preserved
-
-        # --- Step 4: Cross-feature interaction ---
-        if self.cfg.n_sab_feat > 0:
-            ctx = self.sab_feat(ev)                  # (m, p, d_feat)
-        else:
-            ctx = self.lambda_feat * ev + self.gamma_feat * ev.mean(1, keepdim=True)  # (m, p, d_feat)
-
-        # --- Step 5: Neural prediction ---
-        beta_like = self.beta_head(ctx).squeeze(-1)  # (m, p)
-        lin_pred  = (beta_like * xq_norm).sum(dim=1) # (m,)
-        summary   = self.feat_summary_pool(ctx)       # (m, 4*d_feat)
-        resid     = self.residual_head(summary).squeeze(-1)  # (m,)
-        neural    = lin_pred + self.residual_scale * resid   # (m,)
-
-        # --- Step 6: Ridge expert (optional) ---
-        if self.cfg.use_ridge_expert:
-            ridge = self._ridge.predict(X_norm, y_norm, xq_norm, self.cfg.ridge_lambda)  # (m,)
-
-        # --- Step 7: Gate + combine ---
-        ctx_mean = ctx.mean(dim=1)                   # (m, d_feat)
-        gate     = torch.sigmoid(self.gate_head(ctx_mean).squeeze(-1))  # (m,)
-        if self.cfg.use_ridge_expert:
-            pred_norm = ridge + gate * neural
-        else:
-            pred_norm = neural
-
-        # --- Step 8: Denormalize (identical to DeepSetModel) ---
-        y_hat = pred_norm * y_std + y_mean if self.cfg.norm_target else pred_norm
-
-        return y_hat.squeeze(0) if single else y_hat
 
 
 # ---------------------------------------------------------------------------
@@ -733,10 +390,10 @@ class ExchangeableMatrixBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MarketExchangeableICLModel — MODEL3 inductive forecasting
+# DeepSetICLModel - MODEL3 inductive forecasting
 # ---------------------------------------------------------------------------
 
-class MarketExchangeableICLModel(nn.Module):
+class DeepSetICLModel(nn.Module):
     """
     MODEL3 inductive in-context learning model using Hartford-style exchangeable blocks.
 
@@ -751,7 +408,7 @@ class MarketExchangeableICLModel(nn.Module):
     Required config:
       cfg.model_family             == "market_exchangeable_icl"
       cfg.model_arch_version       == "model3"
-      cfg.model3_design_pattern    == "inductive_forecasting"
+      cfg.model_design_pattern    == "inductive_forecasting"
 
     Shared config fields used:
       cfg.d_phi             — channel dimension d_model for blocks
@@ -769,7 +426,7 @@ class MarketExchangeableICLModel(nn.Module):
         super().__init__()
         if cfg.model_family != "market_exchangeable_icl":
             raise ValueError(
-                f"MarketExchangeableICLModel requires model_family='market_exchangeable_icl', "
+                f"DeepSetICLModel requires model_family='market_exchangeable_icl', "
                 f"got {cfg.model_family!r}"
             )
         self.cfg = cfg
@@ -868,10 +525,10 @@ class MarketExchangeableICLModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MarketExchangeableCompletionModel — MODEL3 transductive completion
+# DeepSetCompletionModel - MODEL3 transductive completion
 # ---------------------------------------------------------------------------
 
-class MarketExchangeableCompletionModel(nn.Module):
+class DeepSetCompletionModel(nn.Module):
     """
     MODEL3 transductive completion model for sparse market matrix/tensor completion.
 
@@ -884,7 +541,7 @@ class MarketExchangeableCompletionModel(nn.Module):
     Required config:
       cfg.model_family             == "market_exchangeable_completion"
       cfg.model_arch_version       == "model3"
-      cfg.model3_design_pattern    == "transductive_completion"
+      cfg.model_design_pattern    == "transductive_completion"
 
     Shared config fields used:
       cfg.d_phi     — channel dimension d_model
@@ -896,7 +553,7 @@ class MarketExchangeableCompletionModel(nn.Module):
         super().__init__()
         if cfg.model_family != "market_exchangeable_completion":
             raise ValueError(
-                f"MarketExchangeableCompletionModel requires "
+                f"DeepSetCompletionModel requires "
                 f"model_family='market_exchangeable_completion', got {cfg.model_family!r}"
             )
         self.cfg = cfg
@@ -937,13 +594,8 @@ class MarketExchangeableCompletionModel(nn.Module):
 
 def _instantiate_model(cfg: ModelConfig) -> nn.Module:
     """Route to the correct model class based on cfg.model_family."""
-    family = getattr(cfg, "model_family", "deepset")
-    if family == "deepset":
-        return DeepSetModel(cfg=cfg)
-    if family == "market_aware":
-        return MarketAwareDeepSetModel(cfg=cfg)
-    if family == "market_exchangeable_icl":
-        return MarketExchangeableICLModel(cfg=cfg)
-    if family == "market_exchangeable_completion":
-        return MarketExchangeableCompletionModel(cfg=cfg)
-    raise ValueError(f"Unknown model_family: {family!r}")
+    if cfg.model_family == "market_exchangeable_icl":
+        return DeepSetICLModel(cfg=cfg)
+    if cfg.model_family == "market_exchangeable_completion":
+        return DeepSetCompletionModel(cfg=cfg)
+    raise ValueError(f"Unknown model_family: {cfg.model_family!r}")

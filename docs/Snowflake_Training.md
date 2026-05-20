@@ -12,7 +12,7 @@ written back to Snowflake.
 
 **Steps:**
 
-1. **Create database, schema, and stages** with `run_training_job.sql`: `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_RESULTS_STAGE`, and `@MLJOB_PAYLOAD_STAGE`.
+1. **Create database, schema, and stages** with `run_training_job.sql`: `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, `@EVALUATION_RESULTS_STAGE`, and `@MLJOB_PAYLOAD_STAGE`.
 2. **Create compute pools** with `run_training_job.sql`: `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and `AUTOGLUON_CPU_POOL`. Verify the pools reach `ACTIVE` state before submitting jobs.
 3. **Create network rules, `KAGGLE_API_SECRET`, and `BENCHMARK_EXTERNAL_ACCESS`**. The committed SQL uses placeholders only; never commit real Kaggle credentials.
 4. **Upload scripts and Parquet data** with SnowSQL `PUT`: `src/*.py` and `scripts/*.py` to `@MODEL_STAGE/scripts/`, and local synthetic datasets to `@META_DATASET_STAGE/{train,val,test}/`.
@@ -21,12 +21,71 @@ written back to Snowflake.
 7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_DATASET_STAGE/benchmark_prepared/`.
 8. **Call `run_pretrain_pipeline()`**. Pretrain writes mandatory
    `@MODEL_STAGE/checkpoints/pretrain.pt`; verify it before HPO starts.
-9. **Call `run_hpo_pipeline()`**. HPO requires `pretrain.pt`, tunes `lr`,
-   `weight_decay`, and `dropout`, and writes `@MODEL_STAGE/hpo/best_config.json`.
-   The JSON also includes `model_family` (propagated from `HPO_MODEL_FAMILY`, default
-   `"market_aware"`). `train.py` reads `model_family` from `best_config.json` to
-   instantiate the correct model class.
-10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG` and writes `@MODEL_STAGE/checkpoints/best.pt`. The saved checkpoint `metadata` includes `best_val_mse`, `train_mse_at_best`, and `best_epoch`.
+9. **Call `run_hpo_pipeline()` — two-sweep strategy (recommended)**. HPO requires `pretrain.pt`
+   and produces sweep-specific output files plus a merged `best_config.json`.
+
+   **Sweep 1 — ridge_residual (run first):**
+   ```sql
+   CALL run_hpo_pipeline(
+       'market_exchangeable_icl', 'synthetic_regression_combined',
+       'inductive_forecasting', 'ridge_residual'
+   );
+   ```
+   Writes `@MODEL_STAGE/hpo/best_config_ridge_residual.json` and (same content)
+   `@MODEL_STAGE/hpo/best_config.json`. Fixed architecture (`d_phi=128`, `n_sab_feat=1`);
+   tunes `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim`, `use_huber`,
+   `huber_delta`, `lambda_l1`. Fails the trial on pretrain checkpoint mismatch.
+
+   **MODEL3 DDP Memory Probe (mandatory gate before architecture sweep):**
+   Run at worst-case shape before architecture HPO. Failure must stop the pipeline.
+   ```sql
+   CALL run_model_ddp_memory_probe(
+       'model3', 'inductive_forecasting', 'market_exchangeable_icl',
+       200, 128, 128, 256, 2, TRUE
+   );
+   ```
+   Probe shape: `d_phi=256` (max), `n_blocks=2` (max) — covers all ARCH_D_PHI_CANDIDATES and
+   ARCH_N_SAB_FEAT_CANDIDATES. Use `RUN_BACKWARD=TRUE` (MODEL3 trains with backprop; forward-only
+   understates peak memory). Results at `@MODEL_STAGE/diagnostics/model_ddp_memory_probe.json`.
+
+   **Sweep 2 — architecture (run after probe passes):**
+   ```sql
+   CALL run_hpo_pipeline(
+       'market_exchangeable_icl', 'synthetic_regression_combined',
+       'inductive_forecasting', 'architecture',
+       '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
+   );
+   ```
+   Requires `HPO_BASELINE_CONFIG_STAGE_PATH` pointing to `best_config_ridge_residual.json` from
+   sweep 1. Freezes all optimizer/regularization params from baseline; tunes only
+   `d_phi ∈ {64,128,192,256}` and `n_sab_feat ∈ {1,2}`. Writes:
+   - `best_config_architecture.json` — architecture sweep winner.
+   - `best_config.json` — **merged**: `d_phi`/`n_sab_feat` from sweep 2, all other params from
+     sweep 1. `_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture` record provenance.
+
+   **HPO stage outputs summary:**
+   | File | When written |
+   |------|-------------|
+   | `best_config_ridge_residual.json` | After sweep 1 |
+   | `best_config.json` (= sweep 1) | After sweep 1 |
+   | `best_config_architecture.json` | After sweep 2 |
+   | `best_config.json` (merged) | After sweep 2 |
+
+   `best_config.json` always has: `lr`, `weight_decay`, `d_phi`, `d_rho`, `dropout`, `pool`,
+   `n_sab_feat`, `use_ridge_expert` (always `true`), `ridge_lambda`, `gate_hidden_dim`,
+   `use_huber`, `huber_delta`, `lambda_l1`, `hpo_sweep_mode`, and a `_meta` block.
+
+10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG`
+    and writes `@MODEL_STAGE/checkpoints/best.pt`. The saved checkpoint `metadata` includes
+    `best_val_mse`, `train_mse_at_best`, `best_epoch`, `pretrain_loaded`, `pretrain_policy`, and
+    (when a mismatch occurred) `pretrain_mismatch_reason`.
+
+    **Pretrain Checkpoint Policy (`PRETRAIN_LOAD_POLICY`):** set automatically by
+    `run_model_training_job.py` based on `best_config.hpo_sweep_mode`:
+    - `ridge_residual` → `require_match`: raises RuntimeError on architecture mismatch (fail-fast).
+    - `architecture` → `allow_cold_start_on_arch_mismatch`: logs warning and cold-starts if the
+      pretrain checkpoint's architecture differs from the merged best config. This allows the new
+      `d_phi`/`n_sab_feat` from sweep 2 to differ from the pretrain checkpoint.
 11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
 12. **Run evaluation** — two options depending on Snowflake account node quota:
     - **Split-phase (recommended under tight quota)**: call each phase independently
@@ -43,7 +102,7 @@ written back to Snowflake.
 ## Split-Phase Evaluation Under Tight Node Quota
 
 When the Snowflake account has limited node quota, holding `DEEPSET_GPU_POOL` (10 nodes),
-`DEEPSET_CPU_POOL` (3 nodes), and `AUTOGLUON_CPU_POOL` (30 nodes) simultaneously during the
+`DEEPSET_CPU_POOL` (6 nodes), and `AUTOGLUON_CPU_POOL` (60 nodes) simultaneously during the
 full ~2-hour `run_evaluation_pipeline()` run can cause `Requested number of nodes exceeds node
 limit` failures mid-pipeline. The split-phase procedures expose each benchmark phase as its own
 stored procedure so quota is released between phases.
@@ -91,7 +150,8 @@ CALL run_evaluation_aggregation('<prep>', '<benchmark>', '<autogluon>');
 ## Current Snowflake Guardrails
 
 - `run_training_job.sql` creates `@MLJOB_PAYLOAD_STAGE` in addition to
-  `@META_DATASET_STAGE`, `@MODEL_STAGE`, and `@EVALUATION_RESULTS_STAGE`.
+  `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, and
+  `@EVALUATION_RESULTS_STAGE`.
 - CPU compute pools must use one minimum node. Use `AUTO_SUSPEND_SECS` and
   `INITIALLY_SUSPENDED` for cost control instead of a zero-node minimum.
 - `submit_from_stage(source="@MODEL_STAGE/scripts/", stage_name="MLJOB_PAYLOAD_STAGE")`
@@ -121,8 +181,8 @@ CALL run_evaluation_aggregation('<prep>', '<benchmark>', '<autogluon>');
   seconds with `PREP_RUNTIME_ENVIRONMENT is required`, the old zero-argument
   procedure is still installed. Recreate it with three arguments, then:
   `CALL run_evaluation_pipeline('<prep>', '<benchmark>', '<autogluon>');`
-- DeepSet benchmark shard jobs run `DeepSetModel-MC bounded-context ensemble`, not
-  exact full-context DeepSet inference. The OOM boundary was forwarding the full
+- MODEL3-ICL benchmark shard jobs run `MODEL3-ICL-MC bounded-context ensemble`, not
+  exact full-context inference. The OOM boundary was forwarding the full
   90% processed training split against the full test split inside MC dropout on
   Snowflake GPU nodes. The remediation preserves dataset, seed, split, and test-row
   coverage by splitting 90/10 first, fitting preprocessing on train only, applying
@@ -503,15 +563,20 @@ to `@EVALUATION_RESULTS_STAGE` before any local download:
 ```sql
 CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+CREATE STAGE IF NOT EXISTS EVALUATION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS EVALUATION_RESULTS_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 ```
 
 Resource split:
 
-- GPU (`DEEPSET_GPU_POOL`): 5-node HPO, 10-node DDP training, synthetic DeepSet evaluation, and DeepSet-MC benchmark (10 single-node GPU shard jobs).
-- CPU_X64_M (`DEEPSET_CPU_POOL`): Kaggle download, 3 single-node combined baseline dataset shard jobs, and aggregation. Each baseline shard receives `BENCHMARK_METHODS=<all 9 baseline methods>`, owns a dataset subset, and runs all baseline methods inside the dataset-first loop.
-- CPU_X64_M (`AUTOGLUON_CPU_POOL`): AutoGluon benchmark shards (30 single-node jobs).
+- GPU (`DEEPSET_GPU_POOL`): 5-node HPO, 10-node DDP training, synthetic MODEL3-ICL evaluation, and MODEL3-ICL-MC benchmark (10 single-node GPU shard jobs).
+- CPU_X64_M (`DEEPSET_CPU_POOL`): Kaggle download, 6 single-node synthetic regression baseline dataset shard jobs, and aggregation. Each baseline shard owns a dataset subset and runs all baseline methods inside the dataset-first loop.
+- CPU_X64_M (`AUTOGLUON_CPU_POOL`): Synthetic regression AutoGluon evaluation. Combined suite
+  (`linear_all_v1`) default: 6 logical work-item clusters × 4 target instances = up to 24 concurrent
+  CPU_X64_M nodes. Each cluster runs `evaluate_synthetic_regression_autogluon_ray.py` with Ray
+  distributing independent dataset/seed/condition work items. Main and OOD suites use legacy
+  single-node sharded paths (`evaluate_synthetic_regression.py`).
 
 Evaluation dependency checks are method-aware. The shared prepared-benchmark
 path requires scikit-learn for splitting, preprocessing, and metrics for
@@ -530,7 +595,7 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 3
+  MAX_NODES = 6
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -538,7 +603,7 @@ CREATE COMPUTE POOL DEEPSET_CPU_POOL
 DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;
 CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 30
+  MAX_NODES = 60
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -833,6 +898,9 @@ CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SS
 -- Internal stage for scripts, HPO config, and model checkpoints.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
+-- Internal stage for synthetic regression and OOD evaluation input datasets.
+CREATE STAGE IF NOT EXISTS EVALUATION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
 -- Internal stage for all evaluation CSVs and benchmark comparison outputs.
 CREATE STAGE IF NOT EXISTS EVALUATION_RESULTS_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
@@ -850,8 +918,8 @@ CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_S
 -- GPU_NV_M: 4 A10G GPUs per node. MAX_NODES=10 supports 5-node HPO (20 concurrent
 -- one-GPU trials, 1 round) and 10-node DDP training (world_size=40).
 -- Evaluation: synthetic=1 GPU node; DeepSet benchmark=10 GPU dataset shard jobs;
---   baselines=3 CPU dataset shard jobs, each running all 9 baseline methods;
---   AutoGluon=30 CPU shard jobs. CPU_X64_M: MAX_NODES=3 supports the combined
+--   baselines=6 CPU dataset shard jobs, each running all baseline methods;
+--   AutoGluon=60 CPU shard jobs. CPU_X64_M: MAX_NODES=6 supports the combined
 --   baseline shard topology.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
@@ -864,7 +932,7 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 3
+  MAX_NODES = 6
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -872,7 +940,7 @@ CREATE COMPUTE POOL DEEPSET_CPU_POOL
 DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;
 CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 30
+  MAX_NODES = 60
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -1124,7 +1192,7 @@ Kaggle download uses `compute_pool="DEEPSET_CPU_POOL"` and writes raw `.npz` fil
 to `@META_DATASET_STAGE/kaggle/`. Benchmark dataset preparation uses one CPU node
 and writes `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` plus
 prepared `.npz` files under `benchmark_prepared/{openml,kaggle}/`. HPO, training,
-synthetic evaluation, and DeepSetModel-MC benchmark use
+synthetic evaluation, and MODEL3-ICL-MC benchmark use
 `compute_pool="DEEPSET_GPU_POOL"`; baseline benchmark jobs use
 `compute_pool="DEEPSET_CPU_POOL"` as 3 combined dataset shard jobs with
 `BENCHMARK_METHODS=<all 9 baseline methods>` and bounded concurrency. AutoGluon runs as
@@ -1150,7 +1218,7 @@ releases it, and then continues to the next owned dataset.
 | HPO | `hpo.py` | 5 | `@MODEL_STAGE/hpo/best_config.json` |
 | Training | `train.py` | 10 (DDP, 40 workers) | `@MODEL_STAGE/checkpoints/best.pt` |
 | Synthetic evaluation | `evaluate.py` | 1 GPU single-node job | `@EVALUATION_RESULTS_STAGE/synthetic/test_report.csv` and `mc_report.csv` |
-| DeepSet benchmark | `evaluate.py` | 10 GPU shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/DeepSetModel-MC_shard{i}_of_{n}_detailed.csv` |
+| MODEL3-ICL benchmark | `evaluate.py` | 10 GPU shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/MODEL3-ICL-MC_shard{i}_of_{n}_detailed.csv` |
 | Baseline benchmarks | `evaluate.py` | 3 CPU shard jobs; each receives `BENCHMARK_METHODS=<all 9 baseline methods>` | `@EVALUATION_RESULTS_STAGE/benchmark_parts/<method>_shard{i}_of_{n}_detailed.csv` |
 | AutoGluon benchmark | `evaluate.py` | 30 CPU_X64_M shard jobs | `@EVALUATION_RESULTS_STAGE/benchmark_parts/AutoGluon_shard{i}_of_{n}_detailed.csv` |
 | Aggregate comparison | `evaluate.py` | 1 CPU | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` and `model_comparison_summary.csv` |
@@ -1158,7 +1226,7 @@ releases it, and then continues to the next owned dataset.
 Benchmark preparation is always submitted before shards. When the prepared
 manifest/index and staged `.npz` payloads already exist, the prep job validates
 and exits early, so the expected evaluation work is: five serial runtime probes,
-synthetic evaluation, prep validation, 10 DeepSet benchmark shards, 3 combined
+synthetic evaluation, prep validation, 10 MODEL3-ICL benchmark shards, 3 combined
 baseline shards, 30 AutoGluon shards, aggregate comparison, and the parent
 submission/orchestration job.
 
@@ -1396,7 +1464,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from model import DeepSetModel
+from model import ModelConfig, _instantiate_model
 
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_DIR   = "/tmp/data"
@@ -1438,14 +1506,17 @@ val_loader = DataLoader(
 )
 
 # --- Model, compiler, optimizer, scaler ---
-from model import DeepSetModel, ModelConfig
+from model import ModelConfig, _instantiate_model
 
 cfg = ModelConfig(
     d_phi=128, d_rho=256, pool="pna", n_heads=4,
-    n_sab_feat=1, n_sab_samp=1,
+    n_sab_feat=1,
     norm_feat=True, norm_target=True, dropout=0.1,
+    model_family="market_exchangeable_icl",
+    model_arch_version="model3",
+    model_design_pattern="inductive_forecasting",
 )
-model     = DeepSetModel(cfg=cfg).to(DEVICE)
+model     = _instantiate_model(cfg).to(DEVICE)
 model     = torch.compile(model, mode="reduce-overhead")
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scaler    = torch.cuda.amp.GradScaler(enabled=USE_AMP)
@@ -1635,10 +1706,7 @@ X â†’ Ï† â†’ SAB_feat â†’ pool_feat â†’ Ï â†’ SAB
 `H = LayerNorm(Q + Dropout(MHA(Q, K, K)))`. SAB is permutation equivariant:
 `SAB(X[Ï€]) = SAB(X)[Ï€]` for any permutation Ï€ - a strictly more expressive
 generalisation of the original Î»/Î³ equivariance. The number of SAB layers is
-controlled by `n_sab_feat` and `n_sab_samp` in `ModelConfig`.
-
-Setting `n_sab_feat=0, n_sab_samp=0` recovers the original linear equivariance
-layers exactly (backward-compatible with old checkpoints).
+controlled by `n_sab_feat` in `ModelConfig`.
 
 ### Pooling Modes
 
@@ -1686,8 +1754,7 @@ All hyperparameters are bundled in `ModelConfig` (a `dataclasses.dataclass`):
 | `d_rho` | 256 | rho output dim (â‰¥ n for universality) |
 | `pool` | `"pna"` | Pooling mode (see table above) |
 | `n_heads` | 4 | Attention heads for SAB / AttentionPool |
-| `n_sab_feat` | 1 | SAB layers at feature level |
-| `n_sab_samp` | 1 | SAB layers at sample level |
+| `n_sab_feat` | 1 | Number of ExchangeableMatrixBlocks |
 | `norm_feat` | `True` | Feature standardization |
 | `norm_target` | `True` | Target standardization |
 | `dropout` | 0.1 | Dropout in MLPs and SAB |
@@ -1704,8 +1771,8 @@ from snowflake.ml.registry import Registry
 
 reg = Registry(session=session, database="TABPFN_DB", schema="TABPFN_SCHEMA")
 reg.log_model(
-    model=deepset_model,
-    model_name="DEEPSET_TABPFN_V1",
+    model=model,
+    model_name="MODEL3_ICL_TABPFN_V1",
     version_name="v1",
     sample_input_data=sample_batch,
 )
@@ -1723,8 +1790,8 @@ FROM INFERENCE_TABLE;
 ## Model Output
 
 `best.pt` is the pretrained model artifact. It encodes the learned PPD approximation
-procedure - the full state dict of the DeepSet (phi, rho, psi MLPs and the four
-equivariant scalars Î»_1, Î³_1, Î»_2, Î³_2).
+procedure — the full state dict of the MODEL3 ICL model (ColumnEncoder, CellEncoder,
+ExchangeableMatrixBlocks, and prediction head).
 
 **Key properties:**
 - Stored at `@MODEL_STAGE/checkpoints/best.pt`.
@@ -1736,18 +1803,13 @@ equivariant scalars Î»_1, Î³_1, Î»_2, Î³_2).
 
 ```python
 import torch
-from model import DeepSetModel, ModelConfig
+from model import ModelConfig, _instantiate_model
 
-ckpt = torch.load("best.pt", map_location="cpu")
-if isinstance(ckpt, dict) and "cfg" in ckpt:
-    cfg, state_dict = ckpt["cfg"], ckpt["state_dict"]
-else:                                       # legacy bare state_dict
-    cfg = ModelConfig(d_phi=128, d_rho=256, pool="pna",
-                      n_sab_feat=0, n_sab_samp=0,
-                      norm_feat=False, norm_target=False)
-    state_dict = ckpt
-model = DeepSetModel(cfg=cfg)
-model.load_state_dict(state_dict)
+ckpt = torch.load("best.pt", map_location="cpu", weights_only=True)
+cfg_payload = ckpt.get("cfg")
+cfg = ModelConfig(**cfg_payload) if isinstance(cfg_payload, dict) else cfg_payload
+model = _instantiate_model(cfg)
+model.load_state_dict(ckpt["state_dict"])
 model.eval()
 
 with torch.no_grad():
@@ -1878,10 +1940,12 @@ Done. Files saved to ./models/
 
 ```python
 import torch
-from model import DeepSetModel
+from model import ModelConfig, _instantiate_model
 
-ckpt  = torch.load("models/best.pt", map_location="cpu")
-model = DeepSetModel(cfg=ckpt["cfg"])
+ckpt = torch.load("models/best.pt", map_location="cpu", weights_only=True)
+cfg_payload = ckpt.get("cfg")
+cfg = ModelConfig(**cfg_payload) if isinstance(cfg_payload, dict) else cfg_payload
+model = _instantiate_model(cfg)
 model.load_state_dict(ckpt["state_dict"])
 model.eval()
 ```
@@ -2159,7 +2223,7 @@ baselines + AutoGluon) on 200 OOD datasets across 4 regimes (E/F/G/H, 50 per reg
 
 | Pool | Count | Description |
 |------|-------|-------------|
-| Source pool | 200 staged parquet files | 50 per regime E/F/G/H; generated locally, staged to `@EVAL_DATASET_STAGE/ood_parity/` |
+| Source pool | 200 staged parquet files | 50 per regime E/F/G/H; generated locally, staged to `@EVALUATION_DATASET_STAGE/ood_parity/` |
 | Pilot indexed | 80 (20/regime) | Indexed under `ood_linear_pilot_v1`; DeepSet only |
 | Full suite indexed | 200 (50/regime) | Indexed under `ood_linear_full_v1`; all methods |
 
@@ -2176,11 +2240,11 @@ Output: `data/ood_regression/{E,F,G,H}/dataset_NNNN.parquet` and `data/ood_regre
 ### Step 2 — Stage all 200 OOD parquet files
 
 ```sql
-PUT file://data/ood_regression/E/*.parquet @EVAL_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/ood_regression/F/*.parquet @EVAL_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/ood_regression/G/*.parquet @EVAL_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/ood_regression/H/*.parquet @EVAL_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/ood_regression/ood_manifest.json @EVAL_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/E/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/F/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/G/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/H/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/ood_regression/ood_manifest.json @EVALUATION_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 ### Step 3 — Stage updated Python scripts
@@ -2202,9 +2266,13 @@ CALL run_synthetic_regression_ood_full_evaluation('2.5.0-py311', '2.5.0-py311');
 This runs 5 phases sequentially:
 1. **OOD prep** — indexes 200 datasets under `ood_linear_full_v1`
 2. **DeepSet** — 10 GPU shards on `DEEPSET_GPU_POOL`
-3. **Baselines** — 3 CPU shards on `DEEPSET_CPU_POOL`
-4. **AutoGluon** — 30 CPU shards on `AUTOGLUON_CPU_POOL`
+3. **Baselines** — 6 CPU shards on `DEEPSET_CPU_POOL`
+4. **AutoGluon** — 60 CPU single-node shards on `AUTOGLUON_CPU_POOL` (legacy path)
 5. **Aggregation** — 1 CPU job; outputs to `@EVALUATION_RESULTS_STAGE/ood_full/`
+
+> Note: The combined suite (`linear_all_v1`) uses a different AutoGluon path: 6 distributed
+> work-item clusters × 4 workers via `evaluate_synthetic_regression_autogluon_ray.py`.
+> See the Combined Suite section below.
 
 ### Step 5 — Verify index
 
@@ -2234,3 +2302,224 @@ LIST @EVALUATION_RESULTS_STAGE/ood_full/;
 | `OOD_REGRESSION_N_DATASETS` | 80 | Preferred: number of OOD datasets to index (must be divisible by 4) |
 | `OOD_REGRESSION_N_PILOT` | — | Legacy fallback for `OOD_REGRESSION_N_DATASETS`; still accepted |
 | `OOD_REGRESSION_SUITE_ID` | `ood_linear_pilot_v1` | Suite ID for indexed rows |
+
+---
+
+## Combined Suite Evaluation (linear_all_v1)
+
+The combined suite (`linear_all_v1`, 400 datasets) is an index-level composition of the primary
+in-distribution suite (`linear_poisson_v1_recommended`, regimes A/B/C/D, 200 datasets) and the
+OOD full suite (`ood_linear_full_v1`, regimes E/F/G/H, 200 datasets). No parquet files are merged
+or rewritten; `prepare_combined_suite()` copies rows into `SYNTHETIC_REGRESSION_DATASET_INDEX`.
+
+**Prerequisites:** both source suites must be indexed before running combined prep.
+
+### AutoGluon distributed work-item architecture
+
+The combined suite uses a distributed AutoGluon evaluation path instead of the legacy 60-shard
+single-node path used by the main and OOD suites.
+
+**Default topology (6 clusters × 4 workers = 24 concurrent CPU_X64_M nodes):**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | 6 | Number of logical shard files written |
+| `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` | 4 | `target_instances` per MLJob cluster |
+| `AUTOGLUON_TASK_CPUS` | 1 | CPUs per individual AutoGluon fit task |
+| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Max simultaneous MLJob clusters |
+| `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
+| `SYNREG_AUTOGLUON_ENTRYPOINT` | `evaluate_synthetic_regression_autogluon_ray.py` | Entrypoint |
+
+Each MLJob cluster runs the Ray entrypoint. The driver process:
+1. Loads `SYNTHETIC_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
+2. Expands rows to explicit `(dataset, split_seed, condition)` work items
+3. Assigns this cluster's shard using `assign_synthetic_regression_shard(items, shard_index, num_shards)`
+4. Distributes work items across Ray tasks on the cluster's `target_instances` nodes
+5. Writes exactly one file: `AutoGluon_shard{shard_index}_of_{num_shards}_detailed.csv`
+
+Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CLUSTER_SHARDS`).
+
+### Step-by-step runbook
+
+```sql
+-- Prerequisites: linear_poisson_v1_recommended and ood_linear_full_v1 must be indexed.
+
+-- Step 0: Stage updated scripts (SnowSQL only)
+-- PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/evaluate_synthetic_regression_autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://src/evaluate_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- Verify:
+-- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|evaluate_synthetic_regression_autogluon_ray|capacity_probe)[.]py';
+
+-- Step 1: Capacity probes (verify node envelope before evaluation)
+CALL run_synthetic_regression_combined_baseline_capacity_probe(
+  '2.5.0-py311', '2.5.0-py311', 6
+);
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+
+CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+  '2.5.0-py311', '2.5.0-py311', 6, 4, 6
+);
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+
+-- Step 2: Combined prep (index composition)
+CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
+-- Verify (expect A/B/C/D/E/F/G/H each with 50 rows, total 400):
+-- SELECT prior_regime, COUNT(*) AS n
+-- FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+-- WHERE suite_id = 'linear_all_v1'
+-- GROUP BY prior_regime ORDER BY prior_regime;
+
+-- Step 3: DeepSet evaluation (10 GPU shards → 10 MODEL3-ICL shard files)
+CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
+ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
+
+-- Step 4: Baseline evaluation (6 CPU shards)
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
+ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+
+-- Step 5: Distributed AutoGluon evaluation (6 clusters × 4 workers → 6 shard files)
+CALL run_synthetic_regression_combined_autogluon_evaluation(
+  '2.5.0-py311',
+  '2.5.0-py311',
+  6,     -- AUTOGLUON_CLUSTER_SHARDS
+  4,     -- AUTOGLUON_WORKERS_PER_SHARD
+  1,     -- AUTOGLUON_TASK_CPUS
+  6,     -- AUTOGLUON_CONCURRENT_CLUSTERS
+  300,   -- AUTOGLUON_TIME_LIMIT_SECONDS
+  'best_quality',
+  'evaluate_synthetic_regression_autogluon_ray.py'
+);
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+
+-- Step 6: Aggregation (expects N=6 AutoGluon shard files)
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+
+-- Step 7: Final model training with explicit runtime lineage
+CALL run_model_training(
+  'market_exchangeable_icl',
+  'synthetic_regression_combined',
+  'inductive_forecasting'
+);
+```
+
+### Output verification
+
+```sql
+-- Verify 6 AutoGluon shard files were written:
+LIST @EVALUATION_RESULTS_STAGE/regression/linear_all_v1/
+  PATTERN='.*AutoGluon_shard[0-9]+_of_6_detailed[.]csv';
+
+-- Verify combined aggregation outputs:
+LIST @EVALUATION_RESULTS_STAGE/combined/;
+-- Expected:
+--   synthetic_regression_model_comparison.csv
+--   synthetic_regression_model_comparison_summary.csv
+--   synthetic_regression_summary_by_regime.csv
+--   synthetic_regression_chart_data_model_rank.csv
+
+-- Read combined summary:
+SELECT $1
+FROM @EVALUATION_RESULTS_STAGE/combined/synthetic_regression_model_comparison_summary.csv;
+```
+
+---
+
+## MODEL3 DDP Memory Probe
+
+`run_model_ddp_memory_probe()` is a deployment-safety probe that measures peak CUDA
+memory per DDP worker for representative MODEL3 ICL shapes **before** pretrain / HPO /
+final training.  Because MODEL3 meta-training uses back-propagation through the full
+forward graph, always run with `RUN_BACKWARD=TRUE` to get a faithful peak-memory
+measurement that covers gradient tensors and activation storage during backprop.
+
+### When to run
+
+Run before every new MODEL3 training experiment when:
+- Increasing `N_CONTEXT`, `P_FEATURES`, `M_QUERY`, `D_PHI`, or `N_BLOCKS`.
+- Testing a new `d_phi` value from the HPO search space.
+- Deploying MODEL3 on a new compute pool configuration.
+
+### Procedure signature
+
+```sql
+CALL run_model_ddp_memory_probe(
+    MODEL_ARCH_VERSION   STRING,    -- must be 'model3'
+    MODEL_DESIGN_PATTERN STRING,   -- 'inductive_forecasting' (transductive not yet supported)
+    MODEL_FAMILY          STRING,   -- 'market_exchangeable_icl'
+    N_CONTEXT  INTEGER,             -- context rows (n)
+    P_FEATURES INTEGER,             -- features (p)
+    M_QUERY    INTEGER,             -- query batch size (m)
+    D_PHI      INTEGER,             -- channel dimension (d_phi / d_model)
+    N_BLOCKS   INTEGER,             -- number of ExchangeableMatrixBlocks
+    RUN_BACKWARD BOOLEAN            -- always TRUE for training-regime validation
+);
+```
+
+### Canonical call (production defaults)
+
+```sql
+CALL run_model_ddp_memory_probe(
+    'model3',
+    'inductive_forecasting',
+    'market_exchangeable_icl',
+    200,    -- N_CONTEXT
+    128,    -- P_FEATURES
+    128,    -- M_QUERY
+    128,    -- D_PHI
+    1,      -- N_BLOCKS
+    TRUE    -- RUN_BACKWARD
+);
+```
+
+### Reading results
+
+```sql
+LIST @MODEL_STAGE/diagnostics/;
+
+SELECT $1
+FROM @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json
+  (FILE_FORMAT => (TYPE = JSON));
+```
+
+### JSON result schema
+
+| Field | Description |
+|-------|-------------|
+| `status` | `"ok"` \| `"error"` \| `"skipped_static_memory_guard"` |
+| `shape.n_context` … `shape.run_backward` | Probe input shape and flags |
+| `static_estimate.h_tensor_bytes` | Bytes for H: (m, n, p, d_phi) |
+| `static_estimate.estimated_reserved_bytes` | H × activation_factor × safety_factor |
+| `static_estimate.activation_factor` | 20 (backward) or 8 (forward-only) |
+| `summary.max_peak_reserved_bytes` | Max peak reserved across all 40 workers |
+| `summary.max_reserved_fraction` | max_peak_reserved / cuda_total |
+| `ranks[*].peak_memory_reserved_bytes` | Per-worker peak reserved bytes |
+| `ranks[*].backward_ok` | Whether backward pass succeeded on that worker |
+
+### Static memory guard
+
+Before allocating any tensors the probe estimates
+`H_bytes = m * n * p * d_phi * 4` (float32) and then
+`estimated_reserved = H_bytes * 20 * 1.5` (forward+backward, safety_factor=1.5).
+
+If this estimate exceeds `CUDA_total × MODEL_PROBE_MAX_GPU_MEMORY_FRACTION` (default 0.9),
+the probe emits `status="skipped_static_memory_guard"` without allocating tensors and
+raises `RuntimeError` if `MODEL_PROBE_STRICT_MEMORY_GUARD=true` (default).
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PROBE_N_CONTEXT` | `200` | Context rows |
+| `MODEL_PROBE_P_FEATURES` | `128` | Features |
+| `MODEL_PROBE_M_QUERY` | `128` | Query batch size |
+| `MODEL_PROBE_D_PHI` | `128` | Channel dimension |
+| `MODEL_PROBE_N_BLOCKS` | `1` | ExchangeableMatrixBlocks |
+| `MODEL_PROBE_RUN_BACKWARD` | `true` | Run backward pass (always true for training-regime validation) |
+| `MODEL_PROBE_DTYPE` | `float32` | Tensor dtype (`float32` or `bfloat16`) |
+| `MODEL_PROBE_MAX_GPU_MEMORY_FRACTION` | `0.9` | Static guard threshold as fraction of GPU total |
+| `MODEL_PROBE_MAX_TENSOR_BYTES` | — | Hard byte cap (optional override) |
+| `MODEL_PROBE_MEMORY_SAFETY_FACTOR` | `1.5` | Overhead multiplier for reserved estimate |
+| `MODEL_PROBE_STRICT_MEMORY_GUARD` | `true` | Raise if guard triggers |
+| `MODEL_PROBE_OUTPUT_STAGE` | `@MODEL_STAGE/diagnostics/` | Upload destination |

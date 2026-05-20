@@ -327,9 +327,9 @@ class TestBaselineMode:
         assert "FixedRidgeLambda1" in evsr.SYNREG_BASELINE_METHODS
         assert "OLS" not in evsr.SYNREG_BASELINE_METHODS
 
-    def test_3_baseline_shards_exist_as_constant(self):
+    def test_6_baseline_shards_exist_as_constant(self):
         from run_synthetic_regression_evaluation import SYNREG_CPU_SHARDS
-        assert SYNREG_CPU_SHARDS == 3
+        assert SYNREG_CPU_SHARDS == 6
 
     def test_all_baseline_methods_present(self):
         expected = {
@@ -496,7 +496,7 @@ class TestLoadSyntheticRegressionIndexKeyNormalization:
             "SUITE_FAMILY": "primary",
             "DATASET_ID": 0,
             "DATASET_SEED": 42,
-            "STAGE_PATH": "@EVAL_DATASET_STAGE/primary/dataset_0000.parquet",
+            "STAGE_PATH": "@EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet",
             "PRIOR_REGIME": "A",
             "SPLIT_SEEDS": "[0, 1, 2]",   # JSON string — common Snowflake serialisation
             "N_TOTAL": 500,
@@ -562,7 +562,7 @@ class TestLoadSyntheticRegressionIndexKeyNormalization:
         assert result[0]["split_seeds"] == [0]
 
     def test_stage_path_value_preserved(self):
-        expected = "@EVAL_DATASET_STAGE/primary/dataset_0000.parquet"
+        expected = "@EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet"
         mock_row = self._make_mock_row({"STAGE_PATH": expected})
         mock_sql = MagicMock()
         mock_sql.collect.return_value = [mock_row]

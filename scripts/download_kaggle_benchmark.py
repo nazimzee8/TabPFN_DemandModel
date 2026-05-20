@@ -20,11 +20,11 @@ Output: one .npz per competition in out_dir/
     source               : (1,) object     — always "kaggle"
     task_type            : (1,) object     — "regression" or "classification"
 
-DeepSetModel fitness notes (for regression benchmark):
+MODEL3-ICL fitness notes (for regression benchmark):
     s3e5 Wine Quality     — 11 numerical features, ordinal target 3–9, ~130k rows → subsampled.
                             Smooth chemistry features; ordinal-as-continuous is a standard approximation.
     s3e9 Concrete Strength — 8 numerical features, ~1030 rows, continuous target.
-                            Small dataset is DeepSet's strength; non-linear cement/water/age
+                            Small dataset is MODEL3-ICL's strength; non-linear cement/water/age
                             interactions may challenge a linear-prior-trained model.
     s3e3/s3e22/s3e26      — Classification: staged for future benchmark; excluded from regression run.
 """

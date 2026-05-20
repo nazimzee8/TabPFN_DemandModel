@@ -4,6 +4,7 @@ Stored procedure handler for submitting only the model training MLJob.
 
 import json
 import os
+import tempfile
 
 from snowflake.ml.jobs import submit_from_stage
 
@@ -14,6 +15,7 @@ MODEL_STAGE = "@MODEL_STAGE"
 SCRIPTS_STAGE = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 TRAIN_NUM_NODES = 10
+LOCAL_TMP_DIR = tempfile.gettempdir()
 
 # Training data family — identifies the synthetic data suite used for this training run.
 # Production synthetic regression evaluation checkpoints use synthetic_regression_combined
@@ -24,10 +26,8 @@ DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
 )
 
 # MODEL3 architecture selectors — propagated to the training MLJob env_vars.
-# Default values preserve MODEL2 production behavior.
-DEFAULT_DEEPSET_MODEL_FAMILY  = os.getenv("DEEPSET_MODEL_FAMILY",  "market_aware")
-DEFAULT_MODEL_ARCH_VERSION    = os.getenv("MODEL_ARCH_VERSION",    "model2")
-DEFAULT_MODEL3_DESIGN_PATTERN = os.getenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
+DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
 def _wait_done(job, label):
@@ -136,8 +136,49 @@ def _validate_meta_dataset_index(session):
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
+    # Column existence check — catches missing columns before long GPU jobs
+    _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
+    try:
+        session.sql(
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_DATASET_INDEX LIMIT 1"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"META_DATASET_INDEX is missing one or more required columns "
+            f"({_REQUIRED_COLUMNS}). "
+            "Rebuild with CALL build_meta_dataset_index(); "
+            f"Error: {exc}"
+        ) from exc
 
-def run_model_training(session) -> str:
+    # Stage file accessibility spot-check — catches empty/missing staged data
+    for _split in ("train", "val"):
+        try:
+            _files = session.sql(f"LIST @META_DATASET_STAGE/{_split}/").collect()
+            if not _files:
+                raise RuntimeError(
+                    f"No staged files found in @META_DATASET_STAGE/{_split}/. "
+                    "Re-upload training data before starting a GPU job."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"META_DATASET_INDEX references @META_DATASET_STAGE/{_split}/ "
+                f"but the stage directory is inaccessible: {exc}. "
+                "Verify stage permissions and re-upload data."
+            ) from exc
+
+
+def _run_model_training_impl(
+    session,
+    model_family: str,
+    training_data_family: str,
+    model_design_pattern: str,
+) -> str:
+    """Core implementation for model training submission.
+
+    All logic is here; run_model_training() and run_model_training_model() delegate to this.
+    """
     if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config.json"):
         raise FileNotFoundError(
             f"{MODEL_STAGE}/hpo/best_config.json is required before training. "
@@ -145,12 +186,20 @@ def run_model_training(session) -> str:
             "if the config is missing."
         )
 
-    session.file.get(f"{MODEL_STAGE}/hpo/best_config.json", "/tmp/")
-    with open("/tmp/best_config.json") as f:
+    session.file.get(f"{MODEL_STAGE}/hpo/best_config.json", LOCAL_TMP_DIR)
+    with open(os.path.join(LOCAL_TMP_DIR, "best_config.json")) as f:
         best_config = json.load(f)
     print("Best config:", best_config)
 
     _validate_meta_dataset_index(session)
+
+    # Determine pretrain checkpoint load policy from best_config.hpo_sweep_mode
+    hpo_sweep_mode = best_config.get("hpo_sweep_mode", "ridge_residual")
+    pretrain_policy = (
+        "allow_cold_start_on_arch_mismatch"
+        if hpo_sweep_mode == "architecture"
+        else "require_match"
+    )
 
     env_vars = {
         "BEST_CONFIG":               json.dumps(best_config),
@@ -159,14 +208,14 @@ def run_model_training(session) -> str:
         "HOME":                      "/tmp",
         "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),   # 10 × 4 = 40
         "STRICT_WORLD_SIZE_CHECK":   "true",
-        "DEEPSET_MODEL_FAMILY":       DEFAULT_DEEPSET_MODEL_FAMILY,
-        "TRAINING_DATA_FAMILY":       DEFAULT_TRAINING_DATA_FAMILY,
-        "MODEL_ARCH_VERSION":         DEFAULT_MODEL_ARCH_VERSION,
-        "MODEL3_DESIGN_PATTERN":      DEFAULT_MODEL3_DESIGN_PATTERN,
+        "MODEL_FAMILY":               model_family,
+        "TRAINING_DATA_FAMILY":       training_data_family,
+        "MODEL_DESIGN_PATTERN":      model_design_pattern,
+        "PRETRAIN_LOAD_POLICY":      pretrain_policy,
     }
     if _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "pretrain.pt"):
         env_vars["PRETRAIN_CHECKPOINT_PATH"] = f"{MODEL_STAGE}/checkpoints/pretrain.pt"
-        print("pretrain.pt found; final training will warm-start from it.")
+        print(f"pretrain.pt found; final training will warm-start from it (policy={pretrain_policy!r}).")
     else:
         print("No pretrain.pt found; final training starts from random initialization.")
 
@@ -187,6 +236,7 @@ def run_model_training(session) -> str:
             "STRICT_WORLD_SIZE_CHECK":    env_vars["STRICT_WORLD_SIZE_CHECK"],
             "CHECKPOINT_OUTPUT_NAME":     env_vars["CHECKPOINT_OUTPUT_NAME"],
             "TRAINING_DATA_FAMILY":       env_vars["TRAINING_DATA_FAMILY"],
+            "PRETRAIN_LOAD_POLICY":       env_vars["PRETRAIN_LOAD_POLICY"],
             "compute_pool":               GPU_POOL,
             "entrypoint":                 "train.py",
             "source":                     SCRIPTS_STAGE,
@@ -204,9 +254,10 @@ def run_model_training(session) -> str:
         "expected_train_world_size": int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"]),
         "strict_world_size_check":   env_vars["STRICT_WORLD_SIZE_CHECK"],
         "checkpoint_output_name":    env_vars["CHECKPOINT_OUTPUT_NAME"],
-        "training_data_family":      DEFAULT_TRAINING_DATA_FAMILY,
+        "training_data_family":      training_data_family,
         "has_best_config":           True,
         "has_pretrain":              "PRETRAIN_CHECKPOINT_PATH" in env_vars,
+        "pretrain_load_policy":      pretrain_policy,
         "compute_pool":              GPU_POOL,
         "target_instances":          TRAIN_NUM_NODES,
         "entrypoint":                "train.py",
@@ -214,7 +265,7 @@ def run_model_training(session) -> str:
         "stage_name":                MLJOB_PAYLOAD_STAGE,
         "best_config":               best_config,
     }
-    _sp_start_local = "/tmp/training_submission_started.json"
+    _sp_start_local = os.path.join(LOCAL_TMP_DIR, "training_submission_started.json")
     with open(_sp_start_local, "w", encoding="utf-8") as _sp_f:
         _json_sp.dump(_sp_start_payload, _sp_f, indent=2, sort_keys=True)
     try:
@@ -248,6 +299,177 @@ def run_model_training(session) -> str:
         "Model training complete.\n\n"
         "MODEL_STAGE checkpoints:\n"
         + "\n".join(f"  {p}" for p in checkpoint_contents)
+    )
+
+
+def run_model_training(session) -> str:
+    """Zero-arg entrypoint: uses env-var defaults."""
+    return _run_model_training_impl(
+        session,
+        DEFAULT_MODEL_FAMILY,
+        DEFAULT_TRAINING_DATA_FAMILY,
+        DEFAULT_MODEL_DESIGN_PATTERN,
+    )
+
+
+def run_model_training_model(
+    session,
+    model_family: str,
+    training_data_family: str,
+    model_design_pattern: str,
+) -> str:
+    """Parameterized model training handler.
+
+    Matches the explicit runtime lineage variable pattern used by run_pretrain_pipeline_model()
+    and run_hpo_pipeline_model(). Passes MODEL_FAMILY, TRAINING_DATA_FAMILY, and
+    MODEL_DESIGN_PATTERN directly to the training MLJob env_vars (does not mutate os.environ).
+
+    MODEL_ARCH_VERSION is not a parameter here — the default 'model3' is set internally
+    by train.py based on MODEL_FAMILY. Do not expose it as a SQL/runtime selector.
+
+    SQL call:
+        CALL run_model_training(
+            'market_exchangeable_icl',
+            'synthetic_regression_combined',
+            'inductive_forecasting'
+        );
+    """
+    print(
+        f"[run_model_training_model] model_family={model_family!r} "
+        f"training_data_family={training_data_family!r} "
+        f"model_design_pattern={model_design_pattern!r}",
+        flush=True,
+    )
+    return _run_model_training_impl(
+        session, model_family, training_data_family, model_design_pattern
+    )
+
+
+def run_model_ddp_memory_probe(
+    session,
+    model_design_pattern: str,
+    model_family: str,
+    n_context: int,
+    p_features: int,
+    m_query: int,
+    d_phi: int,
+    n_blocks: int,
+    run_backward: bool,
+) -> str:
+    """Launch the MODEL3 DDP memory probe on DEEPSET_GPU_POOL.
+
+    Measures peak CUDA memory per DDP worker for the given MODEL3 ICL shape before
+    pretrain / HPO / final training.  Because MODEL3 meta-training uses back-propagation,
+    run_backward should always be True for training-regime validation.
+
+    The probe uses the same DDP topology as training: TRAIN_NUM_NODES nodes ×
+    4 workers/GPUs = world_size 40.  Results are uploaded as structured JSON to
+    @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json.
+
+    Call via:
+        CALL run_model_ddp_memory_probe(
+            'inductive_forecasting', 'market_exchangeable_icl',
+            200, 128, 128, 128, 1, TRUE
+        );
+
+    After the call:
+        LIST @MODEL_STAGE/diagnostics/;
+        SELECT $1 FROM @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json
+          (FILE_FORMAT => (TYPE = JSON));
+    """
+    # ---- Validate arguments before submitting ----
+    if model_design_pattern == "transductive_completion":
+        raise ValueError(
+            "run_model_ddp_memory_probe does not support "
+            "model_design_pattern='transductive_completion'. "
+            "Use model_design_pattern='inductive_forecasting'."
+        )
+    if model_design_pattern != "inductive_forecasting":
+        raise ValueError(
+            f"Unsupported model_design_pattern={model_design_pattern!r}. "
+            "Only 'inductive_forecasting' is currently supported."
+        )
+    if model_family != "market_exchangeable_icl":
+        raise ValueError(
+            f"Unsupported model_family={model_family!r}. "
+            "Only 'market_exchangeable_icl' is currently supported."
+        )
+    for _name, _val in [
+        ("n_context",  n_context),
+        ("p_features", p_features),
+        ("m_query",    m_query),
+        ("d_phi",      d_phi),
+        ("n_blocks",   n_blocks),
+    ]:
+        if _val <= 0:
+            raise ValueError(
+                f"Shape parameter {_name}={_val!r} must be a positive integer."
+            )
+
+    expected_world_size = TRAIN_NUM_NODES * 4   # 10 × 4 = 40
+
+    env_vars = {
+        "HOME":                                "/tmp",
+        "TRAIN_NUM_NODES":                     str(TRAIN_NUM_NODES),
+        "EXPECTED_TRAIN_WORLD_SIZE":           str(expected_world_size),
+        "STRICT_WORLD_SIZE_CHECK":             "true",
+        "MODEL_DESIGN_PATTERN":               model_design_pattern,
+        "MODEL_FAMILY":                        model_family,
+        "MODEL_PROBE_N_CONTEXT":              str(n_context),
+        "MODEL_PROBE_P_FEATURES":             str(p_features),
+        "MODEL_PROBE_M_QUERY":                str(m_query),
+        "MODEL_PROBE_D_PHI":                  str(d_phi),
+        "MODEL_PROBE_N_BLOCKS":               str(n_blocks),
+        "MODEL_PROBE_RUN_BACKWARD":           "true" if run_backward else "false",
+        "MODEL_PROBE_DTYPE":                  "float32",
+        "MODEL_PROBE_MAX_GPU_MEMORY_FRACTION": "0.9",
+        "MODEL_PROBE_STRICT_MEMORY_GUARD":    "true",
+        "MODEL_PROBE_MEMORY_SAFETY_FACTOR":   "1.5",
+        "MODEL_PROBE_OUTPUT_STAGE":           f"{MODEL_STAGE}/diagnostics/",
+    }
+
+    print(
+        "Submitting MODEL3 DDP memory probe:",
+        {
+            "entrypoint":            "model_ddp_memory_probe.py",
+            "compute_pool":          GPU_POOL,
+            "target_instances":      TRAIN_NUM_NODES,
+            "TRAIN_NUM_NODES":       env_vars["TRAIN_NUM_NODES"],
+            "EXPECTED_WORLD_SIZE":   env_vars["EXPECTED_TRAIN_WORLD_SIZE"],
+            "model_design_pattern": model_design_pattern,
+            "model_family":          model_family,
+            "shape": {
+                "n_context":    n_context,
+                "p_features":   p_features,
+                "m_query":      m_query,
+                "d_phi":        d_phi,
+                "n_blocks":     n_blocks,
+                "run_backward": run_backward,
+            },
+        },
+        flush=True,
+    )
+
+    probe_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="model_ddp_memory_probe.py",
+        compute_pool=GPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=TRAIN_NUM_NODES,
+        env_vars=env_vars,
+        session=session,
+    )
+    _wait_done(probe_job, "MODEL3DDPMemoryProbe")
+
+    diagnostics = _list_stage(session, f"{MODEL_STAGE}/diagnostics/")
+    return (
+        "MODEL3 DDP memory probe complete.\n\n"
+        "MODEL_STAGE diagnostics:\n"
+        + "\n".join(f"  {p}" for p in diagnostics)
+        + "\n\nTo read results:\n"
+        "  SELECT $1\n"
+        "  FROM @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json\n"
+        "    (FILE_FORMAT => (TYPE = JSON));"
     )
 
 

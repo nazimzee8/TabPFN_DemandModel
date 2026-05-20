@@ -21,6 +21,10 @@ CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SS
 -- MODEL_STAGE: scripts, HPO config, and model checkpoints only.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
+-- EVALUATION_DATASET_STAGE: staged synthetic regression and OOD evaluation
+-- input datasets only. Production training parquet stays in META_DATASET_STAGE.
+CREATE STAGE IF NOT EXISTS EVALUATION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
 -- EVALUATION_RESULTS_STAGE: all synthetic reports, benchmark part CSVs, and
 -- the canonical final comparison file model_comparison.csv.
 CREATE STAGE IF NOT EXISTS EVALUATION_RESULTS_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
@@ -39,12 +43,18 @@ CREATE STAGE IF NOT EXISTS EPOCH_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 -- GPU_NV_M: 4 A10G GPUs per node. MAX_NODES=10 supports 5-node HPO
 -- (20 concurrent one-GPU trials, 1 round of 20 trials) and 10-node DDP training
 -- (40 DDP workers via num_workers_per_node=4).
--- CPU_X64_M: MAX_NODES=3 supports the three combined CPU baseline shard jobs.
+-- CPU_X64_M: MAX_NODES=6 supports the six combined CPU baseline shard jobs.
 -- Each shard owns a deterministic dataset subset and evaluates all configured
 -- baseline methods across all configured seeds. Oversized CPU rows emit NaN
 -- skip rows instead of exhausting container memory.
--- AUTOGLUON_CPU_POOL uses CPU_X64_M for AutoGluon shard jobs:
--- 30 independent single-node shard jobs, each loading one owned dataset at a time.
+-- AUTOGLUON_CPU_POOL uses CPU_X64_M for AutoGluon shard jobs (combined suite):
+-- Default: 6 logical AutoGluon work-item clusters, 4 target instances per cluster.
+-- Each cluster runs evaluate_synthetic_regression_autogluon_ray.py with Ray for
+-- distributed independent work items. Maximum concurrent nodes = 6 * 4 = 24.
+-- Runtime concurrency can be tuned via SYNREG_AUTOGLUON_CLUSTER_SHARDS /
+-- SYNREG_AUTOGLUON_WORKERS_PER_SHARD / SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS
+-- or procedure overload arguments when quota is temporarily constrained.
+-- Run run_synthetic_regression_combined_autogluon_capacity_probe before evaluation.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
@@ -57,7 +67,7 @@ CREATE COMPUTE POOL DEEPSET_GPU_POOL
 DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;
 CREATE COMPUTE POOL DEEPSET_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 3
+  MAX_NODES = 6
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -65,7 +75,7 @@ CREATE COMPUTE POOL DEEPSET_CPU_POOL
 DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;
 CREATE COMPUTE POOL AUTOGLUON_CPU_POOL
   MIN_NODES = 1
-  MAX_NODES = 30
+  MAX_NODES = 60
   INSTANCE_FAMILY = CPU_X64_M
   AUTO_SUSPEND_SECS = 300
   INITIALLY_SUSPENDED = TRUE;
@@ -378,14 +388,13 @@ CREATE OR REPLACE PROCEDURE build_meta_dataset_index()
 -- run_pretrain_pipeline() trains with default hyperparameters and writes
 -- @MODEL_STAGE/checkpoints/pretrain.pt. Run before run_hpo_pipeline() so
 -- HPO trials warm-start from the pre-trained weights.
--- Zero-arg form uses env-var defaults (MODEL2 production behavior):
+-- Zero-arg form uses env-var defaults:
 --   CALL run_pretrain_pipeline();
--- Parameterized form for MODEL3 training:
+-- Parameterized form:
 --   CALL run_pretrain_pipeline(
---       'market_exchangeable_icl',    -- DEEPSET_MODEL_FAMILY
---       'synthetic_regression_combined',  -- TRAINING_DATA_FAMILY
---       'model3',                     -- MODEL_ARCH_VERSION
---       'inductive_forecasting'       -- MODEL3_DESIGN_PATTERN
+--       'market_exchangeable_icl',       -- MODEL_FAMILY
+--       'synthetic_regression_combined', -- TRAINING_DATA_FAMILY
+--       'inductive_forecasting'          -- MODEL_DESIGN_PATTERN
 --   );
 CREATE OR REPLACE PROCEDURE run_pretrain_pipeline()
   RETURNS STRING
@@ -396,30 +405,44 @@ CREATE OR REPLACE PROCEDURE run_pretrain_pipeline()
   HANDLER = 'run_pretrain_job.run_pretrain_pipeline';
 
 CREATE OR REPLACE PROCEDURE run_pretrain_pipeline(
-  DEEPSET_MODEL_FAMILY STRING,
+  MODEL_FAMILY STRING,
   TRAINING_DATA_FAMILY STRING,
-  MODEL_ARCH_VERSION STRING,
-  MODEL3_DESIGN_PATTERN STRING
+  MODEL_DESIGN_PATTERN STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
-  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_m3';
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_model';
 
 -- run_hpo_pipeline() launches hpo.py on the GPU pool using Ray Tune for distributed HPO.
--- Produces @MODEL_STAGE/hpo/best_config.json on success or hpo_failure.json
--- if the Python driver starts and then fails. Per-trial errors appear in Ray
--- worker logs (visible in Snowsight container logs), not in hpo_failure.json.
--- best_config.json keys: lr, weight_decay, dropout, model_family (from HPO_MODEL_FAMILY,
---   default "market_aware"), plus any architecture fields tuned (d_phi, d_rho, etc.).
+-- Produces @MODEL_STAGE/hpo/best_config.json on success or hpo_failure.json on failure.
+-- best_config.json keys: lr, weight_decay, dropout, d_phi, d_rho, pool, n_sab_feat,
+--   use_ridge_expert, ridge_lambda, gate_hidden_dim, use_huber, huber_delta, lambda_l1,
+--   model_family, model_arch_version, model_design_pattern, hpo_sweep_mode.
 -- Note: HPO only supports inductive_forecasting; transductive_completion raises in hpo.py.
--- Zero-arg:   CALL run_hpo_pipeline();
--- Parameterized for MODEL3:
+--
+-- HPO_SWEEP_MODE controls the search space (default: ridge_residual):
+--   ridge_residual — fixed architecture (d_phi=128, n_sab_feat=1); tunes optimizer,
+--                    Ridge Expert (ridge_lambda, gate_hidden_dim), and robust loss params.
+--   architecture   — tunes d_phi (from [64,128,192,256]) and n_sab_feat (from [1,2]);
+--                    Ridge Expert params also tuned; cold-start allowed on mismatch.
+--
+-- These are two separate HPO executions using the SAME procedure with different HPO_SWEEP_MODE.
+-- Always run ridge_residual first; run architecture only after memory probes confirm safety.
+--
+-- Zero-arg (uses env-var defaults including HPO_SWEEP_MODE):
+--   CALL run_hpo_pipeline();
+-- Three-arg (explicit model selectors; uses HPO_SWEEP_MODE env-var default):
 --   CALL run_hpo_pipeline(
 --       'market_exchangeable_icl', 'synthetic_regression_combined',
---       'model3', 'inductive_forecasting'
+--       'inductive_forecasting'
+--   );
+-- Four-arg (explicit model selectors + explicit HPO_SWEEP_MODE):
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'inductive_forecasting', 'ridge_residual'
 --   );
 CREATE OR REPLACE PROCEDURE run_hpo_pipeline()
   RETURNS STRING
@@ -430,22 +453,82 @@ CREATE OR REPLACE PROCEDURE run_hpo_pipeline()
   HANDLER = 'run_hpo_job.run_hpo_pipeline';
 
 CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
-  DEEPSET_MODEL_FAMILY STRING,
+  MODEL_FAMILY STRING,
   TRAINING_DATA_FAMILY STRING,
-  MODEL_ARCH_VERSION STRING,
-  MODEL3_DESIGN_PATTERN STRING
+  MODEL_DESIGN_PATTERN STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
   RUNTIME_VERSION = '3.11'
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
-  HANDLER = 'run_hpo_job.run_hpo_pipeline_m3';
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_model';
+
+-- Four-arg overload: explicit HPO_SWEEP_MODE selector.
+-- Use 'ridge_residual' for production-safe tuning; 'architecture' for d_phi/n_sab_feat exploration.
+--
+-- Sweep 1 — Ridge Expert / residual / optimizer tuning (run first):
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'inductive_forecasting', 'ridge_residual'
+--   );
+-- Sweep 2 — memory-gated architecture exploration (run after ridge_residual is stable):
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'inductive_forecasting', 'architecture'
+--   );
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING,
+  HPO_SWEEP_MODE STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep';
+
+-- Five-arg overload: explicit HPO_SWEEP_MODE + baseline config stage path.
+-- Use for architecture sweep to freeze optimizer/regularization from sweep 1.
+-- HPO_BASELINE_CONFIG_STAGE_PATH must point to best_config_ridge_residual.json
+-- written by sweep 1 (four-arg or five-arg call with HPO_SWEEP_MODE='ridge_residual').
+-- Pass '' (empty string) for HPO_BASELINE_CONFIG_STAGE_PATH when HPO_SWEEP_MODE='ridge_residual'.
+--
+-- Two-sweep HPO (recommended):
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'inductive_forecasting', 'ridge_residual', ''
+--   );
+--   CALL run_model_ddp_memory_probe(
+--       'inductive_forecasting', 'market_exchangeable_icl',
+--       200, 128, 128, 256, 2, TRUE
+--   );
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_combined',
+--       'inductive_forecasting', 'architecture',
+--       '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
+--   );
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING,
+  HPO_SWEEP_MODE STRING,
+  HPO_BASELINE_CONFIG_STAGE_PATH STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep_with_baseline';
 
 -- run_model_training() reads @MODEL_STAGE/hpo/best_config.json, passes it to
 -- train.py as BEST_CONFIG, and produces @MODEL_STAGE/checkpoints/best.pt.
 -- Checkpoint metadata includes: model_family, task_type, training_data_family,
 --   best_val_mse, train_mse_at_best, best_epoch, pytorch_version.
+-- Zero-arg form uses env-var defaults (MODEL_FAMILY, TRAINING_DATA_FAMILY, MODEL_DESIGN_PATTERN):
 CREATE OR REPLACE PROCEDURE run_model_training()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -453,6 +536,24 @@ CREATE OR REPLACE PROCEDURE run_model_training()
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_model_training_job.py')
   HANDLER = 'run_model_training_job.run_model_training';
+
+-- Parameterized form — same explicit runtime lineage variables as pretrain and HPO:
+--   CALL run_model_training(
+--       'market_exchangeable_icl',       -- MODEL_FAMILY
+--       'synthetic_regression_combined', -- TRAINING_DATA_FAMILY
+--       'inductive_forecasting'          -- MODEL_DESIGN_PATTERN
+--   );
+CREATE OR REPLACE PROCEDURE run_model_training(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_model_training_job.py')
+  HANDLER = 'run_model_training_job.run_model_training_model';
 
 CREATE OR REPLACE PROCEDURE run_training_runtime_probe(target_instances INTEGER)
   RETURNS STRING
@@ -475,12 +576,19 @@ CREATE OR REPLACE PROCEDURE run_training_runtime_probe(target_instances INTEGER)
 -- If logs show Prometheus mmap panic before '[runtime_probe] entered Python',
 -- escalate to Snowflake Support as a managed MLJob/Ray/Prometheus runtime issue.
 
--- run_training_pipeline() runs the full 3-phase pipeline in sequence:
---   Phase 1 (Pretrain)       → @MODEL_STAGE/checkpoints/pretrain.pt
---   Phase 2 (HPO fine-tune)  → @MODEL_STAGE/hpo/best_config.json
---   Phase 3 (Final training) → @MODEL_STAGE/checkpoints/best.pt
--- HPO trials and final training both warm-start from pretrain.pt when
--- architecture matches; otherwise fall back to random init.
+-- run_training_pipeline() runs the full 7-step two-sweep pipeline in sequence:
+--   Step 1 (Validate)         META_DATASET_INDEX counts, columns, stage access
+--   Step 2 (Pretrain)       → @MODEL_STAGE/checkpoints/pretrain.pt
+--   Step 3 (HPO sweep 1)    → @MODEL_STAGE/hpo/best_config_ridge_residual.json
+--                              + @MODEL_STAGE/hpo/best_config.json (same content)
+--   Step 4 (Memory probe)     Worst-case probe (d_phi=256, n_blocks=2) — mandatory gate
+--   Step 5 (HPO sweep 2)    → @MODEL_STAGE/hpo/best_config_architecture.json
+--                              + @MODEL_STAGE/hpo/best_config.json (merged)
+--   Step 6 (Load config)      Downloads and parses merged best_config.json
+--   Step 7 (Final training) → @MODEL_STAGE/checkpoints/best.pt
+-- HPO trials warm-start from pretrain.pt; architecture mismatch policy is
+-- set automatically from best_config.hpo_sweep_mode (require_match for
+-- ridge_residual; allow_cold_start_on_arch_mismatch for architecture).
 CREATE OR REPLACE PROCEDURE run_training_pipeline()
   RETURNS STRING
   LANGUAGE PYTHON
@@ -509,6 +617,54 @@ CREATE OR REPLACE PROCEDURE run_train_epoch_test()
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_epoch_tests.py')
   HANDLER = 'run_epoch_tests.run_train_epoch_test';
+
+-- run_model_ddp_memory_probe() measures peak CUDA memory per DDP worker for a
+-- representative MODEL3 ICL shape before pretrain / HPO / final training.
+--
+-- Run RUN_BACKWARD=TRUE (always) because MODEL3 meta-training uses back-propagation;
+-- the probe with backward gives a faithful peak-memory measurement for training-regime
+-- validation that covers gradient tensors and activation storage during backprop.
+--
+-- Launches model_ddp_memory_probe.py on DEEPSET_GPU_POOL with the same topology as
+-- training (TRAIN_NUM_NODES=10 nodes x 4 workers = world_size 40).
+--
+-- Diagnostic JSON uploaded to @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json.
+--
+-- Usage:
+--   CALL run_training_runtime_probe(1);
+--   CALL run_training_runtime_probe(10);
+--
+--   CALL run_model_ddp_memory_probe(
+--       'inductive_forecasting',
+--       'market_exchangeable_icl',
+--       200,    -- N_CONTEXT
+--       128,    -- P_FEATURES
+--       128,    -- M_QUERY
+--       128,    -- D_PHI
+--       1,      -- N_BLOCKS
+--       TRUE    -- RUN_BACKWARD (always TRUE for training-regime validation)
+--   );
+--
+--   LIST @MODEL_STAGE/diagnostics/;
+--   SELECT $1
+--   FROM @MODEL_STAGE/diagnostics/model_ddp_memory_probe.json
+--     (FILE_FORMAT => (TYPE = JSON));
+CREATE OR REPLACE PROCEDURE run_model_ddp_memory_probe(
+  MODEL_DESIGN_PATTERN STRING,
+  MODEL_FAMILY STRING,
+  N_CONTEXT INTEGER,
+  P_FEATURES INTEGER,
+  M_QUERY INTEGER,
+  D_PHI INTEGER,
+  N_BLOCKS INTEGER,
+  RUN_BACKWARD BOOLEAN
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_model_training_job.py')
+  HANDLER = 'run_model_training_job.run_model_ddp_memory_probe';
 
 -- prepare_benchmark_datasets() fetches OpenML/Kaggle benchmark datasets once,
 -- stages them to @META_DATASET_STAGE/benchmark_prepared/, and writes
@@ -704,6 +860,55 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_capacity_probe(
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_capacity_probe';
 
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_capacity_probe(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_capacity_probe(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_capacity_probe(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_capacity_probe';
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_prep(
   PREP_RUNTIME_ENVIRONMENT STRING,
   BENCHMARK_RUNTIME_ENVIRONMENT STRING,
@@ -749,6 +954,22 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_evaluation(
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_evaluation';
 
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_evaluation';
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_evaluation(
   PREP_RUNTIME_ENVIRONMENT STRING,
   BENCHMARK_RUNTIME_ENVIRONMENT STRING,
@@ -761,6 +982,22 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_evaluation(
   IMPORTS = (
     '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
     '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'F
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_evaluation';
 
@@ -813,11 +1050,11 @@ CALL run_synthetic_regression_aggregation('2.5.0-py311', '2.5.0-py311', '2.5.0-p
 --   1. Generate 200 OOD parquet files locally:
 --      python scripts/ood_regression/generate_ood_eval_data.py --n_datasets 200
 --   2. Stage all 200 OOD parquet files:
---      PUT file://data/ood_regression/E/*.parquet @EVAL_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
---      PUT file://data/ood_regression/F/*.parquet @EVAL_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
---      PUT file://data/ood_regression/G/*.parquet @EVAL_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
---      PUT file://data/ood_regression/H/*.parquet @EVAL_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
---      PUT file://data/ood_regression/ood_manifest.json @EVAL_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/E/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/F/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/G/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/H/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://data/ood_regression/ood_manifest.json @EVALUATION_DATASET_STAGE/ood_parity/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 --   3. Stage updated Python scripts:
 --      PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 --      PUT file://scripts/ood_regression/prepare_ood_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
@@ -839,6 +1076,23 @@ CALL run_synthetic_regression_aggregation('2.5.0-py311', '2.5.0-py311', '2.5.0-p
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -889,9 +1143,33 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_baseline_evaluatio
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_baseline_evaluation';
 
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_baseline_evaluation';
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_autogluon_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_autogluon_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -962,6 +1240,22 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_evaluation';
 
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER,
+  AUTOGLUON_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_evaluation';
+
 -- Combined Suite — Split-Phase Procedures
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_prep(
   BENCH_RUNTIME_ENVIRONMENT STRING,
@@ -999,6 +1293,19 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluatio
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_evaluation';
 
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_evaluation';
+
+-- Combined AutoGluon evaluation — two-argument form uses all defaults from env:
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -1010,6 +1317,33 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_evaluation';
 
+-- Combined AutoGluon evaluation — full dynamic form:
+-- AUTOGLUON_CLUSTER_SHARDS:      number of logical shard files to write (default 6)
+-- AUTOGLUON_WORKERS_PER_SHARD:   target_instances per MLJob cluster   (default 4)
+-- AUTOGLUON_TASK_CPUS:           CPUs per individual AutoGluon fit     (default 1)
+-- AUTOGLUON_CONCURRENT_CLUSTERS: max simultaneous MLJob clusters       (default 6)
+-- AUTOGLUON_TIME_LIMIT_SECONDS:  per-fit time limit in seconds         (default 300)
+-- AUTOGLUON_PRESETS:             AutoGluon presets string              (default best_quality)
+-- AUTOGLUON_ENTRYPOINT:          Ray entrypoint filename               (default evaluate_synthetic_regression_autogluon_ray.py)
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_TASK_CPUS INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  AUTOGLUON_TIME_LIMIT_SECONDS INTEGER,
+  AUTOGLUON_PRESETS STRING,
+  AUTOGLUON_ENTRYPOINT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_evaluation';
+
+-- Combined aggregation — two-argument form defaults to SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT=6:
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -1021,15 +1355,107 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_aggregation';
 
--- Combined split-phase execution (recommended under tight quota):
+-- Combined aggregation — three-argument form with explicit expected AutoGluon shard count:
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  EXPECTED_AUTOGLUON_SHARDS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_aggregation';
+
+-- Combined baseline capacity probe — verify DEEPSET_CPU_POOL can scale before evaluation:
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_capacity_probe';
+
+-- Combined AutoGluon capacity probe — verify AUTOGLUON_CPU_POOL can satisfy the distributed
+-- envelope (concurrent_clusters * workers_per_shard nodes) before evaluation:
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_capacity_probe';
+
+-- Combined split-phase execution with distributed AutoGluon (recommended under tight quota):
+-- Step 0: Verify node quota before committing to the evaluation runs.
+-- CALL run_synthetic_regression_combined_baseline_capacity_probe('2.5.0-py311', '2.5.0-py311', 6);
+-- ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
+-- CALL run_synthetic_regression_combined_autogluon_capacity_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
+-- ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+-- Step 1: Run combined split phases.
 CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
 CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311');
+-- Recommended: 6 clusters x 4 workers = 24 concurrent CPU_X64_M nodes, 1 CPU per fit task
+CALL run_synthetic_regression_combined_autogluon_evaluation(
+  '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality',
+  'evaluate_synthetic_regression_autogluon_ray.py'
+);
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311');
+-- Aggregation expects 6 AutoGluon shard files (N=6 matches cluster_shards above)
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+
+-- Recommended capacity probe calls for reference:
+-- CALL run_synthetic_regression_combined_baseline_capacity_probe(
+--   '2.5.0-py311', '2.5.0-py311', 6
+-- );
+-- CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+--   '2.5.0-py311', '2.5.0-py311', 6, 4, 6
+-- );
+-- CALL run_synthetic_regression_combined_autogluon_evaluation(
+--   '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality',
+--   'evaluate_synthetic_regression_autogluon_ray.py'
+-- );
+-- CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+-- Final training with explicit runtime lineage variables:
+-- CALL run_model_training(
+--   'market_exchangeable_icl', 'synthetic_regression_combined', 'inductive_forecasting'
+-- );
 
 CALL download_kaggle_to_stage();
 LIST @META_DATASET_STAGE/kaggle/;
@@ -1094,10 +1520,30 @@ CALL run_training_runtime_probe(5);   -- 5-node probe (optional)
 CALL run_training_runtime_probe(10);  -- full-topology probe
 CALL run_pretrain_pipeline();
 LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain[.]pt';
-CALL run_hpo_pipeline();
+
+-- HPO Sweep 1 (recommended first): ridge_residual — fixed architecture, tune optimizer/Ridge Expert.
+CALL run_hpo_pipeline(
+  'market_exchangeable_icl',
+  'synthetic_regression_combined',
+  'inductive_forecasting',
+  'ridge_residual'
+);
 LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
--- Inspect best_config.json; expected keys: lr, weight_decay, dropout, model_family, ...
+-- Inspect best_config.json; expected keys include: lr, weight_decay, dropout, ridge_lambda,
+--   gate_hidden_dim, use_huber, n_sab_feat, d_phi, hpo_sweep_mode, use_ridge_expert, ...
 SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
+
+-- HPO Sweep 2 (optional, run after ridge_residual is stable): architecture — tunes d_phi/n_sab_feat.
+-- Run DDP memory probe if d_phi > 128 before using architecture sweep results for final training.
+-- CALL run_hpo_pipeline(
+--   'market_exchangeable_icl',
+--   'synthetic_regression_combined',
+--   'inductive_forecasting',
+--   'architecture'
+-- );
+-- LIST @MODEL_STAGE/hpo/;
+-- SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
+
 CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
 

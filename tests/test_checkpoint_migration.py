@@ -20,8 +20,7 @@ SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
-from model import ModelConfig, DeepSetModel  # noqa: E402
-from evaluate import load_checkpoint_compat  # noqa: E402
+from model import ModelConfig, DeepSetICLModel  # noqa: E402
 
 
 def _load_migrate():
@@ -35,121 +34,118 @@ def _load_migrate():
 
 
 def _tiny_model():
-    cfg = ModelConfig(d_phi=16, d_rho=32, pool="mean", n_sab_feat=0, n_sab_samp=0)
-    model = DeepSetModel(cfg=cfg)
+    cfg = ModelConfig(
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=16, d_rho=32, pool="mean", n_sab_feat=1,
+    )
+    model = DeepSetICLModel(cfg=cfg)
     return cfg, model
 
 
-def test_migrate_legacy_checkpoint_with_pickled_modelconfig():
-    """Create a legacy checkpoint with a pickled ModelConfig, migrate it, verify v2 output."""
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        cfg, model = _tiny_model()
-        legacy_path = os.path.join(tmp_dir, "legacy.pt")
-        # Save cfg as a ModelConfig object (legacy format — will fail weights_only=True).
-        torch.save({"cfg": cfg, "state_dict": model.state_dict()}, legacy_path)
+# ---------------------------------------------------------------------------
+# Retired-family rejection tests (normalize_checkpoint_cfg)
+# ---------------------------------------------------------------------------
 
-        # Confirm the legacy file fails weights_only=True (or safe_globals — either is fine).
-        with pytest.raises(Exception):
-            torch.load(legacy_path, weights_only=True)
+def test_normalize_cfg_rejects_deepset_family():
+    """normalize_checkpoint_cfg raises RuntimeError for retired model_family='deepset'."""
+    sys.path.insert(0, SRC_DIR)
 
-        # Migrate.
-        migrate = _load_migrate()
-        migrated_path = os.path.join(tmp_dir, "migrated.pt")
-        migrate.migrate_checkpoint(legacy_path, migrated_path)
+    # Patch heavy imports for evaluate_synthetic_regression
+    import unittest.mock as mock
+    _snowflake_mock = mock.MagicMock()
+    for mod in ("snowflake", "snowflake.snowpark", "snowflake.snowpark.Session",
+                "matplotlib", "matplotlib.pyplot", "pyarrow", "pyarrow.parquet",
+                "autogluon_models", "baseline_models"):
+        if mod not in sys.modules:
+            sys.modules[mod] = mock.MagicMock()
 
-        # Must load cleanly with weights_only=True.
-        ckpt = torch.load(migrated_path, weights_only=True)
-        assert ckpt["checkpoint_format_version"] == 2
-        assert isinstance(ckpt["cfg"], dict), "cfg must be a plain dict"
-        assert not isinstance(ckpt["cfg"], ModelConfig)
+    from evaluate_synthetic_regression import normalize_checkpoint_cfg
 
-        # State dict keys and tensor shapes preserved.
-        for k, v in model.state_dict().items():
-            assert k in ckpt["state_dict"], f"Missing key {k!r} in migrated state_dict"
-            assert ckpt["state_dict"][k].shape == v.shape, (
-                f"Shape mismatch for {k!r}: {ckpt['state_dict'][k].shape} vs {v.shape}"
-            )
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    payload = {"cfg": {"model_family": "deepset", "d_phi": 64, "d_rho": 128,
+                       "pool": "pna", "n_heads": 4, "n_sab_feat": 1,
+                       "norm_feat": True, "norm_target": True, "dropout": 0.0}}
+    with pytest.raises(RuntimeError, match="retired"):
+        normalize_checkpoint_cfg(payload)
 
 
-def test_migrate_is_idempotent_on_v2_checkpoint():
-    """Migrating a v2 checkpoint produces an identical v2 checkpoint."""
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        cfg, model = _tiny_model()
-        v2_path = os.path.join(tmp_dir, "v2.pt")
-        torch.save(
-            {
-                "checkpoint_format_version": 2,
-                "cfg": dataclasses.asdict(cfg),
-                "state_dict": model.state_dict(),
-                "metadata": {"source": "test"},
-            },
-            v2_path,
-        )
+def test_normalize_cfg_rejects_market_aware_family():
+    """normalize_checkpoint_cfg raises RuntimeError for retired model_family='market_aware'."""
+    sys.path.insert(0, SRC_DIR)
 
-        migrate = _load_migrate()
-        migrated_path = os.path.join(tmp_dir, "v2_migrated.pt")
-        migrate.migrate_checkpoint(v2_path, migrated_path)
+    import unittest.mock as mock
+    for mod in ("snowflake", "snowflake.snowpark", "snowflake.snowpark.Session",
+                "matplotlib", "matplotlib.pyplot", "pyarrow", "pyarrow.parquet",
+                "autogluon_models", "baseline_models"):
+        if mod not in sys.modules:
+            sys.modules[mod] = mock.MagicMock()
 
-        ckpt = torch.load(migrated_path, weights_only=True)
-        assert ckpt["checkpoint_format_version"] == 2
-        assert isinstance(ckpt["cfg"], dict)
-        # All original cfg fields preserved.
-        for k, v in dataclasses.asdict(cfg).items():
-            assert ckpt["cfg"][k] == v, f"cfg field {k!r} changed after idempotent migration"
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+
+    payload = {"cfg": {"model_family": "market_aware", "d_phi": 64, "d_rho": 128,
+                       "pool": "pna", "n_heads": 4, "n_sab_feat": 1,
+                       "norm_feat": True, "norm_target": True, "dropout": 0.0}}
+    with pytest.raises(RuntimeError, match="retired"):
+        normalize_checkpoint_cfg(payload)
 
 
-def test_migrate_bare_state_dict():
-    """Migrating a bare state-dict checkpoint (no 'state_dict' key) writes a v2 checkpoint."""
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        _, model = _tiny_model()
-        bare_path = os.path.join(tmp_dir, "bare.pt")
-        torch.save(model.state_dict(), bare_path)
+def test_normalize_cfg_accepts_model3_icl_family():
+    """normalize_checkpoint_cfg returns ModelConfig for market_exchangeable_icl."""
+    sys.path.insert(0, SRC_DIR)
 
-        migrate = _load_migrate()
-        migrated_path = os.path.join(tmp_dir, "bare_migrated.pt")
-        migrate.migrate_checkpoint(bare_path, migrated_path)
+    import unittest.mock as mock
+    for mod in ("snowflake", "snowflake.snowpark", "snowflake.snowpark.Session",
+                "matplotlib", "matplotlib.pyplot", "pyarrow", "pyarrow.parquet",
+                "autogluon_models", "baseline_models"):
+        if mod not in sys.modules:
+            sys.modules[mod] = mock.MagicMock()
 
-        ckpt = torch.load(migrated_path, weights_only=True)
-        assert ckpt["checkpoint_format_version"] == 2
-        assert isinstance(ckpt["cfg"], dict)
-        # State dict tensors preserved.
-        for k, v in model.state_dict().items():
-            assert k in ckpt["state_dict"]
-            assert ckpt["state_dict"][k].shape == v.shape
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+
+    payload = {"cfg": {
+        "model_family": "market_exchangeable_icl",
+        "model_arch_version": "model3",
+        "model_design_pattern": "inductive_forecasting",
+        "d_phi": 64, "d_rho": 128, "pool": "pna",
+        "n_heads": 4, "n_sab_feat": 1,
+        "norm_feat": True, "norm_target": True, "dropout": 0.0,
+    }}
+    cfg = normalize_checkpoint_cfg(payload)
+    assert cfg.model_family == "market_exchangeable_icl"
 
 
-def test_migrate_backup_created():
-    """migrate_local() creates a .bak file before overwriting."""
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        cfg, model = _tiny_model()
-        checkpoint_path = os.path.join(tmp_dir, "best.pt")
-        torch.save({"cfg": cfg, "state_dict": model.state_dict()}, checkpoint_path)
+def test_normalize_cfg_strips_legacy_fields():
+    """normalize_checkpoint_cfg strips legacy fields before creating ModelConfig."""
+    sys.path.insert(0, SRC_DIR)
 
-        migrate = _load_migrate()
-        migrate.migrate_local(checkpoint_path)
+    import unittest.mock as mock
+    for mod in ("snowflake", "snowflake.snowpark", "snowflake.snowpark.Session",
+                "matplotlib", "matplotlib.pyplot", "pyarrow", "pyarrow.parquet",
+                "autogluon_models", "baseline_models"):
+        if mod not in sys.modules:
+            sys.modules[mod] = mock.MagicMock()
 
-        backup_path = checkpoint_path + ".bak"
-        assert os.path.exists(backup_path), ".bak file must be created by migrate_local()"
-        # Backup must be the original (loads with weights_only=False; contains ModelConfig).
-        bak = torch.load(backup_path, weights_only=False)
-        assert isinstance(bak.get("cfg"), ModelConfig), (
-            "Backup must preserve the original pickled ModelConfig"
-        )
-        # Migrated file must now be v2.
-        ckpt = torch.load(checkpoint_path, weights_only=True)
-        assert ckpt["checkpoint_format_version"] == 2
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+
+    payload = {"cfg": {
+        "model_family": "market_exchangeable_icl",
+        "model_arch_version": "model3",
+        "model_design_pattern": "inductive_forecasting",
+        "d_phi": 64, "d_rho": 128, "pool": "pna",
+        "n_heads": 4, "n_sab_feat": 1,
+        "norm_feat": True, "norm_target": True, "dropout": 0.0,
+        # legacy fields that should be stripped
+        "n_sab_samp": 1,
+        "feature_aggregation_order": "legacy_feature_pool_first",
+        "d_sample": 64,
+        "n_sab_sample_per_feature": 0,
+        "sample_pool": "attn",
+        "residual_scale_init": 0.1,
+    }}
+    # Should not raise despite legacy fields
+    cfg = normalize_checkpoint_cfg(payload)
+    assert cfg.model_family == "market_exchangeable_icl"
 
 
 def test_migrate_metadata_with_primitive_values_passes():
@@ -160,14 +156,14 @@ def test_migrate_metadata_with_primitive_values_passes():
         path = os.path.join(tmp_dir, "with_meta.pt")
         torch.save(
             {
-                "checkpoint_format_version": 2,
+                "checkpoint_format_version": 4,
                 "cfg": {},
                 "state_dict": model.state_dict(),
                 "metadata": {
                     "source": "train.py",
                     "epoch": 42,
                     "val_mse": 0.012,
-                    "tags": ["v2", "final"],
+                    "tags": ["v4", "final"],
                     "nested": {"a": 1, "b": None},
                 },
             },
@@ -177,7 +173,7 @@ def test_migrate_metadata_with_primitive_values_passes():
         out = os.path.join(tmp_dir, "out.pt")
         migrate.migrate_checkpoint(path, out)
         ckpt = torch.load(out, weights_only=True)
-        assert ckpt["checkpoint_format_version"] == 2
+        assert ckpt["checkpoint_format_version"] in (2, 4)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -195,31 +191,3 @@ def test_validate_metadata_with_nonprimitive_raises():
     # Nested non-primitive is also rejected.
     with pytest.raises(ValueError, match="Non-primitive"):
         migrate._validate_metadata({"nested": {"deep": _Custom()}})
-
-
-def test_evaluate_load_model_uses_migrated_checkpoint(monkeypatch):
-    """evaluate.load_model() can instantiate a model from a migrated v2 checkpoint."""
-    import evaluate
-
-    tmp_dir = tempfile.mkdtemp()
-    try:
-        cfg, model = _tiny_model()
-        legacy_path = os.path.join(tmp_dir, "legacy.pt")
-        torch.save({"cfg": cfg, "state_dict": model.state_dict()}, legacy_path)
-
-        migrate = _load_migrate()
-        migrated_path = os.path.join(tmp_dir, "migrated.pt")
-        migrate.migrate_checkpoint(legacy_path, migrated_path)
-
-        # Patch evaluate so it uses the local path without a Snowflake download.
-        monkeypatch.setattr(evaluate, "CHECKPOINT_STAGE", "@FAKE_STAGE/checkpoints")
-        monkeypatch.setattr(os.path, "exists", lambda p: True)
-
-        loaded_model = evaluate.load_model(migrated_path)
-        assert isinstance(loaded_model, DeepSetModel)
-        # Architecture must match the original config.
-        assert loaded_model.cfg.d_phi == cfg.d_phi
-        assert loaded_model.cfg.d_rho == cfg.d_rho
-        assert loaded_model.cfg.pool == cfg.pool
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)

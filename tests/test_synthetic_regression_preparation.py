@@ -460,7 +460,7 @@ def _make_manifest_dataset(dataset_id: int, regime: str = "A",
         "suite_family": suite_family,
         "dataset_id": dataset_id,
         "dataset_seed": dataset_id * 10,
-        "stage_path": f"@EVAL_DATASET_STAGE/primary/dataset_{dataset_id:04d}.parquet",
+        "stage_path": f"@EVALUATION_DATASET_STAGE/primary/dataset_{dataset_id:04d}.parquet",
         "prior_regime": regime,
         "n_total": 200,
         "n_train_default": 160,
@@ -533,7 +533,7 @@ class TestParquetManifestValidation:
         bad_rows = []
         for i in range(3):
             r = _make_manifest_dataset(i)
-            r["stage_path"] = f"@EVAL_DATASET_STAGE/primary/dataset_{i:04d}.WRONG"
+            r["stage_path"] = f"@EVALUATION_DATASET_STAGE/primary/dataset_{i:04d}.WRONG"
             bad_rows.append(r)
         session = _build_mock_session_for_validation(bad_rows, count_override=3)
         result = prep._validate_parquet_index(session, manifest, prep.SYNREG_SUITE_ID)
@@ -649,7 +649,7 @@ class TestLogicalDatasetKeyPersistence:
             suite_family="primary",
             dataset_id=0,
             dataset_seed=42,
-            stage_path="@EVAL_DATASET_STAGE/primary/dataset_0000.parquet",
+            stage_path="@EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet",
             regime="A",
             split_seeds=[0, 1, 2],
             n_total=200,
@@ -669,7 +669,7 @@ class TestLogicalDatasetKeyPersistence:
             suite_family="primary",
             dataset_id=7,
             dataset_seed=42,
-            stage_path="@EVAL_DATASET_STAGE/primary/dataset_0007.parquet",
+            stage_path="@EVALUATION_DATASET_STAGE/primary/dataset_0007.parquet",
             regime="A",
             split_seeds=[0, 1, 2],
             n_total=200,
@@ -684,7 +684,7 @@ class TestLogicalDatasetKeyPersistence:
             suite_family="primary",
             dataset_id=7,
             dataset_seed=42,
-            stage_path="@EVAL_DATASET_STAGE/primary/dataset_0007.parquet",
+            stage_path="@EVALUATION_DATASET_STAGE/primary/dataset_0007.parquet",
             regime="A",
             split_seeds=[0, 1, 2],
             n_total=200,
@@ -772,7 +772,7 @@ class TestCombinedSuite:
             "suite_family": "primary",
             "dataset_id": dataset_id,
             "dataset_seed": dataset_id * 3,
-            "stage_path": f"@EVAL_DATASET_STAGE/primary/dataset_{dataset_id:04d}.npz",
+            "stage_path": f"@EVALUATION_DATASET_STAGE/primary/dataset_{dataset_id:04d}.npz",
             "prior_name": "linear_poisson",
             "prior_version": "v1",
             "prior_regime": regime,
@@ -797,7 +797,7 @@ class TestCombinedSuite:
             "suite_family": "ood_primary",
             "dataset_id": dataset_id,
             "dataset_seed": dataset_id * 7,
-            "stage_path": f"@EVAL_DATASET_STAGE/ood_parity/{regime}/dataset_{dataset_id:04d}.parquet",
+            "stage_path": f"@EVALUATION_DATASET_STAGE/ood_parity/{regime}/dataset_{dataset_id:04d}.parquet",
             "prior_name": "linear_poisson_ood",
             "prior_version": "v1",
             "prior_regime": regime,

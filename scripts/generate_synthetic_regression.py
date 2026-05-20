@@ -4,7 +4,7 @@ generate_synthetic_regression.py
 Generate synthetic regression evaluation data (primary suite) as parquet files locally.
 
 Mirrors generate_dgp.py exactly — produces parquet files that can be PUT to
-@EVAL_DATASET_STAGE/synthetic_regression_prepared/{suite_id}/primary/ and indexed
+@EVALUATION_DATASET_STAGE/synthetic_regression_prepared/{suite_id}/primary/ and indexed
 by prepare_synthetic_regression.py (parquet workflow branch).
 
 Usage:
@@ -149,7 +149,7 @@ def main() -> None:
     regimes = ["A", "B", "C", "D"]
     per_regime = n_datasets // len(regimes)
 
-    stage_prefix = "@EVAL_DATASET_STAGE"
+    stage_prefix = "@EVALUATION_DATASET_STAGE"
 
     primary_dir = os.path.join(out_dir, "synthetic_regression_prepared", suite_id, "primary")
     os.makedirs(primary_dir, exist_ok=True)
@@ -232,11 +232,11 @@ def main() -> None:
 
     print(
         "\n--- SnowSQL PUT commands ---\n"
-        "REMOVE @EVAL_DATASET_STAGE/primary/;\n"
+        "REMOVE @EVALUATION_DATASET_STAGE/primary/;\n"
         f"PUT file://{abs_primary}/*.parquet\n"
-        "    @EVAL_DATASET_STAGE/primary/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        "    @EVALUATION_DATASET_STAGE/primary/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
         f"PUT file://{abs_manifest}\n"
-        "    @EVAL_DATASET_STAGE/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;"
+        "    @EVALUATION_DATASET_STAGE/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;"
     )
 
 

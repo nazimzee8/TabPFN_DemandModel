@@ -27,26 +27,24 @@ from sanity_checks import (
     check_ratio_to_fixed_ridge,
     check_train_val_gap,
 )
-from model import ModelConfig, MarketAwareDeepSetModel
+from model import ModelConfig, DeepSetICLModel
 
 
 def _make_healthy_model():
     cfg = ModelConfig(
-        model_family="market_aware",
-        d_sample=32,
-        n_sab_sample_per_feature=0,
-        sample_pool="attn",
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=64, d_rho=128, pool="pna",
+        n_heads=4, n_sab_feat=1,
         use_ridge_expert=False,
         ridge_lambda=1.0,
-        residual_scale_init=0.1,
         gate_hidden_dim=32,
-        n_sab_feat=1,
-        n_heads=4,
         norm_feat=True,
         norm_target=True,
         dropout=0.0,
     )
-    model = MarketAwareDeepSetModel(cfg=cfg)
+    model = DeepSetICLModel(cfg=cfg)
     model.eval()
     return model
 
@@ -145,7 +143,7 @@ def test_train_val_gap_gate_passes_on_good_ratio():
 # ---------------------------------------------------------------------------
 
 def test_healthy_model_passes_all_gates():
-    """MarketAwareDeepSetModel with random weights passes all gates (loose thresholds).
+    """DeepSetICLModel with random weights passes all gates (loose thresholds).
 
     A freshly-initialized model has random weights and cannot be expected to
     rival ridge regression on a linear DGP.  The ratio gate is therefore set

@@ -1,7 +1,7 @@
 """
 tests/test_model3_icl.py
 
-Tests for MarketExchangeableICLModel — MODEL3 inductive forecasting.
+Tests for DeepSetICLModel — MODEL3 inductive forecasting.
 
 Covers:
   - ModelConfig validation (selector combination checks)
@@ -32,7 +32,7 @@ if SRC_DIR not in sys.path:
 
 from model import (
     ModelConfig,
-    MarketExchangeableICLModel,
+    DeepSetICLModel,
     _instantiate_model,
 )
 
@@ -45,7 +45,7 @@ def _icl_cfg(n_blocks=2, d_model=64, dropout=0.0, use_ridge=False):
     return ModelConfig(
         model_family="market_exchangeable_icl",
         model_arch_version="model3",
-        model3_design_pattern="inductive_forecasting",
+        model_design_pattern="inductive_forecasting",
         d_phi=d_model,
         n_sab_feat=n_blocks,
         n_heads=4,
@@ -59,7 +59,7 @@ def _icl_cfg(n_blocks=2, d_model=64, dropout=0.0, use_ridge=False):
 
 def _fresh_icl(n_blocks=2, d_model=64, use_ridge=False):
     cfg = _icl_cfg(n_blocks=n_blocks, d_model=d_model, use_ridge=use_ridge)
-    m = MarketExchangeableICLModel(cfg)
+    m = DeepSetICLModel(cfg)
     m.eval()
     return m
 
@@ -73,14 +73,14 @@ class TestModelConfigValidation:
         cfg = _icl_cfg()
         assert cfg.model_family == "market_exchangeable_icl"
         assert cfg.model_arch_version == "model3"
-        assert cfg.model3_design_pattern == "inductive_forecasting"
+        assert cfg.model_design_pattern == "inductive_forecasting"
 
     def test_icl_family_requires_model3_arch(self):
         with pytest.raises(ValueError, match="model_arch_version"):
             ModelConfig(
                 model_family="market_exchangeable_icl",
                 model_arch_version="model2",
-                model3_design_pattern="inductive_forecasting",
+                model_design_pattern="inductive_forecasting",
             )
 
     def test_icl_pattern_must_match_family(self):
@@ -88,38 +88,32 @@ class TestModelConfigValidation:
             ModelConfig(
                 model_family="market_exchangeable_completion",
                 model_arch_version="model3",
-                model3_design_pattern="inductive_forecasting",
+                model_design_pattern="inductive_forecasting",
             )
 
     def test_invalid_arch_version_raises(self):
         with pytest.raises(ValueError, match="model_arch_version"):
             ModelConfig(
-                model_family="market_aware",
+                model_family="market_exchangeable_icl",
                 model_arch_version="model99",
             )
 
     def test_invalid_design_pattern_raises(self):
-        with pytest.raises(ValueError, match="model3_design_pattern"):
+        with pytest.raises(ValueError):
             ModelConfig(
-                model_family="market_aware",
-                model3_design_pattern="bad_pattern",
+                model_family="market_exchangeable_icl",
+                model_design_pattern="bad_pattern",
             )
 
-    def test_model2_default_unaffected(self):
-        """MODEL2 default config still works with the new fields."""
-        cfg = ModelConfig(model_family="market_aware", d_phi=128, n_sab_feat=1)
-        assert cfg.model_arch_version == "model2"
-        assert cfg.model3_design_pattern == "inductive_forecasting"
-        m = _instantiate_model(cfg)
-        from model import MarketAwareDeepSetModel
-        assert isinstance(m, MarketAwareDeepSetModel)
+    def test_retired_market_aware_family_raises(self):
+        """Retired model_family='market_aware' must raise ValueError."""
+        with pytest.raises(ValueError, match="model_family"):
+            ModelConfig(model_family="market_aware", d_phi=128, n_sab_feat=1)
 
-    def test_deepset_default_unaffected(self):
-        cfg = ModelConfig(model_family="deepset", d_phi=64, n_sab_feat=0)
-        assert cfg.model_arch_version == "model2"
-        m = _instantiate_model(cfg)
-        from model import DeepSetModel
-        assert isinstance(m, DeepSetModel)
+    def test_retired_deepset_family_raises(self):
+        """Retired model_family='deepset' must raise ValueError."""
+        with pytest.raises(ValueError, match="model_family"):
+            ModelConfig(model_family="deepset", d_phi=64, n_sab_feat=0)
 
 
 # ---------------------------------------------------------------------------
@@ -130,12 +124,17 @@ class TestFactoryRouting:
     def test_instantiate_icl(self):
         cfg = _icl_cfg()
         m = _instantiate_model(cfg)
-        assert isinstance(m, MarketExchangeableICLModel)
+        assert isinstance(m, DeepSetICLModel)
 
     def test_wrong_family_for_icl_class_raises(self):
-        cfg = ModelConfig(model_family="market_aware", d_phi=64)
+        cfg = ModelConfig(
+            model_family="market_exchangeable_completion",
+            model_arch_version="model3",
+            model_design_pattern="transductive_completion",
+            d_phi=64,
+        )
         with pytest.raises(ValueError, match="market_exchangeable_icl"):
-            MarketExchangeableICLModel(cfg)
+            DeepSetICLModel(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +338,7 @@ class TestGradientFlow:
 class TestCheckpointV4:
     def test_checkpoint_format_version_4(self):
         cfg = _icl_cfg()
-        m = MarketExchangeableICLModel(cfg)
+        m = DeepSetICLModel(cfg)
         m.eval()
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "model3.pt")
@@ -349,7 +348,7 @@ class TestCheckpointV4:
             "state_dict": m.state_dict(),
             "metadata": {
                 "model_arch_version": "model3",
-                "model3_design_pattern": "inductive_forecasting",
+                "model_design_pattern": "inductive_forecasting",
                 "model_family": "market_exchangeable_icl",
                 "training_data_family": "synthetic_regression_combined",
                 "task_objective": "inductive_regression",
@@ -359,13 +358,13 @@ class TestCheckpointV4:
         ckpt = torch.load(path, weights_only=False)
         assert ckpt["checkpoint_format_version"] == 4
         assert ckpt["metadata"]["model_arch_version"] == "model3"
-        assert ckpt["metadata"]["model3_design_pattern"] == "inductive_forecasting"
+        assert ckpt["metadata"]["model_design_pattern"] == "inductive_forecasting"
         assert ckpt["metadata"]["model_family"] == "market_exchangeable_icl"
         assert ckpt["metadata"]["task_objective"] == "inductive_regression"
 
     def test_reload_from_checkpoint(self):
         cfg = _icl_cfg()
-        m = MarketExchangeableICLModel(cfg)
+        m = DeepSetICLModel(cfg)
         m.eval()
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "model3_reload.pt")
@@ -392,7 +391,7 @@ class TestCheckpointV4:
         cfg = _icl_cfg()
         d = dataclasses.asdict(cfg)
         assert d["model_arch_version"] == "model3"
-        assert d["model3_design_pattern"] == "inductive_forecasting"
+        assert d["model_design_pattern"] == "inductive_forecasting"
         cfg2 = ModelConfig(**d)
         assert cfg2.model_family == cfg.model_family
         assert cfg2.model_arch_version == cfg.model_arch_version
@@ -416,7 +415,7 @@ class TestFiniteOutputs:
     def test_no_nan_with_dropout(self):
         torch.manual_seed(0)
         cfg = _icl_cfg(dropout=0.2)
-        m = MarketExchangeableICLModel(cfg)
+        m = DeepSetICLModel(cfg)
         m.train()
         X = torch.randn(15, 3)
         y = torch.randn(15)

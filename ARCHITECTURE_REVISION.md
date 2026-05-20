@@ -2,7 +2,7 @@
 
 ## Scope
 
-This document validates `MODEL2`, the current `MarketAwareDeepSetModel`, against Hartford et al. (2018), *Deep Models of Interactions Across Sets*.
+This document validates `MODEL2`, the current `retired MODEL2 model`, against Hartford et al. (2018), *Deep Models of Interactions Across Sets*.
 
 This is an architectural audit only. It does not prescribe immediate implementation work in this revision.
 
@@ -32,9 +32,9 @@ However, the current synthetic regression pipeline is not purely a Hartford matr
 given context (X_train, y_train) and query x_test -> predict y_test
 ```
 
-So the recommended path is not to replace `MarketAwareDeepSetModel` wholesale with a factorized exchangeable autoencoder. The better path is:
+So the recommended path is not to replace `retired MODEL2 model` wholesale with a factorized exchangeable autoencoder. The better path is:
 
-1. Keep `MarketAwareDeepSetModel` as the current production model.
+1. Keep `retired MODEL2 model` as the current production model.
 2. Add a Hartford-aligned model family for structured interaction tensors.
 3. Use exchangeable matrix/tensor blocks before any irreversible pooling.
 4. Keep inductive query prediction as the default objective for synthetic regression.
@@ -44,7 +44,7 @@ In short: adopt Hartford's exchangeable layer as a core block, but do not inheri
 
 ## Current MODEL2 Architecture
 
-`MarketAwareDeepSetModel` currently does the following:
+`retired MODEL2 model` currently does the following:
 
 1. Builds per-query, per-feature, per-sample tokens:
 
@@ -106,7 +106,7 @@ The model should impose permutation equivariance across two sets, i.e. a 2D matr
 
 Partially satisfied.
 
-`MarketAwareDeepSetModel` is sample-row invariant and feature-permutation consistent under current tests. But it does not maintain a full `(row, column)` cell state through multiple exchangeable layers.
+`retired MODEL2 model` is sample-row invariant and feature-permutation consistent under current tests. But it does not maintain a full `(row, column)` cell state through multiple exchangeable layers.
 
 Current MODEL2:
 
@@ -721,7 +721,7 @@ This preserves the MODEL2 principle of avoiding early feature collapse, while ad
 
 ### Recommended Model Family Boundary
 
-Do not mutate current `MarketAwareDeepSetModel` into this architecture incrementally. The changes are large enough to justify a new family:
+Do not mutate current `retired MODEL2 model` into this architecture incrementally. The changes are large enough to justify a new family:
 
 ```text
 model_family = "market_tabicl"
@@ -781,7 +781,7 @@ This requirement is consistent with the DeepSet principle: the training context 
 
 MODEL2 is already directionally aligned with dataset-wise ICL:
 
-- `MarketAwareDeepSetModel.forward(X_train, y_train, x_test)` receives the full context set and query rows.
+- `retired MODEL2 model.forward(X_train, y_train, x_test)` receives the full context set and query rows.
 - It normalizes features and targets using context statistics.
 - It builds query-conditioned evidence from the context.
 - It is row-permutation invariant over context rows.
@@ -1339,7 +1339,7 @@ MAB(Q, K) = MultiheadAttention(Q, K, K) + residual/norm/FFN
 SAB(X)    = MAB(X, X)
 ```
 
-`MarketAwareDeepSetModel` then uses:
+`retired MODEL2 model` then uses:
 
 ```text
 sab_sample  # optional, over samples n inside each (query, feature)
@@ -1637,7 +1637,7 @@ This ordering is consistent with DeepSet architecture and MODEL2 because:
 - context samples remain an unordered set,
 - feature tokens remain exchangeable unless feature identity is explicitly semantic,
 - no irreversible sample or feature pooling happens before structured interaction,
-- `MarketAwareDeepSetModel` remains the current production baseline,
+- `retired MODEL2 model` remains the current production baseline,
 - MODEL3 extends MODEL2's "do not collapse feature identity early" principle.
 
 #### Per-Query Hartford Tensor
@@ -1750,7 +1750,7 @@ to row/query embeddings.
 
 ### Keep MODEL2 as Current Production Baseline
 
-`MarketAwareDeepSetModel` should remain the current production architecture until a Hartford-aligned model is implemented and validated.
+`retired MODEL2 model` should remain the current production architecture until a Hartford-aligned model is implemented and validated.
 
 It is already integrated with:
 
@@ -1871,4 +1871,4 @@ MODEL2 is a strong intermediate architecture. It fixes early feature collapse an
 
 But relative to Hartford et al., it is not yet the right final architecture for a market mental model built on structured interactions across exchangeable axes.
 
-The next principled step is not to keep stretching `MarketAwareDeepSetModel`; it is to design `MODEL3 = MarketExchangeableModel` around exchangeable matrix/tensor blocks, mask-aware reductions, and a clear inductive-vs-transductive objective split.
+The next principled step is not to keep stretching `retired MODEL2 model`; it is to design `MODEL3 = MarketExchangeableModel` around exchangeable matrix/tensor blocks, mask-aware reductions, and a clear inductive-vs-transductive objective split.

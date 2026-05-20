@@ -55,7 +55,7 @@ def run_permutation_tests(model):
     n, p = 20, 5
     cfg = model.cfg
     device = next(model.parameters(), torch.empty(0)).device
-    model_family = getattr(cfg, "model_family", "deepset")
+    model_family = getattr(cfg, "model_family", "market_exchangeable_icl")
 
     X_train = torch.randn(n, p, device=device)
     y_train = torch.randn(n, device=device)
@@ -80,87 +80,7 @@ def run_permutation_tests(model):
                 atol=1e-5,
             )
 
-            if model_family == "market_aware":
-                # Test 3: Feature equivariance via apply_feat_equiv (valid for MarketAware:
-                # has sab_feat when n_sab_feat > 0, else lambda_feat/gamma_feat)
-                d_feat = getattr(model, "_d_feat", getattr(cfg, "d_sample", 64))
-                h = torch.randn(1, p, d_feat, device=device)
-                pi_feat = torch.randperm(p, device=device)
-                results["Test 3 (feature equiv equivariance)"] = torch.allclose(
-                    apply_feat_equiv(model, h[:, pi_feat, :]),
-                    apply_feat_equiv(model, h)[:, pi_feat, :],
-                    atol=1e-4,
-                )
-
-                # Test 4: Finite output (no NaN/Inf)
-                out = model(X_train, y_train, x_test)
-                results["Test 4 (finite output)"] = bool(
-                    torch.isfinite(out).all().item()
-                )
-
-                # Test 5: Batch query output shape
-                x_batch = torch.randn(4, p, device=device)
-                out_batch = model(X_train, y_train, x_batch)
-                results["Test 5 (batch query shape)"] = out_batch.shape == (4,)
-
-            elif model_family == "deepset":
-                D_PHI = cfg.d_phi
-                D_RHO = cfg.d_rho
-
-                r, pi = torch.randn(n, D_RHO, device=device), torch.randperm(n, device=device)
-                results["Test 3 (sample equiv equivariance)"] = torch.allclose(
-                    apply_samp_equiv(model, r[pi]),
-                    apply_samp_equiv(model, r)[pi],
-                    atol=1e-5,
-                )
-
-                h, pi_feat = torch.randn(n, p, D_PHI, device=device), torch.randperm(p, device=device)
-                results["Test 4 (feature equiv equivariance)"] = torch.allclose(
-                    apply_feat_equiv(model, h[:, pi_feat, :]),
-                    apply_feat_equiv(model, h)[:, pi_feat, :],
-                    atol=1e-5,
-                )
-
-                r, pi = torch.randn(n, D_RHO, device=device), torch.randperm(n, device=device)
-                results["Test 5 (sample invariance after pool)"] = torch.allclose(
-                    apply_samp_equiv(model, r).mean(dim=0),
-                    apply_samp_equiv(model, r[pi]).mean(dim=0),
-                    atol=1e-5,
-                )
-
-                if cfg.n_sab_samp == 0:
-                    r = torch.randn(n, D_RHO, device=device)
-                    lam = model.lambda_samp.item()
-                    gam = model.gamma_samp.item()
-                    theta = lam * torch.eye(n, device=device) + (gam / n) * torch.ones(n, n, device=device)
-                    results["Test 6 (Theta matrix form)"] = torch.allclose(
-                        apply_samp_equiv(model, r),
-                        theta @ r,
-                        atol=1e-5,
-                    )
-
-                    r, pi = torch.randn(n, D_RHO, device=device), torch.randperm(n, device=device)
-                    results["Test 7 (mean after permuted equiv)"] = torch.allclose(
-                        apply_samp_equiv(model, r[pi]).mean(dim=0),
-                        apply_samp_equiv(model, r).mean(dim=0),
-                        atol=1e-5,
-                    )
-                else:
-                    r, pi = torch.randn(n, D_RHO, device=device), torch.randperm(n, device=device)
-                    rb = r.unsqueeze(0)
-                    results["Test 6 (SAB sample equivariance)"] = torch.allclose(
-                        model.sab_samp(rb[:, pi, :]).squeeze(0),
-                        model.sab_samp(rb).squeeze(0)[pi],
-                        atol=1e-4,
-                    )
-
-                    h, pi_feat = torch.randn(n, p, D_PHI, device=device), torch.randperm(p, device=device)
-                    results["Test 7 (SAB feature equivariance)"] = torch.allclose(
-                        model.sab_feat(h[:, pi_feat, :]),
-                        model.sab_feat(h)[:, pi_feat, :],
-                        atol=1e-4,
-                    )
-            elif model_family == "market_exchangeable_icl":
+            if model_family == "market_exchangeable_icl":
                 # MODEL3 inductive: row permutation invariance + column permutation consistency
                 # + finite output + batch query shape
                 out_ref = model(X_train, y_train, x_test)
@@ -202,7 +122,7 @@ def run_permutation_tests(model):
             else:
                 raise ValueError(
                     f"Unknown model_family: {model_family!r}. "
-                    "Cannot run permutation tests."
+                    "Only 'market_exchangeable_icl' and 'market_exchangeable_completion' are supported."
                 )
     finally:
         model.train(was_training)
@@ -439,16 +359,16 @@ def deepset_gpu_memory_skip_reason(
         else max_memory_fraction
     )
 
-    # MODEL3 ICL: use the larger H-tensor estimate
-    model_family = None
+    # MODEL3 ICL: use the H-tensor estimate
+    model_family = "market_exchangeable_icl"
     if model is not None:
         cfg = getattr(model, "cfg", None)
         if cfg is not None:
-            model_family = getattr(cfg, "model_family", None)
+            model_family = getattr(cfg, "model_family", "market_exchangeable_icl")
 
     if model_family == "market_exchangeable_icl":
-        cfg = model.cfg
-        d_phi = int(getattr(cfg, "d_phi", 64))
+        cfg = getattr(model, "cfg", None) if model is not None else None
+        d_phi = int(getattr(cfg, "d_phi", 64) if cfg is not None else 64)
         estimate = estimate_model3_icl_gpu_inference_bytes(
             n_train_rows=X_train_np.shape[0],
             n_test_rows=X_test_np.shape[0],
@@ -468,28 +388,10 @@ def deepset_gpu_memory_skip_reason(
             ), estimate
         return None, estimate
 
-    # MODEL2 (deepset, market_aware): original estimator
-    estimate = estimate_deepset_gpu_inference_bytes(
-        n_train_rows=X_train_np.shape[0],
-        n_test_rows=X_test_np.shape[0],
-        n_features=X_train_np.shape[1],
+    raise ValueError(
+        f"Unknown model_family: {model_family!r}. "
+        "Only 'market_exchangeable_icl' is supported for GPU memory estimation."
     )
-    if int(max_inference_bytes) > 0 and estimate > int(max_inference_bytes):
-        return (
-            f"estimated_gpu_inference_bytes={estimate} exceeds "
-            "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES="
-            f"{int(max_inference_bytes)}"
-        ), estimate
-
-    free_budget = int(_cuda_free_bytes(device) * float(max_memory_fraction))
-    if estimate > free_budget:
-        return (
-            f"estimated_gpu_inference_bytes={estimate} exceeds available CUDA "
-            "memory budget "
-            f"{free_budget} (BENCHMARK_DEEPSET_MAX_GPU_MEMORY_FRACTION="
-            f"{float(max_memory_fraction)})"
-        ), estimate
-    return None, estimate
 
 
 def predict_deepset_mc_streamed(

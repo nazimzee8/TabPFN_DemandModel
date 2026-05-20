@@ -57,9 +57,9 @@ def train_timing_fn():
             run_epoch, identity_collate, ParquetMetaDataset,
             reduce_loss_sum_count,
             DATA_DIR, LR, WEIGHT_DECAY, D_PHI, D_RHO, POOL,
-            N_HEADS, N_SAB_FEAT, N_SAB_SAMP, NORM_FEAT, NORM_TARGET,
+            N_HEADS, N_SAB_FEAT, NORM_FEAT, NORM_TARGET,
         )
-        from model import DeepSetModel, ModelConfig
+        from model import ModelConfig, _instantiate_model
         from snowflake_io import materialize_connector_shard
 
         # Pre-training: BEST_CONFIG absent → hyper_params={} → defaults apply.
@@ -100,9 +100,9 @@ def train_timing_fn():
             dist.init_process_group(backend="nccl")
 
         cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool,
-                            n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
+                            n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT,
                             norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout)
-        model     = DeepSetModel(cfg=cfg).to(device)
+        model     = _instantiate_model(cfg).to(device)
         model     = torch.compile(model, mode="reduce-overhead")
         model     = DistributedDataParallel(model, device_ids=[local_rank])
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)

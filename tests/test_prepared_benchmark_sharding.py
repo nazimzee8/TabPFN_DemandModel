@@ -492,7 +492,7 @@ def test_dependency_validation_fails_for_selected_missing_optional_baseline(
         evaluate.validate_benchmark_dependencies([method])
 
 
-@pytest.mark.parametrize("method", ["DeepSetModel-MC", "Ridge", "AutoGluon"])
+@pytest.mark.parametrize("method", ["MODEL3-ICL-MC", "Ridge", "AutoGluon"])
 def test_dependency_validation_requires_sklearn_for_shared_benchmark_path(monkeypatch, method):
     monkeypatch.setattr(
         evaluate,
@@ -625,7 +625,7 @@ def test_deepset_benchmark_uses_train_only_contexts_and_averages_predictions(mon
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=object(),
         seeds=[7],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
         mc_K=3,
@@ -634,7 +634,7 @@ def test_deepset_benchmark_uses_train_only_contexts_and_averages_predictions(mon
     assert calls["contexts"] == [2, 2, 2, 2, 2]
     assert len(calls["preprocess"]) == 1
     assert len(calls["metrics"]) == 1
-    assert detailed_df["method"].tolist() == ["DeepSetModel-MC"]
+    assert detailed_df["method"].tolist() == ["MODEL3-ICL-MC"]
     row = detailed_df.iloc[0]
     assert row["raw_features"] == 3
     assert row["processed_features"] == 3
@@ -739,13 +739,13 @@ def test_deepset_too_few_train_rows_emits_nan_with_feature_metadata(monkeypatch)
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=object(),
         seeds=[0],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
     )
 
     row = detailed_df.iloc[0]
-    assert row["method"] == "DeepSetModel-MC"
+    assert row["method"] == "MODEL3-ICL-MC"
     assert np.isnan(row["mse"])
     assert row["raw_features"] == 3
     assert row["processed_features"] == 3
@@ -819,7 +819,7 @@ def test_deepset_feature_selection_is_train_only_once_and_applied_to_train_and_t
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=ModelWithCfg(),
         seeds=[0],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
     )
@@ -878,13 +878,13 @@ def test_deepset_gpu_memory_budget_skip_happens_before_inference(monkeypatch):
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=object(),
         seeds=[0],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
     )
 
     row = detailed_df.iloc[0]
-    assert row["method"] == "DeepSetModel-MC"
+    assert row["method"] == "MODEL3-ICL-MC"
     assert np.isnan(row["mse"])
     assert "BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES" in row["skip_reason"]
     assert row["estimated_gpu_inference_bytes"] > 10
@@ -907,13 +907,13 @@ def test_deepset_cuda_oom_emits_nan_and_clears_cache(monkeypatch):
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=object(),
         seeds=[0],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
     )
 
     row = detailed_df.iloc[0]
-    assert row["method"] == "DeepSetModel-MC"
+    assert row["method"] == "MODEL3-ICL-MC"
     assert np.isnan(row["mse"])
     assert row["skip_reason"] == "cuda_oom"
     assert row["estimated_gpu_inference_bytes"] == 1234
@@ -1095,12 +1095,12 @@ def test_deepset_skips_selector_when_processed_matrix_is_risky(monkeypatch):
     detailed_df, _, _ = evaluate.run_prepared_benchmark(
         model=ModelWithCfg(),
         seeds=[0],
-        methods=["DeepSetModel-MC"],
+        methods=["MODEL3-ICL-MC"],
         rank=0,
         world_size=1,
     )
 
     row = detailed_df.iloc[0]
-    assert row["method"] == "DeepSetModel-MC"
+    assert row["method"] == "MODEL3-ICL-MC"
     assert np.isnan(row["mse"])
     assert "processed_features=3 exceeds" in row["skip_reason"]

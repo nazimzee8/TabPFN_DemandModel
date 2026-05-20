@@ -21,18 +21,39 @@ print("hpo.py: stdlib imports OK", flush=True)
 FIXED_D_PHI           = 128
 FIXED_D_RHO           = 256
 FIXED_POOL            = "pna"
+FIXED_N_SAB_FEAT      = 1
 BASE_D_PHI_CANDIDATES = [64, 128, 256, 512]      # kept for hpo_epoch_test.py
 BASE_D_RHO_CANDIDATES = [128, 256, 512, 1024]    # kept for hpo_epoch_test.py
 HPO_SPLIT_LIMITS      = {"train": 200, "val": 40}
 NUM_TRIALS            = 20
-HPO_MODEL_FAMILY      = os.environ.get("DEEPSET_MODEL_FAMILY", "market_aware")
+MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "market_exchangeable_icl")
 TRIAL_MAX_EPOCHS      = 30   # max epochs per HPO trial (early stopping via PATIENCE)
 
+# Architecture sweep candidates — memory-safe defaults.
+# d_phi=512 requires explicit DDP memory probe before production use.
+ARCH_D_PHI_CANDIDATES      = [64, 128, 192, 256]
+ARCH_N_SAB_FEAT_CANDIDATES = [1, 2]
+
 # MODEL3 runtime selectors — propagated to HPO workers via env vars.
-# Default: MODEL_ARCH_VERSION="model2" preserves existing MODEL2 HPO behavior.
-# MODEL3 HPO is activated only when MODEL_ARCH_VERSION="model3".
-MODEL_ARCH_VERSION    = os.environ.get("MODEL_ARCH_VERSION",    "model2")
-MODEL3_DESIGN_PATTERN = os.environ.get("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+# MODEL_ARCH_VERSION is hardcoded to "model3".
+MODEL_ARCH_VERSION = "model3"
+MODEL_DESIGN_PATTERN = os.environ.get("MODEL_DESIGN_PATTERN", "inductive_forecasting")
+
+# HPO sweep mode — controls which search space is used.
+# ridge_residual (default): tunes optimizer/regularization/Ridge Expert; architecture fixed.
+# architecture: tunes d_phi/n_sab_feat with Ridge Expert fixed; cold-start allowed on mismatch.
+HPO_SWEEP_MODE = os.environ.get("HPO_SWEEP_MODE", "ridge_residual").strip().lower()
+
+_ALLOWED_HPO_SWEEP_MODES = {"ridge_residual", "architecture"}
+if HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
+    raise ValueError(
+        f"Invalid HPO_SWEEP_MODE={HPO_SWEEP_MODE!r}. "
+        f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
+    )
+
+HPO_BASELINE_CONFIG_STAGE_PATH = os.environ.get(
+    "HPO_BASELINE_CONFIG_STAGE_PATH", ""
+).strip()
 
 
 # IMPORTANT:
@@ -57,6 +78,75 @@ def _upload_json_to_hpo(filename, payload):
         with open(tmp, "w") as f:
             json.dump(payload, f)
         session.file.put(tmp, "@MODEL_STAGE/hpo/", overwrite=True, auto_compress=False)
+
+
+# ── baseline config loader (architecture sweep only) ─────────────────────────
+
+def _load_baseline_config_from_stage(stage_path):
+    """Download and parse the ridge_residual best_config.json for architecture sweep.
+
+    stage_path must be a non-empty Snowflake stage path such as
+    @MODEL_STAGE/hpo/best_config_ridge_residual.json.
+    """
+    import glob as _glob
+    if not stage_path:
+        raise ValueError(
+            "architecture HPO requires HPO_BASELINE_CONFIG_STAGE_PATH. Run ridge_residual HPO "
+            "first, then pass HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_ridge_residual.json"
+        )
+    from snowflake.snowpark import Session
+    session = Session.builder.getOrCreate()
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmp_dir:
+        session.file.get(stage_path, tmp_dir)
+        # session.file.get may rename the file; glob for any .json
+        candidates = sorted(_glob.glob(os.path.join(tmp_dir, "*.json")))
+        if not candidates:
+            raise FileNotFoundError(
+                f"[HPO driver] Failed to download baseline config from {stage_path!r} to {tmp_dir}"
+            )
+        with open(candidates[0]) as f:
+            return json.load(f)
+
+
+def _merge_sweep_configs(baseline_config, arch_config):
+    """Merge ridge_residual baseline config with architecture sweep best config.
+
+    Returns a new dict with:
+    - All keys from baseline_config as the base
+    - d_phi, n_sab_feat, hpo_sweep_mode overridden from arch_config
+    - _meta.sweeps recording both sweeps' provenance
+    - _meta.best_val_mse from the architecture sweep (final gate)
+    """
+    merged = {**baseline_config}
+    # Override architecture-specific keys from arch sweep
+    for key in ("d_phi", "n_sab_feat", "hpo_sweep_mode"):
+        if key in arch_config:
+            merged[key] = arch_config[key]
+
+    baseline_meta = baseline_config.get("_meta", {})
+    arch_meta = arch_config.get("_meta", {})
+    merged["_meta"] = {
+        "sweeps": {
+            "ridge_residual": {
+                "stage_path": "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
+                "best_val_mse": baseline_meta.get("best_val_mse"),
+                "pretrain_warm_start_policy": baseline_meta.get("pretrain_warm_start_policy"),
+            },
+            "architecture": {
+                "stage_path": "@MODEL_STAGE/hpo/best_config_architecture.json",
+                "best_val_mse": arch_meta.get("best_val_mse"),
+                "pretrain_warm_start_policy": arch_meta.get("pretrain_warm_start_policy"),
+                "d_phi": arch_config.get("d_phi"),
+                "n_sab_feat": arch_config.get("n_sab_feat"),
+            },
+        },
+        "merged_from": [
+            "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
+            "@MODEL_STAGE/hpo/best_config_architecture.json",
+        ],
+        "best_val_mse": arch_meta.get("best_val_mse"),
+    }
+    return merged
 
 
 # ── pretrain checkpoint check ─────────────────────────────────────────────────
@@ -175,6 +265,8 @@ def checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "norm_feat",
         "norm_target",
         "model_family",
+        "use_ridge_expert",
+        "gate_hidden_dim",
     )
     return {
         field: {
@@ -417,6 +509,67 @@ def _report_hpo_metric(metrics):
         ) from legacy_report_exc
 
 
+# ── HPO search space builder ──────────────────────────────────────────────────
+
+def build_hpo_search_space(tune, baseline_config=None) -> dict:
+    """Return the Ray Tune search space for the active HPO_SWEEP_MODE.
+
+    ridge_residual (default):
+        Fixed architecture (d_phi, d_rho, n_sab_feat, pool).
+        Tunes: lr, weight_decay, dropout, ridge_lambda, gate_hidden_dim,
+               use_huber, huber_delta, lambda_l1.
+
+    architecture:
+        Requires baseline_config (from ridge_residual sweep).
+        Fixes all optimizer/regularization params from baseline_config.
+        Tunes d_phi from ARCH_D_PHI_CANDIDATES and n_sab_feat from
+        ARCH_N_SAB_FEAT_CANDIDATES. Fixed d_rho and pool.
+    """
+    if HPO_SWEEP_MODE == "ridge_residual":
+        return {
+            "lr":                   tune.loguniform(1e-4, 3e-3),
+            "weight_decay":         tune.loguniform(1e-6, 1e-3),
+            "dropout":              tune.uniform(0.0, 0.25),
+            "use_ridge_expert":     True,
+            "ridge_lambda":         tune.loguniform(1e-3, 1e2),
+            "gate_hidden_dim":      tune.choice([32, 64, 128]),
+            "use_huber":            tune.choice([False, True]),
+            "huber_delta":          tune.choice([0.5, 1.0, 2.0]),
+            "lambda_l1":            tune.choice([0.0, 1e-6, 1e-5, 1e-4]),
+            "d_phi":                FIXED_D_PHI,
+            "n_sab_feat":           FIXED_N_SAB_FEAT,
+            "d_rho":                FIXED_D_RHO,
+            "pool":                 FIXED_POOL,
+            "model_family":         MODEL_FAMILY,
+            "model_design_pattern": MODEL_DESIGN_PATTERN,
+            "hpo_sweep_mode":       HPO_SWEEP_MODE,
+        }
+    # architecture sweep: freeze optimizer/regularization from ridge_residual baseline
+    if baseline_config is None:
+        raise ValueError(
+            "architecture HPO requires HPO_BASELINE_CONFIG_STAGE_PATH. Run ridge_residual HPO "
+            "first, then pass HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_ridge_residual.json"
+        )
+    return {
+        "lr":               float(baseline_config["lr"]),
+        "weight_decay":     float(baseline_config["weight_decay"]),
+        "dropout":          float(baseline_config["dropout"]),
+        "use_ridge_expert": True,
+        "ridge_lambda":     float(baseline_config["ridge_lambda"]),
+        "gate_hidden_dim":  int(baseline_config["gate_hidden_dim"]),
+        "use_huber":        bool(baseline_config.get("use_huber", False)),
+        "huber_delta":      float(baseline_config.get("huber_delta", 1.0)),
+        "lambda_l1":        float(baseline_config.get("lambda_l1", 0.0)),
+        "d_rho":            FIXED_D_RHO,
+        "pool":             FIXED_POOL,
+        "model_family":     MODEL_FAMILY,
+        "model_design_pattern": MODEL_DESIGN_PATTERN,
+        "hpo_sweep_mode":   HPO_SWEEP_MODE,
+        "d_phi":            tune.choice(ARCH_D_PHI_CANDIDATES),
+        "n_sab_feat":       tune.choice(ARCH_N_SAB_FEAT_CANDIDATES),
+    }
+
+
 # ── Ray Tune trainable ────────────────────────────────────────────────────────
 
 def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
@@ -424,11 +577,11 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
     def ray_trainable(config):
         import sys
         import torch
+        import torch.nn as nn
         import ray
         import ray.tune as tune
-        from train import (run_epoch, PATIENCE, N_HEADS, N_SAB_FEAT, N_SAB_SAMP,
-                           NORM_FEAT, NORM_TARGET)
-        from model import DeepSetModel, ModelConfig, _instantiate_model
+        from train import (run_epoch, PATIENCE, N_HEADS, NORM_FEAT, NORM_TARGET)
+        from model import ModelConfig, _instantiate_model
 
         if "snowflake.snowpark" in sys.modules:
             print(
@@ -437,12 +590,20 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
                 flush=True,
             )
 
-        lr           = float(config["lr"])
-        weight_decay = float(config["weight_decay"])
-        dropout      = float(config["dropout"])
-        d_phi        = FIXED_D_PHI
-        d_rho        = FIXED_D_RHO
-        pool         = FIXED_POOL
+        lr               = float(config["lr"])
+        weight_decay     = float(config["weight_decay"])
+        dropout          = float(config["dropout"])
+        d_phi            = int(config.get("d_phi",            FIXED_D_PHI))
+        d_rho            = int(config.get("d_rho",            FIXED_D_RHO))
+        pool             = config.get("pool",                  FIXED_POOL)
+        n_sab_feat       = int(config.get("n_sab_feat",       FIXED_N_SAB_FEAT))
+        use_ridge_expert = bool(config.get("use_ridge_expert", True))
+        ridge_lambda     = float(config.get("ridge_lambda",   1.0))
+        gate_hidden_dim  = int(config.get("gate_hidden_dim",  64))
+        use_huber        = bool(config.get("use_huber",        False))
+        huber_delta      = float(config.get("huber_delta",    1.0))
+        lambda_l1        = float(config.get("lambda_l1",      0.0))
+        hpo_sweep_mode   = str(config.get("hpo_sweep_mode",   "ridge_residual"))
 
         device  = "cuda" if torch.cuda.is_available() else "cpu"
         use_amp = device == "cuda"
@@ -475,11 +636,14 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
 
         cfg = ModelConfig(
             d_phi=d_phi, d_rho=d_rho, pool=pool,
-            n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
+            n_heads=N_HEADS, n_sab_feat=n_sab_feat,
             norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout,
-            model_family=config.get("model_family", HPO_MODEL_FAMILY),
+            model_family=config.get("model_family", MODEL_FAMILY),
             model_arch_version=MODEL_ARCH_VERSION,
-            model3_design_pattern=MODEL3_DESIGN_PATTERN,
+            model_design_pattern=config.get("model_design_pattern", MODEL_DESIGN_PATTERN),
+            use_ridge_expert=use_ridge_expert,
+            ridge_lambda=ridge_lambda,
+            gate_hidden_dim=gate_hidden_dim,
         )
         model     = _instantiate_model(cfg).to(device)
 
@@ -488,15 +652,28 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
         _saved_cfg = pretrain_ckpt.get("cfg")
         _arch_mismatches = checkpoint_architecture_mismatches(_saved_cfg, cfg)
         if _arch_mismatches:
-            raise RuntimeError(
-                "[HPO trial] Pretrain checkpoint architecture mismatch: "
-                f"{_arch_mismatches}; saved={_saved_cfg}, current={cfg}"
-            )
-        model.load_state_dict(pretrain_ckpt["state_dict"])
-        print("[HPO trial] Loaded pretrain checkpoint from Ray object store.", flush=True)
+            if hpo_sweep_mode == "architecture":
+                print(
+                    f"[HPO trial] architecture sweep: pretrain checkpoint mismatch "
+                    f"({_arch_mismatches}); starting this trial from scratch.",
+                    flush=True,
+                )
+            else:
+                raise RuntimeError(
+                    f"[HPO trial] Pretrain checkpoint architecture mismatch: "
+                    f"{_arch_mismatches}; saved={_saved_cfg}, current={cfg}. "
+                    "Fix the architecture or run with HPO_SWEEP_MODE='architecture' "
+                    "to allow cold-start trials on mismatch."
+                )
+        else:
+            model.load_state_dict(pretrain_ckpt["state_dict"])
+            print("[HPO trial] Loaded pretrain checkpoint from Ray object store.", flush=True)
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         scaler    = torch.cuda.amp.GradScaler(enabled=False)   # BF16 needs no loss scaling
+
+        _huber_loss = nn.HuberLoss(delta=huber_delta) if use_huber else None
+        loss_fn     = (lambda y_hat, y: _huber_loss(y_hat, y)) if use_huber else None
 
         train_loader = make_in_memory_loader(train_records, shuffle=True)
         val_loader   = make_in_memory_loader(val_records,   shuffle=False)
@@ -504,14 +681,17 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
         best_val_mse   = float("inf")
         patience_count = 0
         print(
-            f"[HPO trial] starting epoch loop: max_epochs={TRIAL_MAX_EPOCHS}, patience={PATIENCE}",
+            f"[HPO trial] starting epoch loop: max_epochs={TRIAL_MAX_EPOCHS}, patience={PATIENCE}, "
+            f"use_huber={use_huber}, lambda_l1={lambda_l1}",
             flush=True,
         )
 
         for epoch in range(1, TRIAL_MAX_EPOCHS + 1):
-            run_epoch(model, train_loader, optimizer, scaler, True,  device, use_amp)
+            run_epoch(model, train_loader, optimizer, scaler, True,  device, use_amp,
+                      loss_fn=loss_fn, l1_lambda=lambda_l1)
             with torch.no_grad():
-                val_mse = run_epoch(model, val_loader, None, scaler, False, device, use_amp)
+                val_mse = run_epoch(model, val_loader, None, scaler, False, device, use_amp,
+                                    loss_fn=loss_fn)
             if val_mse < best_val_mse:
                 best_val_mse   = val_mse
                 patience_count = 0
@@ -565,25 +745,42 @@ def main():
     selected_train_rows = sum(1 for row in hpo_rows if row["split"] == "train")
     selected_val_rows   = sum(1 for row in hpo_rows if row["split"] == "val")
 
-    enforce_fixed_architecture_cardinality(max_p, max_n_train)
+    if HPO_SWEEP_MODE == "ridge_residual":
+        enforce_fixed_architecture_cardinality(max_p, max_n_train)
+        print(
+            "Fixed HPO architecture:",
+            {
+                "max_p":              max_p,
+                "max_n_train":        max_n_train,
+                "indexed_train_rows": selected_train_rows,
+                "indexed_val_rows":   selected_val_rows,
+                "d_phi":              FIXED_D_PHI,
+                "d_rho":              FIXED_D_RHO,
+                "pool":               FIXED_POOL,
+            },
+            flush=True,
+        )
+    else:
+        # architecture sweep: validate that at least one d_phi candidate satisfies max_p
+        valid_d_phi = cardinality_aware_candidates(
+            "d_phi", ARCH_D_PHI_CANDIDATES, "max_p", max_p
+        )
+        print(
+            f"[HPO architecture] valid d_phi candidates for max_p={max_p}: {valid_d_phi}",
+            flush=True,
+        )
     print(
         f"[HPO driver] selected index rows: train={selected_train_rows} "
         f"val={selected_val_rows}",
         flush=True,
     )
-    print(
-        "Fixed HPO architecture:",
-        {
-            "max_p":              max_p,
-            "max_n_train":        max_n_train,
-            "indexed_train_rows": selected_train_rows,
-            "indexed_val_rows":   selected_val_rows,
-            "d_phi":              FIXED_D_PHI,
-            "d_rho":              FIXED_D_RHO,
-            "pool":               FIXED_POOL,
-        },
-        flush=True,
-    )
+
+    # Load baseline config for architecture sweep (driver only, before Ray init)
+    baseline_config = None
+    if HPO_SWEEP_MODE == "architecture":
+        baseline_config = _load_baseline_config_from_stage(HPO_BASELINE_CONFIG_STAGE_PATH)
+        print("[HPO driver] loaded baseline config from", HPO_BASELINE_CONFIG_STAGE_PATH, flush=True)
+
     hpo_payload, pretrain_ckpt = _prepare_hpo_payload_on_driver(
         hpo_rows,
         pretrain_checkpoint_path,
@@ -609,35 +806,43 @@ def main():
     _run_ray_object_store_preflight(ray)
 
     # ── Guard: HPO only supports inductive training ────────────────────────────
-    if MODEL3_DESIGN_PATTERN == "transductive_completion":
+    if MODEL_DESIGN_PATTERN == "transductive_completion":
         raise ValueError(
-            "HPO does not support MODEL3_DESIGN_PATTERN='transductive_completion'. "
+            "HPO does not support MODEL_DESIGN_PATTERN='transductive_completion'. "
             "Transductive completion requires a different training objective and cannot "
             "be optimized through the inductive MSE objective in hpo.py. "
-            "Set MODEL3_DESIGN_PATTERN='inductive_forecasting' to use HPO, or train "
+            "Set MODEL_DESIGN_PATTERN='inductive_forecasting' to use HPO, or train "
             "a completion model directly via run_model_training()."
         )
 
     # ── Ray Tune search space ─────────────────────────────────────────────────
-    search_space = {
-        "lr":           tune.loguniform(1e-4, 1e-2),
-        "weight_decay": tune.loguniform(1e-5, 1e-3),
-        "dropout":      tune.uniform(0.0, 0.3),
-        "model_family": HPO_MODEL_FAMILY,
-    }
+    search_space = build_hpo_search_space(tune, baseline_config=baseline_config)
+    _arch_info = (
+        {
+            "d_phi_candidates":      ARCH_D_PHI_CANDIDATES,
+            "n_sab_feat_candidates": ARCH_N_SAB_FEAT_CANDIDATES,
+            "pretrain_mismatch_policy": "cold_start",
+        }
+        if HPO_SWEEP_MODE == "architecture"
+        else {
+            "d_phi":       FIXED_D_PHI,
+            "n_sab_feat":  FIXED_N_SAB_FEAT,
+            "pretrain_mismatch_policy": "fail_trial",
+        }
+    )
     print(
         "HPO Ray Tune config:",
         {
-            "num_samples":         NUM_TRIALS,
-            "metric":              "val_mse",
-            "mode":                "min",
-            "resources_per_trial": {"gpu": 1},
-            "search_alg":          "random (FIFO, no early stopping)",
-            "fixed_architecture":   {
-                "d_phi": FIXED_D_PHI,
-                "d_rho": FIXED_D_RHO,
-                "pool":  FIXED_POOL,
-            },
+            "hpo_sweep_mode":       HPO_SWEEP_MODE,
+            "model_family":         MODEL_FAMILY,
+            "model_design_pattern": MODEL_DESIGN_PATTERN,
+            "num_samples":          NUM_TRIALS,
+            "metric":               "val_mse",
+            "mode":                 "min",
+            "resources_per_trial":  {"gpu": 1},
+            "search_alg":           "random (FIFO, no early stopping)",
+            "fixed":                {"d_rho": FIXED_D_RHO, "pool": FIXED_POOL},
+            "architecture_info":    _arch_info,
         },
         flush=True,
     )
@@ -673,17 +878,49 @@ def main():
     best_config = {
         "lr":                   float(best_config_raw["lr"]),
         "weight_decay":         float(best_config_raw["weight_decay"]),
-        "d_phi":                FIXED_D_PHI,
-        "d_rho":                FIXED_D_RHO,
         "dropout":              float(best_config_raw["dropout"]),
-        "pool":                 FIXED_POOL,
-        "model_family":         best_config_raw.get("model_family", HPO_MODEL_FAMILY),
+
+        "d_phi":                int(best_config_raw.get("d_phi",       FIXED_D_PHI)),
+        "d_rho":                int(best_config_raw.get("d_rho",       FIXED_D_RHO)),
+        "pool":                 best_config_raw.get("pool",             FIXED_POOL),
+        "n_sab_feat":           int(best_config_raw.get("n_sab_feat",  FIXED_N_SAB_FEAT)),
+
+        "use_ridge_expert":     bool(best_config_raw.get("use_ridge_expert", True)),
+        "ridge_lambda":         float(best_config_raw.get("ridge_lambda",    1.0)),
+        "gate_hidden_dim":      int(best_config_raw.get("gate_hidden_dim",   64)),
+
+        "use_huber":            bool(best_config_raw.get("use_huber",    False)),
+        "huber_delta":          float(best_config_raw.get("huber_delta", 1.0)),
+        "lambda_l1":            float(best_config_raw.get("lambda_l1",   0.0)),
+
+        "model_family":         best_config_raw.get("model_family",         MODEL_FAMILY),
         "model_arch_version":   MODEL_ARCH_VERSION,
-        "model3_design_pattern": MODEL3_DESIGN_PATTERN,
+        "model_design_pattern": best_config_raw.get("model_design_pattern", MODEL_DESIGN_PATTERN),
+        "hpo_sweep_mode":       HPO_SWEEP_MODE,
+
+        "_meta": {
+            "best_val_mse":              float(best_val_mse) if best_val_mse is not None else None,
+            "num_trials":                NUM_TRIALS,
+            "trial_max_epochs":          TRIAL_MAX_EPOCHS,
+            "pretrain_warm_start_policy": (
+                "cold_start_on_mismatch" if HPO_SWEEP_MODE == "architecture"
+                else "fail_on_mismatch"
+            ),
+        },
     }
 
-    _upload_json_to_hpo("best_config.json", best_config)
-    print("Uploaded best_config.json to @MODEL_STAGE/hpo/", flush=True)
+    sweep_filename = f"best_config_{HPO_SWEEP_MODE}.json"
+    _upload_json_to_hpo(sweep_filename, best_config)
+    print(f"Uploaded {sweep_filename} to @MODEL_STAGE/hpo/", flush=True)
+
+    if HPO_SWEEP_MODE == "architecture" and baseline_config is not None:
+        merged = _merge_sweep_configs(baseline_config, best_config)
+        _upload_json_to_hpo("best_config.json", merged)
+        print("Uploaded merged best_config.json to @MODEL_STAGE/hpo/", flush=True)
+    else:
+        # ridge_residual: best_config.json == best_config_ridge_residual.json
+        _upload_json_to_hpo("best_config.json", best_config)
+        print("Uploaded best_config.json to @MODEL_STAGE/hpo/", flush=True)
 
 
 if __name__ == "__main__":

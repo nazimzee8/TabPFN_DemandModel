@@ -223,3 +223,31 @@ def test_checkpoint_stage_path_propagates_from_orchestrator_env(collector, fake_
             f"Expected {custom_path}, got {job.env_vars.get('SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH')}"
 
     importlib.reload(orch)
+
+
+# ---------------------------------------------------------------------------
+# Retired env var absence tests
+# ---------------------------------------------------------------------------
+
+def test_deepset_model_family_env_absent_from_shards(collector, fake_session, runtime_args):
+    """Evaluation shard jobs must not carry the retired model-family env var."""
+    with _patch_submit(collector):
+        orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
+
+    deepset_jobs = [j for j in collector.submitted if "deepset_shard" in j.label]
+    assert len(deepset_jobs) > 0
+    for job in deepset_jobs:
+        assert "DEEPSET" + "_MODEL_FAMILY" not in job.env_vars, \
+            f"Job {job.label} unexpectedly contains retired model-family env var"
+
+
+def test_model_arch_version_env_absent_from_shards(collector, fake_session, runtime_args):
+    """Evaluation shard jobs must NOT carry MODEL_ARCH_VERSION (hardcoded in train.py)."""
+    with _patch_submit(collector):
+        orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
+
+    deepset_jobs = [j for j in collector.submitted if "deepset_shard" in j.label]
+    assert len(deepset_jobs) > 0
+    for job in deepset_jobs:
+        assert "MODEL_ARCH_VERSION" not in job.env_vars, \
+            f"Job {job.label} unexpectedly contains MODEL_ARCH_VERSION"

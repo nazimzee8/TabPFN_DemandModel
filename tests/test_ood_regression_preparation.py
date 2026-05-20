@@ -325,9 +325,9 @@ class TestIndexSafety:
         assert ood_prep.OOD_SUITE_ID != production_default
 
     def test_ood_stage_prefix_uses_eval_stage(self):
-        """OOD data must reference @EVAL_DATASET_STAGE, never @META_DATASET_STAGE."""
+        """OOD data must reference @EVALUATION_DATASET_STAGE, never @META_DATASET_STAGE."""
         import prepare_ood_regression as ood_prep
-        assert "@EVAL_DATASET_STAGE" in ood_prep.EVAL_STAGE_PREFIX
+        assert "@EVALUATION_DATASET_STAGE" in ood_prep.EVAL_STAGE_PREFIX
         assert "@META_DATASET_STAGE" not in ood_prep.EVAL_STAGE_PREFIX
 
 
@@ -389,7 +389,7 @@ class TestMakeOodIndexRow:
             p_total=4,
             target_noise_scale=1.0,
         )
-        assert row["stage_path"] == "@EVAL_DATASET_STAGE/ood_parity/H/dataset_0003.parquet"
+        assert row["stage_path"] == "@EVALUATION_DATASET_STAGE/ood_parity/H/dataset_0003.parquet"
 
     def test_row_split_seeds(self):
         import prepare_ood_regression as ood_prep
@@ -625,26 +625,26 @@ import evaluate_synthetic_regression as evsr
 class TestCachePathCollision:
     def test_e_and_f_same_basename_produce_different_local_names(self):
         e = evsr._stage_path_to_local_name(
-            "@EVAL_DATASET_STAGE/ood_parity/E/dataset_0000.parquet"
+            "@EVALUATION_DATASET_STAGE/ood_parity/E/dataset_0000.parquet"
         )
         f = evsr._stage_path_to_local_name(
-            "@EVAL_DATASET_STAGE/ood_parity/F/dataset_0000.parquet"
+            "@EVALUATION_DATASET_STAGE/ood_parity/F/dataset_0000.parquet"
         )
         assert e != f
 
     def test_primary_path_works(self):
         name = evsr._stage_path_to_local_name(
-            "@EVAL_DATASET_STAGE/primary/dataset_0042.parquet"
+            "@EVALUATION_DATASET_STAGE/primary/dataset_0042.parquet"
         )
         assert "dataset_0042" in name
 
     def test_cached_e_file_not_reused_for_f(self):
         # stage_path_to_local_name must embed regime in the local filename
         e = evsr._stage_path_to_local_name(
-            "@EVAL_DATASET_STAGE/ood_parity/E/dataset_0000.parquet"
+            "@EVALUATION_DATASET_STAGE/ood_parity/E/dataset_0000.parquet"
         )
         f = evsr._stage_path_to_local_name(
-            "@EVAL_DATASET_STAGE/ood_parity/F/dataset_0000.parquet"
+            "@EVALUATION_DATASET_STAGE/ood_parity/F/dataset_0000.parquet"
         )
         assert "E" in e or "ood_parity__E" in e
         assert "F" in f or "ood_parity__F" in f
@@ -730,7 +730,7 @@ class TestOODPrepTableOrdering:
                 {
                     "regime": r, "dataset_id": i,
                     "filename": f"{r}/dataset_{i:04d}.parquet",
-                    "stage_path": f"@EVAL_DATASET_STAGE/ood_parity/{r}/dataset_{i:04d}.parquet",
+                    "stage_path": f"@EVALUATION_DATASET_STAGE/ood_parity/{r}/dataset_{i:04d}.parquet",
                     "n_total": 100, "p_signal": 5, "p_noise": 0, "p_total": 5,
                     "target_noise_scale": 1.0, "dataset_seed": i + 1,
                 }

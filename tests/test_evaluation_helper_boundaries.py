@@ -36,7 +36,7 @@ def test_synthetic_regression_imports_when_evaluate_is_blocked(monkeypatch):
     try:
         module = importlib.import_module("evaluate_synthetic_regression")
 
-        assert module.DeepSetModel is not None
+        assert module._instantiate_model is not None
         assert module.ModelConfig is not None
     finally:
         sys.modules.pop("evaluate_synthetic_regression", None)

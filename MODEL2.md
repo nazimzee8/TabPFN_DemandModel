@@ -1,15 +1,15 @@
-# MarketAwareDeepSetModel — Reference
+# retired MODEL2 model — Reference
 
-This document is the self-contained reference for `MarketAwareDeepSetModel`.
-`MODEL.md` describes the legacy `DeepSetModel` and must not be modified.
+This document is the self-contained reference for `retired MODEL2 model`.
+`MODEL.md` describes the legacy `retired MODEL1 model` and must not be modified.
 
 ---
 
 ## §1 Motivation
 
-### The query-collapse problem in DeepSetModel
+### The query-collapse problem in retired MODEL1 model
 
-`DeepSetModel` builds tokens `(y_i, X_ij, xq_j)` per `(sample i, feature j)` pair, applies
+`retired MODEL1 model` builds tokens `(y_i, X_ij, xq_j)` per `(sample i, feature j)` pair, applies
 `phi` to each token, then **pools over features first** (per sample), and only afterward
 aggregates over samples. This means that feature identity is destroyed before the model has
 seen evidence across training samples.
@@ -174,8 +174,8 @@ is implemented.
 
 ## §6 Checkpoint v3 Format
 
-`MarketAwareDeepSetModel` checkpoints use `checkpoint_format_version=3`.
-`DeepSetModel` checkpoints keep version 2.
+`retired MODEL2 model` checkpoints use `checkpoint_format_version=3`.
+`retired MODEL1 model` checkpoints keep version 2.
 
 **Full checkpoint dict schema (v3):**
 
@@ -215,7 +215,7 @@ Eight new fields are added to `ModelConfig` (after `dropout`):
 | `residual_scale_init` | `float` | `0.1` | Init value of learned `residual_scale` scalar parameter |
 | `gate_hidden_dim` | `int` | `64` | Hidden dim of `gate_head` MLP |
 
-All new fields have safe defaults that do not change `DeepSetModel` behavior (backward
+All new fields have safe defaults that do not change `retired MODEL1 model` behavior (backward
 compatible for all existing checkpoints with `model_family="deepset"`).
 
 ---
@@ -228,9 +228,9 @@ compatible for all existing checkpoints with `model_family="deepset"`).
 def _instantiate_model(cfg: ModelConfig) -> nn.Module:
     family = getattr(cfg, "model_family", "deepset")
     if family == "deepset":
-        return DeepSetModel(cfg=cfg)
+        return retired MODEL1 model(cfg=cfg)
     if family == "market_aware":
-        return MarketAwareDeepSetModel(cfg=cfg)
+        return retired MODEL2 model(cfg=cfg)
     raise ValueError(f"Unknown model_family: {family!r}")
 ```
 
@@ -238,11 +238,11 @@ def _instantiate_model(cfg: ModelConfig) -> nn.Module:
 
 | File | Change |
 |------|--------|
-| `evaluate.py` | `load_model()` calls `_instantiate_model(cfg)` instead of `DeepSetModel(cfg=cfg)` |
-| `train.py` | `train_fn()` reads `model_family` from `hyper_params` + `DEEPSET_MODEL_FAMILY` env var; calls `_instantiate_model(cfg)` |
+| `evaluate.py` | `load_model()` calls `_instantiate_model(cfg)` instead of `retired MODEL1 model(cfg=cfg)` |
+| `train.py` | `train_fn()` reads `model_family` from `hyper_params` + `MODEL_FAMILY` env var; calls `_instantiate_model(cfg)` |
 | `hpo.py` | Ray worker reads `model_family` from `config`; calls `_instantiate_model(cfg)` |
 
-**Never hardcode `DeepSetModel(cfg=cfg)` in these files.**
+**Never hardcode `retired MODEL1 model(cfg=cfg)` in these files.**
 
 ---
 
@@ -279,7 +279,7 @@ after the model demonstrates query-sensitive behavior on controlled synthetic co
 To train a `market_aware` model, set the environment variable before launching training:
 
 ```bash
-export DEEPSET_MODEL_FAMILY=market_aware
+export MODEL_FAMILY=market_aware
 python src/train.py
 ```
 

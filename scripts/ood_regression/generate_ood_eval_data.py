@@ -282,11 +282,11 @@ def main() -> None:
     abs_manifest = manifest_path.resolve().as_posix()
     print(
         "\n--- SnowSQL PUT commands ---\n"
-        f"PUT file://{abs_E}/*.parquet @EVAL_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
-        f"PUT file://{abs_F}/*.parquet @EVAL_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
-        f"PUT file://{abs_G}/*.parquet @EVAL_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
-        f"PUT file://{abs_H}/*.parquet @EVAL_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
-        f"PUT file://{abs_manifest}   @EVAL_DATASET_STAGE/ood_parity/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;"
+        f"PUT file://{abs_E}/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/E/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"PUT file://{abs_F}/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/F/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"PUT file://{abs_G}/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/G/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"PUT file://{abs_H}/*.parquet @EVALUATION_DATASET_STAGE/ood_parity/H/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"PUT file://{abs_manifest}   @EVALUATION_DATASET_STAGE/ood_parity/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;"
     )
 
 

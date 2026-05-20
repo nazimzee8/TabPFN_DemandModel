@@ -1,17 +1,17 @@
-Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
+Plan: retired MODEL2 model — Fix Early Feature Compression & Query Collapse
 
  Context
 
- The current DeepSetModel pools the feature dimension at step 5 of the forward pass, before
+ The current retired MODEL1 model pools the feature dimension at step 5 of the forward pass, before
  sample-level evidence is aggregated at step 8. This destroys feature identity before the model
  has learned "what does feature j tell us about labels across training samples," preventing it
  from computing anything analogous to Σ_i X_ij·y_i or Σ_i X_ij·X_ik. The result is
  query collapse: predictions barely vary across different x_test inputs because all
  query-differentiating information is pooled away too early.
 
- The fix is a new MarketAwareDeepSetModel class that reverses the pooling order: sample
+ The fix is a new retired MODEL2 model class that reverses the pooling order: sample
  evidence is aggregated per feature first, then features interact. A modular RidgeExpert
- provides an explicit inductive bias without replacing the neural path. Legacy DeepSetModel
+ provides an explicit inductive bias without replacing the neural path. Legacy retired MODEL1 model
  is fully preserved.
 
  ---
@@ -44,15 +44,15 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  File: src/model.py
  Type: Modify
- Summary: Add 8 new ModelConfig fields; add RidgeExpert; add MarketAwareDeepSetModel; add _instantiate_model()
+ Summary: Add 8 new ModelConfig fields; add RidgeExpert; add retired MODEL2 model; add _instantiate_model()
  ────────────────────────────────────────
  File: src/evaluate.py
  Type: Modify
- Summary: Import _instantiate_model; replace hardcoded DeepSetModel(cfg) in load_model()
+ Summary: Import _instantiate_model; replace hardcoded retired MODEL1 model(cfg) in load_model()
  ────────────────────────────────────────
  File: src/train.py
  Type: Modify
- Summary: Add DEEPSET_MODEL_FAMILY constant; import/use _instantiate_model; add model_family to mismatch check; v3
+ Summary: Add MODEL_FAMILY constant; import/use _instantiate_model; add model_family to mismatch check; v3
    checkpoint for market_aware
  ────────────────────────────────────────
  File: src/hpo.py
@@ -93,9 +93,9 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  1a. ModelConfig extension
 
  Add 8 new fields after dropout, with defaults chosen for backward compatibility
- (all new fields have safe defaults that do not change DeepSetModel behavior):
+ (all new fields have safe defaults that do not change retired MODEL1 model behavior):
 
- # New fields — MarketAwareDeepSetModel only
+ # New fields — retired MODEL2 model only
  model_family:             str   = "deepset"   # "deepset" | "market_aware"
  d_sample:                 int   = 64          # phi_sample output dim (must be divisible by n_heads when sample attn
  used)
@@ -121,7 +121,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  1b. RidgeExpert class (no nn.Module; no parameters)
 
- Place immediately above MarketAwareDeepSetModel.
+ Place immediately above retired MODEL2 model.
 
  class RidgeExpert:
      """Closed-form ridge regression. Stateless; no nn.Module parameters.
@@ -141,7 +141,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
              beta  = X_norm.T @ alpha                           # (p,)
          return x_test_norm @ beta                              # (m,)
 
- 1c. MarketAwareDeepSetModel class
+ 1c. retired MODEL2 model class
 
  Constructor modules
 
@@ -184,7 +184,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  Inputs: X_train (n,p), y_train (n,), x_test (p,) or (m,p)
  single = x_test.ndim == 1  →  unsqueeze to (1,p); remember to squeeze output
 
- ─── Step 1: Normalize (identical to DeepSetModel) ───
+ ─── Step 1: Normalize (identical to retired MODEL1 model) ───
  X_norm: (n,p),  x_test_norm: (m,p),  y_norm: (n,)
  y_mean, y_std: scalars (if norm_target)
 
@@ -226,7 +226,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  else:
      pred_norm = neural
 
- ─── Step 8: Denormalize (identical to DeepSetModel) ───
+ ─── Step 8: Denormalize (identical to retired MODEL1 model) ───
  y_hat = pred_norm * y_std + y_mean  (if norm_target)
  return y_hat.squeeze(0) if single else y_hat
 
@@ -235,12 +235,12 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  Add at the bottom of model.py, after both model classes:
 
  def _instantiate_model(cfg: ModelConfig) -> torch.nn.Module:
-     """Route to DeepSetModel or MarketAwareDeepSetModel based on cfg.model_family."""
+     """Route to retired MODEL1 model or retired MODEL2 model based on cfg.model_family."""
      family = getattr(cfg, "model_family", "deepset")
      if family == "deepset":
-         return DeepSetModel(cfg=cfg)
+         return retired MODEL1 model(cfg=cfg)
      if family == "market_aware":
-         return MarketAwareDeepSetModel(cfg=cfg)
+         return retired MODEL2 model(cfg=cfg)
      raise ValueError(f"Unknown model_family: {family!r}")
 
  ---
@@ -249,14 +249,14 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  2a. Import
 
  # Before:
- from model import DeepSetModel, ModelConfig, ...
+ from model import retired MODEL1 model, ModelConfig, ...
  # After:
- from model import DeepSetModel, MarketAwareDeepSetModel, ModelConfig, _instantiate_model, ...
+ from model import retired MODEL1 model, retired MODEL2 model, ModelConfig, _instantiate_model, ...
 
  2b. load_model() — replace hardcoded class
 
  # Before:
- model = DeepSetModel(cfg=cfg)
+ model = retired MODEL1 model(cfg=cfg)
  # After:
  model = _instantiate_model(cfg)
 
@@ -268,8 +268,8 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  3a. Import + constant
 
- from model import DeepSetModel, ModelConfig, _instantiate_model
- DEEPSET_MODEL_FAMILY = os.environ.get("DEEPSET_MODEL_FAMILY", "deepset")
+ from model import retired MODEL1 model, ModelConfig, _instantiate_model
+ MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "deepset")
 
  3b. _checkpoint_architecture_mismatches() — add model_family
 
@@ -284,10 +284,10 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  # Before:
  cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool, ...)
- model = DeepSetModel(cfg=cfg).to(device)
+ model = retired MODEL1 model(cfg=cfg).to(device)
 
  # After:
- model_family = hyper_params.get("model_family", DEEPSET_MODEL_FAMILY)
+ model_family = hyper_params.get("model_family", MODEL_FAMILY)
  cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool, ...,
                      model_family=model_family)
  model = _instantiate_model(cfg).to(device)
@@ -319,13 +319,13 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  4b. _build_ray_trainable Ray worker — use _instantiate_model
 
  # Existing import inside worker closure:
- from model import DeepSetModel, ModelConfig, _instantiate_model
+ from model import retired MODEL1 model, ModelConfig, _instantiate_model
 
  # cfg construction:
  cfg = ModelConfig(..., model_family=config.get("model_family", "deepset"))
 
  # Before:
- model = DeepSetModel(cfg=cfg).to(device)
+ model = retired MODEL1 model(cfg=cfg).to(device)
  # After:
  model = _instantiate_model(cfg).to(device)
 
@@ -358,7 +358,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  CLI: python src/sanity_checks.py [--out_dir artifacts/sanity] [--checkpoint PATH]
 
- If --checkpoint is not given, a freshly-initialized MarketAwareDeepSetModel with defaults
+ If --checkpoint is not given, a freshly-initialized retired MODEL2 model with defaults
  (use_ridge_expert=True) is used (sufficient for structural checks).
 
  ---
@@ -372,8 +372,8 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  - test_forward_works_without_ridge — use_ridge_expert=False
  - test_forward_works_with_ridge — use_ridge_expert=True
  - test_modelconfig_rejects_bad_model_family — ModelConfig(model_family="bad") raises
- - test_instantiate_model_routes_deepset — _instantiate_model returns DeepSetModel
- - test_instantiate_model_routes_market_aware — returns MarketAwareDeepSetModel
+ - test_instantiate_model_routes_deepset — _instantiate_model returns retired MODEL1 model
+ - test_instantiate_model_routes_market_aware — returns retired MODEL2 model
  - test_instantiate_model_unknown_family_raises — raises ValueError
 
  tests/test_market_aware_deepset_permutation.py
@@ -407,7 +407,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
 
  MODEL.md — add §13
 
- Add section "13. MarketAwareDeepSetModel" after existing last section.
+ Add section "13. retired MODEL2 model" after existing last section.
 
  Subsections:
  - 13.1 Motivation: why early feature pooling causes query collapse
@@ -469,7 +469,7 @@ Plan: MarketAwareDeepSetModel — Fix Early Feature Compression & Query Collapse
  ---
  Implementation Order
 
- 1. src/model.py — ModelConfig fields, RidgeExpert, MarketAwareDeepSetModel, _instantiate_model
+ 1. src/model.py — ModelConfig fields, RidgeExpert, retired MODEL2 model, _instantiate_model
  2. src/evaluate.py — import _instantiate_model, update load_model
  3. src/train.py — constant, import, mismatch check, train_fn, checkpoint save
  4. src/hpo.py — mismatch check fields, Ray worker instantiation

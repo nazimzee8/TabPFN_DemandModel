@@ -232,7 +232,7 @@ def _make_ood_rows(n_per_regime: int = 20) -> list[dict]:
                 "feature_noise_level": 0,
                 "target_noise_scale": 1.0,
                 "training_size_anchor": False,
-                "stage_path": f"@EVAL_DATASET_STAGE/ood_parity/{regime}/dataset_{i:04d}.parquet",
+                "stage_path": f"@EVALUATION_DATASET_STAGE/ood_parity/{regime}/dataset_{i:04d}.parquet",
             })
     return rows
 

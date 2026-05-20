@@ -2,11 +2,11 @@
 
 This document is the normative specification for the future `MODEL3` model family.
 It is intentionally specification-only: it does not describe code that is already
-implemented, and it must not be used as permission to mutate `MarketAwareDeepSetModel`
+implemented, and it must not be used as permission to mutate retired MODEL2 classes
 in place.
 
-`MODEL2.md` remains the production reference for the current `MarketAwareDeepSetModel`
-baseline. MODEL3 is a new model-family specification that inherits MODEL2's core
+`MODEL2.md` remains the production reference for the current MODEL2 baseline.
+MODEL3 is a new model-family specification that inherits MODEL2's core
 principle:
 
 > Preserve structured evidence before irreversible pooling.
@@ -27,31 +27,31 @@ validation.
 
 ## 1. Model-Family Boundary
 
-MODEL3 is not a mutation of `MarketAwareDeepSetModel`. It is a future architecture family
+MODEL3 is not a mutation of retired MODEL2 code. It is a future architecture family
 that can coexist with MODEL2 behind explicit runtime selectors.
 
 Required defaults:
 
 ```text
 MODEL_ARCH_VERSION="model2"
-MODEL3_DESIGN_PATTERN="inductive_forecasting"
-DEEPSET_MODEL_FAMILY or MODEL_FAMILY="market_aware"
+MODEL_DESIGN_PATTERN="inductive_forecasting"
+MODEL_FAMILY="market_aware"
 ```
 
 Future MODEL3 synthetic regression:
 
 ```text
 MODEL_ARCH_VERSION="model3"
-MODEL3_DESIGN_PATTERN="inductive_forecasting"
-DEEPSET_MODEL_FAMILY or MODEL_FAMILY="market_exchangeable_icl"
+MODEL_DESIGN_PATTERN="inductive_forecasting"
+MODEL_FAMILY="market_exchangeable_icl"
 ```
 
 Future MODEL3 market completion:
 
 ```text
 MODEL_ARCH_VERSION="model3"
-MODEL3_DESIGN_PATTERN="transductive_completion"
-DEEPSET_MODEL_FAMILY or MODEL_FAMILY="market_exchangeable_completion"
+MODEL_DESIGN_PATTERN="transductive_completion"
+MODEL_FAMILY="market_exchangeable_completion"
 ```
 
 Runtime selection must reject incompatible combinations. In particular,
@@ -145,7 +145,7 @@ requested for explicit query rows.
 Required selector:
 
 ```text
-MODEL3_DESIGN_PATTERN="inductive_forecasting"
+MODEL_DESIGN_PATTERN="inductive_forecasting"
 ```
 
 ### Inputs and Output
@@ -213,7 +213,7 @@ surfaces and missing-cell completion. It is not the default synthetic regression
 Required selector:
 
 ```text
-MODEL3_DESIGN_PATTERN="transductive_completion"
+MODEL_DESIGN_PATTERN="transductive_completion"
 ```
 
 ### Inputs and Output
@@ -337,21 +337,21 @@ training, fine-tuning, evaluation, and inference:
 
 ```text
 MODEL_ARCH_VERSION
-MODEL3_DESIGN_PATTERN
-DEEPSET_MODEL_FAMILY or MODEL_FAMILY
+MODEL_DESIGN_PATTERN
+MODEL_FAMILY
 TRAINING_DATA_FAMILY
 ```
 
 Required runtime values:
 
-| Scenario | `MODEL_ARCH_VERSION` | `MODEL3_DESIGN_PATTERN` | Model family |
+| Scenario | `MODEL_ARCH_VERSION` | `MODEL_DESIGN_PATTERN` | Model family |
 |---|---|---|---|
 | Current production default | `"model2"` | `"inductive_forecasting"` | `"market_aware"` |
 | Future MODEL3 synthetic regression | `"model3"` | `"inductive_forecasting"` | `"market_exchangeable_icl"` |
 | Future MODEL3 market completion | `"model3"` | `"transductive_completion"` | `"market_exchangeable_completion"` |
 
 Defaults must preserve existing MODEL2 behavior. The presence of
-`MODEL3_DESIGN_PATTERN="inductive_forecasting"` as a default selector must not cause MODEL3
+`MODEL_DESIGN_PATTERN="inductive_forecasting"` as a default selector must not cause MODEL3
 code paths to run unless `MODEL_ARCH_VERSION="model3"` is also selected.
 
 ---
@@ -366,7 +366,7 @@ Required metadata fields:
 ```python
 {
     "model_arch_version": "model3",
-    "model3_design_pattern": "inductive_forecasting",  # or "transductive_completion"
+    "model_design_pattern": "inductive_forecasting",  # or "transductive_completion"
     "model_family": "market_exchangeable_icl",         # or "market_exchangeable_completion"
     "training_data_family": "...",
     "task_objective": "...",
@@ -378,7 +378,7 @@ The exact checkpoint format version may change during implementation, but MODEL3
 reuse ambiguous MODEL2 metadata. Loading must validate that:
 
 1. `model_arch_version` matches the instantiated architecture.
-2. `model3_design_pattern` matches the expected runtime objective.
+2. `model_design_pattern` matches the expected runtime objective.
 3. `model_family` maps to the selected model class.
 4. `training_data_family` is compatible with the requested inference path.
 5. `task_objective` is not silently converted between inductive prediction and
@@ -421,23 +421,23 @@ Future `run_training_job.sql` procedure signatures should accept architecture an
 selectors:
 
 ```sql
-run_pretrain_pipeline(MODEL_ARCH_VERSION, MODEL3_DESIGN_PATTERN)
-run_hpo_pipeline(MODEL_ARCH_VERSION, MODEL3_DESIGN_PATTERN)
-run_model_training(MODEL_ARCH_VERSION, MODEL3_DESIGN_PATTERN)
-run_training_pipeline(MODEL_ARCH_VERSION, MODEL3_DESIGN_PATTERN)
+run_pretrain_pipeline(MODEL_ARCH_VERSION, MODEL_DESIGN_PATTERN)
+run_hpo_pipeline(MODEL_ARCH_VERSION, MODEL_DESIGN_PATTERN)
+run_model_training(MODEL_ARCH_VERSION, MODEL_DESIGN_PATTERN)
+run_training_pipeline(MODEL_ARCH_VERSION, MODEL_DESIGN_PATTERN)
 ```
 
 Default SQL calls must remain equivalent to MODEL2 plus the default design-pattern value:
 
 ```text
 MODEL_ARCH_VERSION="model2"
-MODEL3_DESIGN_PATTERN="inductive_forecasting"
+MODEL_DESIGN_PATTERN="inductive_forecasting"
 ```
 
 Future SQL orchestration must also propagate:
 
 ```text
-DEEPSET_MODEL_FAMILY or MODEL_FAMILY
+MODEL_FAMILY
 TRAINING_DATA_FAMILY
 ```
 

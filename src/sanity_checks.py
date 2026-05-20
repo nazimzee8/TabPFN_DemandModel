@@ -1,7 +1,7 @@
 """
 sanity_checks.py
 
-Structural and correctness checks for MarketAwareDeepSetModel.
+Structural and correctness checks for DeepSetICLModel (MODEL3).
 
 Six checks:
   1. check_permutation_invariance      — row-shuffle + col-permute (max_abs_delta <= 1e-5)
@@ -33,7 +33,7 @@ _src_dir = os.path.dirname(os.path.abspath(__file__))
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 
-from model import ModelConfig, MarketAwareDeepSetModel, RidgeExpert, _instantiate_model
+from model import ModelConfig, DeepSetICLModel, RidgeExpert, _instantiate_model
 
 # ---------------------------------------------------------------------------
 # Environment variable constants (Phase 6)
@@ -60,26 +60,22 @@ def _resolve_device(device_str: str) -> torch.device:
 
 
 # ---------------------------------------------------------------------------
-# Helper: build a default fresh MarketAwareDeepSetModel for structural checks
+# Helper: build a default fresh DeepSetICLModel for structural checks
 # ---------------------------------------------------------------------------
 
-def _fresh_model(use_ridge_expert: bool = True, device=None) -> MarketAwareDeepSetModel:
+def _fresh_model(use_ridge_expert: bool = True, device=None) -> DeepSetICLModel:
     cfg = ModelConfig(
-        model_family="market_aware",
-        d_sample=64,
-        n_sab_sample_per_feature=0,
-        sample_pool="attn",
-        use_ridge_expert=use_ridge_expert,
-        ridge_lambda=1.0,
-        residual_scale_init=0.1,
-        gate_hidden_dim=64,
-        n_sab_feat=1,
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=64,
+        d_rho=128,
+        pool="pna",
         n_heads=4,
-        norm_feat=True,
-        norm_target=True,
-        dropout=0.0,
+        n_sab_feat=1,
+        use_ridge_expert=use_ridge_expert,
     )
-    model = MarketAwareDeepSetModel(cfg=cfg)
+    model = DeepSetICLModel(cfg=cfg)
     model.eval()
     if device is not None:
         model.to(device)
@@ -438,8 +434,8 @@ def save_results(results: dict, out_dir: str) -> None:
 # Checkpoint quality gates (Phase 6)
 # ---------------------------------------------------------------------------
 
-def _make_gate_model(device) -> MarketAwareDeepSetModel:
-    """Build a small fresh MarketAwareDeepSetModel for gate checks."""
+def _make_gate_model(device) -> DeepSetICLModel:
+    """Build a small fresh DeepSetICLModel for gate checks."""
     return _fresh_model(use_ridge_expert=False, device=device)
 
 
@@ -647,7 +643,7 @@ def run_checkpoint_gates(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run structural sanity checks for MarketAwareDeepSetModel."
+        description="Run structural sanity checks for DeepSetICLModel (MODEL3)."
     )
     parser.add_argument(
         "--out_dir", default="artifacts/sanity",
@@ -680,7 +676,7 @@ def main():
         model.eval()
         print(f"Checkpoint model_family: {cfg.model_family}", flush=True)
     else:
-        print("No checkpoint given — using freshly initialized MarketAwareDeepSetModel.", flush=True)
+        print("No checkpoint given — using freshly initialized DeepSetICLModel.", flush=True)
 
     results = run_all_checks(model=model, device=device)
 

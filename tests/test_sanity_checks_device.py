@@ -75,13 +75,17 @@ def test_cuda_sanity_checks_pass_or_skip():
 
 def test_run_all_checks_with_explicit_model_on_cpu():
     """Passing a model explicitly to run_all_checks works on CPU."""
-    from model import ModelConfig, MarketAwareDeepSetModel
+    from model import ModelConfig, DeepSetICLModel
     cfg = ModelConfig(
-        model_family="market_aware", d_sample=32, n_sab_sample_per_feature=0,
-        sample_pool="attn", use_ridge_expert=True, ridge_lambda=1.0,
-        residual_scale_init=0.1, gate_hidden_dim=32, n_sab_feat=1,
-        n_heads=4, norm_feat=True, norm_target=True, dropout=0.0,
+        model_family="market_exchangeable_icl",
+        model_arch_version="model3",
+        model_design_pattern="inductive_forecasting",
+        d_phi=64, d_rho=128, pool="pna",
+        n_heads=4, n_sab_feat=1,
+        use_ridge_expert=True, ridge_lambda=1.0,
+        gate_hidden_dim=32,
+        norm_feat=True, norm_target=True, dropout=0.0,
     )
-    model = MarketAwareDeepSetModel(cfg=cfg)
+    model = DeepSetICLModel(cfg=cfg)
     results = run_all_checks(model=model, device=torch.device("cpu"))
     assert results.get("all_passed") is True

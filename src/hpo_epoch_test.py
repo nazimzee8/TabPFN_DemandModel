@@ -50,8 +50,8 @@ def _upload_error_json(session, filename, script_name):
 
 
 def _make_model(config, device):
-    from train import N_HEADS, N_SAB_FEAT, N_SAB_SAMP, NORM_FEAT, NORM_TARGET
-    from model import DeepSetModel, ModelConfig
+    from train import N_HEADS, N_SAB_FEAT, NORM_FEAT, NORM_TARGET
+    from model import ModelConfig, _instantiate_model
 
     cfg = ModelConfig(
         d_phi=int(config["d_phi"]),
@@ -59,12 +59,11 @@ def _make_model(config, device):
         pool=config["pool"],
         n_heads=N_HEADS,
         n_sab_feat=N_SAB_FEAT,
-        n_sab_samp=N_SAB_SAMP,
         norm_feat=NORM_FEAT,
         norm_target=NORM_TARGET,
         dropout=float(config["dropout"]),
     )
-    return DeepSetModel(cfg=cfg).to(device)
+    return _instantiate_model(cfg).to(device)
 
 
 def _time_one_epoch(label, parameter, value, config, train_loader, val_loader, device, use_amp):

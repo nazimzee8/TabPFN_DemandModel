@@ -49,7 +49,7 @@ from deepset_inference import (
     run_permutation_tests,
     select_deepset_features_train_only,
 )
-from model import DeepSetModel, ModelConfig, _instantiate_model
+from model import ModelConfig, _instantiate_model
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -62,7 +62,7 @@ def _parse_int_list(s: str) -> list[int]:
 SYNREG_SUITE_ID = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
 SYNREG_NUM_SHARDS = int(os.getenv("SYNTHETIC_REGRESSION_NUM_SHARDS", "1"))
 SYNREG_SHARD_INDEX = int(os.getenv("SYNTHETIC_REGRESSION_SHARD_INDEX", "0"))
-SYNREG_STAGE_PREFIX = "@EVAL_DATASET_STAGE"
+SYNREG_STAGE_PREFIX = "@EVALUATION_DATASET_STAGE"
 SYNREG_RESULTS_STAGE = os.getenv(
     "SYNREG_RESULTS_STAGE",
     "@EVALUATION_RESULTS_STAGE/regression",
@@ -102,6 +102,7 @@ SYNREG_CPU_MAX_MATRIX_BYTES = int(os.getenv("BENCHMARK_CPU_MAX_MATRIX_BYTES", "5
 SYNREG_AG_TIME_LIMIT = int(os.getenv("AUTOGLUON_TIME_LIMIT", "300"))
 SYNREG_AG_MIN_TMP_FREE_BYTES = int(os.getenv("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", "5368709120"))
 SYNREG_AG_PRESETS = os.getenv("AUTOGLUON_PRESETS", "best_quality")
+SYNREG_AG_TASK_CPUS = int(os.getenv("AUTOGLUON_TASK_CPUS", "1"))
 
 SYNREG_BASELINE_METHODS = [
     "FixedRidgeLambda1",
@@ -204,25 +205,38 @@ def safe_torch_load_with_legacy_escape_hatch(local_path: str, device) -> dict:
     )
 
 
+_RETIRED_FAMILIES = frozenset({"deepset", "market_aware"})
+
+_LEGACY_CFG_FIELDS = frozenset({
+    "n_sab_samp", "feature_aggregation_order", "d_sample",
+    "n_sab_sample_per_feature", "sample_pool", "residual_scale_init",
+})
+
+_INDUCTIVE_REGRESSION_FAMILIES = frozenset({"market_exchangeable_icl"})
+
+
 def normalize_checkpoint_cfg(payload: dict) -> "ModelConfig":
-    """Extract and normalize cfg from checkpoint payload to a ModelConfig instance."""
+    """Extract and normalize cfg from checkpoint payload to a ModelConfig instance.
+
+    Raises RuntimeError for retired model families (deepset, market_aware).
+    Strips legacy-only cfg fields that are no longer in ModelConfig.
+    """
     cfg_raw = payload.get("cfg", {})
     if isinstance(cfg_raw, ModelConfig):
+        if cfg_raw.model_family in _RETIRED_FAMILIES:
+            raise RuntimeError(
+                f"Checkpoint uses retired model_family={cfg_raw.model_family!r}. "
+                "Only 'market_exchangeable_icl' and 'market_exchangeable_completion' are supported."
+            )
         return cfg_raw
-    # v2 format: cfg is a plain dict
-    return ModelConfig(**cfg_raw)
-
-
-_MODEL3_FAMILIES = frozenset({
-    "market_exchangeable_icl",
-    "market_exchangeable_completion",
-})
-
-_INDUCTIVE_REGRESSION_FAMILIES = frozenset({
-    "deepset",
-    "market_aware",
-    "market_exchangeable_icl",
-})
+    family = cfg_raw.get("model_family", "market_exchangeable_icl")
+    if family in _RETIRED_FAMILIES:
+        raise RuntimeError(
+            f"Checkpoint uses retired model_family={family!r}. "
+            "Only 'market_exchangeable_icl' and 'market_exchangeable_completion' are supported."
+        )
+    cfg_clean = {k: v for k, v in cfg_raw.items() if k not in _LEGACY_CFG_FIELDS}
+    return ModelConfig(**cfg_clean)
 
 
 def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
@@ -233,7 +247,7 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
 
     MODEL3 hard rules (format_version == 4):
     - model_arch_version must be 'model3'
-    - model3_design_pattern must match cfg.model3_design_pattern
+    - model_design_pattern must match cfg.model_design_pattern
     - model_family must be consistent between cfg and metadata
     - task_objective must be 'inductive_regression' for synthetic regression eval
     - market_exchangeable_completion is rejected (transductive, not inductive)
@@ -245,8 +259,15 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
         raise RuntimeError(f"Checkpoint {local_path!r} missing required 'state_dict' key.")
 
     cfg = payload["cfg"] if isinstance(payload["cfg"], dict) else dataclasses.asdict(payload["cfg"])
-    cfg_family = cfg.get("model_family", "deepset")
+    cfg_family = cfg.get("model_family", "market_exchangeable_icl")
     fmt = payload.get("checkpoint_format_version", 2)
+
+    # Hard-reject retired families
+    if cfg_family in _RETIRED_FAMILIES:
+        raise RuntimeError(
+            f"Checkpoint {local_path!r} uses retired model_family={cfg_family!r}. "
+            "Only 'market_exchangeable_icl' and 'market_exchangeable_completion' are supported."
+        )
 
     # Hard-reject completion checkpoints in synthetic regression evaluation
     if cfg_family == "market_exchangeable_completion":
@@ -254,8 +275,8 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
             f"Checkpoint {local_path!r} has model_family='market_exchangeable_completion'. "
             "Transductive completion checkpoints cannot be used for synthetic regression "
             "evaluation (which requires an inductive regression model). "
-            "Use a checkpoint trained with model_family='market_exchangeable_icl' or "
-            "'market_aware' for synthetic regression evaluation."
+            "Use a checkpoint trained with model_family='market_exchangeable_icl' "
+            "for synthetic regression evaluation."
         )
 
     meta = payload.get("metadata") or {}
@@ -286,16 +307,8 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
             "synthetic regression evaluation requires task_type='regression'."
         )
 
-    if cfg_family == "market_aware" and fmt < 3:
-        warnings.warn(
-            f"Checkpoint {local_path!r}: model_family='market_aware' but "
-            f"checkpoint_format_version={fmt} (expected >= 3). "
-            "This may be a legacy checkpoint saved before version numbering was updated.",
-            UserWarning,
-        )
-
     # MODEL3-specific hard validation
-    if cfg_family in _MODEL3_FAMILIES:
+    if cfg_family in frozenset({"market_exchangeable_icl", "market_exchangeable_completion"}):
         if fmt != 4:
             raise RuntimeError(
                 f"Checkpoint {local_path!r}: model_family={cfg_family!r} is a MODEL3 "
@@ -304,7 +317,7 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
                 "MODEL3 format version was standardized."
             )
         meta_arch = meta.get("model_arch_version")
-        cfg_arch = cfg.get("model_arch_version", "model2")
+        cfg_arch = cfg.get("model_arch_version", "model3")
         if meta_arch and meta_arch != "model3":
             raise RuntimeError(
                 f"Checkpoint {local_path!r}: MODEL3 family={cfg_family!r} but "
@@ -315,12 +328,12 @@ def validate_checkpoint_payload(payload: dict, local_path: str) -> None:
                 f"Checkpoint {local_path!r}: MODEL3 family={cfg_family!r} but "
                 f"cfg.model_arch_version={cfg_arch!r} (expected 'model3')."
             )
-        meta_pattern = meta.get("model3_design_pattern")
-        cfg_pattern = cfg.get("model3_design_pattern", "inductive_forecasting")
+        meta_pattern = meta.get("model_design_pattern")
+        cfg_pattern = cfg.get("model_design_pattern", "inductive_forecasting")
         if meta_pattern and meta_pattern != cfg_pattern:
             raise RuntimeError(
-                f"Checkpoint {local_path!r}: metadata.model3_design_pattern={meta_pattern!r} "
-                f"disagrees with cfg.model3_design_pattern={cfg_pattern!r}."
+                f"Checkpoint {local_path!r}: metadata.model_design_pattern={meta_pattern!r} "
+                f"disagrees with cfg.model_design_pattern={cfg_pattern!r}."
             )
         task_obj = meta.get("task_objective")
         if task_obj is not None and task_obj != "inductive_regression":
@@ -487,10 +500,10 @@ def _load_parquet_dataset(local_path: str) -> dict:
 def _stage_path_to_local_name(stage_path: str) -> str:
     """Convert full stage path to a flat, collision-free local filename.
 
-    @EVAL_DATASET_STAGE/ood_parity/E/dataset_0000.parquet
+    @EVALUATION_DATASET_STAGE/ood_parity/E/dataset_0000.parquet
     → ood_parity__E__dataset_0000.parquet
 
-    @EVAL_DATASET_STAGE/primary/dataset_0000.parquet
+    @EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet
     → primary__dataset_0000.parquet
     """
     # Strip the @STAGE_NAME/ prefix
@@ -871,7 +884,7 @@ def run_deepset_synthetic_regression() -> None:
     all_work_items = expand_synreg_work_items(all_rows_index, TRAIN_SIZE_GRID)
     my_items = assign_synthetic_regression_shard(all_work_items, SYNREG_SHARD_INDEX, SYNREG_NUM_SHARDS)
     print(
-        f"[INFO] DeepSet shard {SYNREG_SHARD_INDEX}/{SYNREG_NUM_SHARDS}: "
+        f"[INFO] MODEL3 shard {SYNREG_SHARD_INDEX}/{SYNREG_NUM_SHARDS}: "
         f"{len(all_rows_index)} index rows → {len(all_work_items)} work items → "
         f"{len(my_items)} assigned to this shard."
     )
@@ -898,7 +911,7 @@ def run_deepset_synthetic_regression() -> None:
                 "suite_id": SYNREG_SUITE_ID, "suite_family": suite_family,
                 "dataset_id": dataset_id, "dataset_seed": dataset_seed,
                 "split_seed": split_seed, "prior_regime": prior_regime,
-                "method": "DeepSetModel-MC",
+                "method": "MODEL3-ICL-MC",
             }
             output_rows.append(_failed_row(base, type(e).__name__, str(e)[:500]))
             del data
@@ -919,7 +932,7 @@ def run_deepset_synthetic_regression() -> None:
                 "suite_id": SYNREG_SUITE_ID, "suite_family": suite_family,
                 "dataset_id": dataset_id, "dataset_seed": dataset_seed,
                 "split_seed": split_seed, "prior_regime": prior_regime,
-                "method": "DeepSetModel-MC",
+                "method": "MODEL3-ICL-MC",
             }
             output_rows.append(_failed_row(base, type(e).__name__, str(e)[:500]))
             del data, split
@@ -943,7 +956,7 @@ def run_deepset_synthetic_regression() -> None:
             "dataset_seed": dataset_seed,
             "split_seed": split_seed,
             "prior_regime": prior_regime,
-            "method": "DeepSetModel-MC",
+            "method": "MODEL3-ICL-MC",
             "logical_dataset_key": (
                 row.get("logical_dataset_key")
                 or f"{SYNREG_SUITE_ID}:{prior_regime}:{dataset_id:04d}"
@@ -1055,9 +1068,9 @@ def run_deepset_synthetic_regression() -> None:
         gc.collect()
 
     write_part_csv_to_stage(
-        session, output_rows, "DeepSetModel-MC", SYNREG_SHARD_INDEX, SYNREG_NUM_SHARDS
+        session, output_rows, "MODEL3-ICL-MC", SYNREG_SHARD_INDEX, SYNREG_NUM_SHARDS
     )
-    print(f"[INFO] DeepSet shard {SYNREG_SHARD_INDEX} complete: {len(output_rows)} rows.")
+    print(f"[INFO] MODEL3 shard {SYNREG_SHARD_INDEX} complete: {len(output_rows)} rows.")
 
 
 # ---------------------------------------------------------------------------
@@ -1363,6 +1376,11 @@ def run_autogluon_synthetic_regression() -> None:
                 try:
                     X_train_p, X_holdout_p = preprocess_train_only(X_train, X_holdout)
 
+                    skip_reason = memory_guard_matrix(X_train_p, X_holdout_p)
+                    if skip_reason:
+                        output_rows.append(_skipped_row(base, skip_reason))
+                        continue
+
                     ag_path = os.path.join(
                         tempfile.gettempdir(),
                         f"ag_synreg_{dataset_id}_{split_seed}_{n_train_override or 'def'}"
@@ -1373,7 +1391,7 @@ def run_autogluon_synthetic_regression() -> None:
                         X_holdout_p,
                         time_limit=SYNREG_AG_TIME_LIMIT,
                         presets=SYNREG_AG_PRESETS,
-                        num_cpus=1,
+                        num_cpus=SYNREG_AG_TASK_CPUS,
                         num_gpus=0,
                         verbosity=0,
                         model_dir=ag_path,
@@ -1501,7 +1519,7 @@ def _check_shard_completeness(
 
     missing = []
     for i in range(n_ds):
-        expected = f"DeepSetModel-MC_shard{i}_of_{n_ds}_detailed.csv"
+        expected = f"MODEL3-ICL-MC_shard{i}_of_{n_ds}_detailed.csv"
         if not any(expected in n for n in found_names):
             missing.append(expected)
     for i in range(n_bl):

@@ -37,9 +37,35 @@ SCRIPTS_STAGE = "@MODEL_STAGE/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 
 SYNREG_GPU_SHARDS = 10
-SYNREG_CPU_SHARDS = 3
-SYNREG_AUTOGLUON_SHARDS = 30
-SYNREG_AUTOGLUON_MAX_CONCURRENT = 30
+SYNREG_CPU_SHARDS = 6
+SYNREG_AUTOGLUON_SHARDS = 60
+SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT = 6
+SYNREG_AUTOGLUON_CONCURRENT_NODES_DEFAULT = 60
+
+# Distributed AutoGluon defaults (combined suite, ray_work_items mode)
+SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT = int(
+    os.getenv("SYNREG_AUTOGLUON_CLUSTER_SHARDS", "6")
+)
+SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT = int(
+    os.getenv("SYNREG_AUTOGLUON_WORKERS_PER_SHARD", "4")
+)
+SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT = int(
+    os.getenv("AUTOGLUON_TASK_CPUS", "1")
+)
+SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS_DEFAULT = int(
+    os.getenv(
+        "SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS",
+        str(SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT),
+    )
+)
+SYNREG_AUTOGLUON_DISTRIBUTED_MODE_DEFAULT = os.getenv(
+    "SYNREG_AUTOGLUON_DISTRIBUTED_MODE",
+    "ray_work_items",
+)
+SYNREG_AUTOGLUON_ENTRYPOINT_DEFAULT = os.getenv(
+    "SYNREG_AUTOGLUON_ENTRYPOINT",
+    "evaluate_synthetic_regression_autogluon_ray.py",
+)
 
 DEEPSET_GPU_POOL = "DEEPSET_GPU_POOL"
 DEEPSET_CPU_POOL = "DEEPSET_CPU_POOL"
@@ -158,6 +184,110 @@ def _batched(items: list, n: int):
         yield items[i : i + n]
 
 
+def _parse_positive_int(value, *, name: str, procedure_name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{procedure_name}: {name} must be a positive integer; got {value!r}."
+        ) from exc
+    if parsed <= 0:
+        raise ValueError(
+            f"{procedure_name}: {name} must be a positive integer; got {value!r}."
+        )
+    return parsed
+
+
+def _resolve_positive_int_runtime_param(
+    *,
+    procedure_name: str,
+    name: str,
+    sql_arg,
+    env_var: str,
+    default: int,
+) -> int:
+    raw_value = sql_arg if sql_arg is not None else os.getenv(env_var, default)
+    return _parse_positive_int(
+        raw_value,
+        name=name,
+        procedure_name=procedure_name,
+    )
+
+
+def _resolve_runtime_string_param(
+    *,
+    procedure_name: str,
+    name: str,
+    sql_arg,
+    env_var: str,
+    default: str,
+) -> str:
+    value = sql_arg if sql_arg is not None else os.getenv(env_var, default)
+    value = str(value).strip()
+    if not value:
+        raise ValueError(f"{procedure_name}: {name} / {env_var} must not be empty.")
+    return value
+
+
+def _resolve_concurrent_nodes(
+    *,
+    procedure_name: str,
+    sql_arg,
+    env_var: str,
+    default: int,
+    shard_count: int,
+    compute_pool: str,
+    arg_name: str,
+) -> int:
+    raw_value = sql_arg if sql_arg is not None else os.getenv(env_var, default)
+    requested = _parse_positive_int(
+        raw_value,
+        name=arg_name,
+        procedure_name=procedure_name,
+    )
+    if requested > shard_count:
+        raise ValueError(
+            f"{procedure_name}: requested concurrency {requested} exceeds shard "
+            f"count {shard_count} for compute pool {compute_pool}. Raise the shard "
+            "count explicitly or lower the requested concurrent node count."
+        )
+    return requested
+
+
+def _resolve_baseline_concurrent_nodes(
+    procedure_name: str,
+    sql_arg=None,
+    *,
+    shard_count: int = SYNREG_CPU_SHARDS,
+) -> int:
+    return _resolve_concurrent_nodes(
+        procedure_name=procedure_name,
+        sql_arg=sql_arg,
+        env_var="SYNREG_BASELINE_CONCURRENT_NODES",
+        default=SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT,
+        shard_count=shard_count,
+        compute_pool=DEEPSET_CPU_POOL,
+        arg_name="BASELINE_CONCURRENT_NODES",
+    )
+
+
+def _resolve_autogluon_concurrent_nodes(
+    procedure_name: str,
+    sql_arg=None,
+    *,
+    shard_count: int = SYNREG_AUTOGLUON_SHARDS,
+) -> int:
+    return _resolve_concurrent_nodes(
+        procedure_name=procedure_name,
+        sql_arg=sql_arg,
+        env_var="SYNREG_AUTOGLUON_CONCURRENT_NODES",
+        default=SYNREG_AUTOGLUON_CONCURRENT_NODES_DEFAULT,
+        shard_count=shard_count,
+        compute_pool=AUTOGLUON_CPU_POOL,
+        arg_name="AUTOGLUON_CONCURRENT_NODES",
+    )
+
+
 def _wait_job_group(labeled_jobs: list[tuple[str, object]], session) -> None:
     """Wait for every (label, job) pair; propagate first failure."""
     for label, job in labeled_jobs:
@@ -219,9 +349,16 @@ def _submit_synreg(
     """
     Submit a synthetic regression MLJob via submit_from_stage.
 
-    Note: Do NOT use distributed process group (no dist.init_process_group).
-    target_instances=1 for all jobs.
+    Most evaluator jobs use target_instances=1. Distributed AutoGluon work-item cluster jobs
+    may set target_instances > 1, but only with an entrypoint that coordinates workers safely
+    and prevents duplicate shard writes.
     """
+    if target_instances > 1 and "autogluon_ray" not in entrypoint:
+        raise RuntimeError(
+            f"Refusing target_instances={target_instances} for entrypoint={entrypoint!r}. "
+            "Multi-instance synthetic regression jobs require the Ray work-item entrypoint "
+            "to avoid duplicate independent writers."
+        )
     full_env_vars = {"HOME": "/tmp"}
     full_env_vars.update(env_vars)
     _validate_synreg_submission_env(label, full_env_vars)
@@ -397,7 +534,48 @@ def run_synthetic_regression_capacity_probe(
     prep_runtime_environment: str,
     benchmark_runtime_environment: str,
     autogluon_runtime_environment: str,
+    baseline_concurrent_nodes=None,
+    autogluon_concurrent_nodes=None,
 ) -> str:
+    baseline_concurrency = _resolve_baseline_concurrent_nodes(
+        "run_synthetic_regression_capacity_probe",
+        baseline_concurrent_nodes,
+    )
+    autogluon_concurrency = _resolve_autogluon_concurrent_nodes(
+        "run_synthetic_regression_capacity_probe",
+        autogluon_concurrent_nodes,
+    )
+    print(
+        f"[INFO] Capacity probe Phase 1: DEEPSET_CPU_POOL "
+        f"({baseline_concurrency} nodes) ...",
+        flush=True,
+    )
+    _submit_and_wait_capacity_phase(
+        session,
+        "synreg_cap_baseline",
+        DEEPSET_CPU_POOL,
+        benchmark_runtime_environment,
+        baseline_concurrency,
+    )
+    print(
+        f"[INFO] Capacity probe Phase 2: AUTOGLUON_CPU_POOL "
+        f"({autogluon_concurrency} nodes) ...",
+        flush=True,
+    )
+    _submit_and_wait_capacity_phase(
+        session,
+        "synreg_cap_autogluon",
+        AUTOGLUON_CPU_POOL,
+        autogluon_runtime_environment,
+        autogluon_concurrency,
+    )
+    result = (
+        "run_synthetic_regression_capacity_probe: ok "
+        f"baseline={baseline_concurrency} ag={autogluon_concurrency}"
+    )
+    print(f"[INFO] {result}", flush=True)
+    return result
+
     """
     3 phases, strictly non-overlapping:
     Phase 1: 10 capacity probes on DEEPSET_GPU_POOL (bench_rt)
@@ -407,7 +585,7 @@ def run_synthetic_regression_capacity_probe(
     print("[INFO] Capacity probe Phase 1: DEEPSET_GPU_POOL (10 nodes) …", flush=True)
     _submit_and_wait_capacity_phase(
         session,
-        "synreg_cap_gpu",
+        "retired_synreg_cap_gpu",
         DEEPSET_GPU_POOL,
         benchmark_runtime_environment,
         SYNREG_GPU_SHARDS,
@@ -416,7 +594,7 @@ def run_synthetic_regression_capacity_probe(
     print("[INFO] Capacity probe Phase 2: DEEPSET_CPU_POOL (3 nodes) …", flush=True)
     _submit_and_wait_capacity_phase(
         session,
-        "synreg_cap_cpu",
+        "retired_synreg_cap_cpu",
         DEEPSET_CPU_POOL,
         benchmark_runtime_environment,
         SYNREG_CPU_SHARDS,
@@ -425,7 +603,7 @@ def run_synthetic_regression_capacity_probe(
     print("[INFO] Capacity probe Phase 3: AUTOGLUON_CPU_POOL (30 nodes) …", flush=True)
     _submit_and_wait_capacity_phase(
         session,
-        "synreg_cap_ag",
+        "retired_synreg_cap_ag",
         AUTOGLUON_CPU_POOL,
         autogluon_runtime_environment,
         SYNREG_AUTOGLUON_SHARDS,
@@ -437,6 +615,53 @@ def run_synthetic_regression_capacity_probe(
     )
     print(f"[INFO] {result}", flush=True)
     return result
+
+def run_synthetic_regression_baseline_capacity_probe(
+    session,
+    prep_runtime_environment: str,
+    benchmark_runtime_environment: str,
+    autogluon_runtime_environment: str,
+    baseline_concurrent_nodes=None,
+) -> str:
+    baseline_concurrency = _resolve_baseline_concurrent_nodes(
+        "run_synthetic_regression_baseline_capacity_probe",
+        baseline_concurrent_nodes,
+    )
+    _submit_and_wait_capacity_phase(
+        session,
+        "synreg_cap_baseline",
+        DEEPSET_CPU_POOL,
+        benchmark_runtime_environment,
+        baseline_concurrency,
+    )
+    return (
+        "run_synthetic_regression_baseline_capacity_probe: ok "
+        f"baseline={baseline_concurrency}"
+    )
+
+
+def run_synthetic_regression_autogluon_capacity_probe(
+    session,
+    prep_runtime_environment: str,
+    benchmark_runtime_environment: str,
+    autogluon_runtime_environment: str,
+    autogluon_concurrent_nodes=None,
+) -> str:
+    autogluon_concurrency = _resolve_autogluon_concurrent_nodes(
+        "run_synthetic_regression_autogluon_capacity_probe",
+        autogluon_concurrent_nodes,
+    )
+    _submit_and_wait_capacity_phase(
+        session,
+        "synreg_cap_autogluon",
+        AUTOGLUON_CPU_POOL,
+        autogluon_runtime_environment,
+        autogluon_concurrency,
+    )
+    return (
+        "run_synthetic_regression_autogluon_capacity_probe: ok "
+        f"ag={autogluon_concurrency}"
+    )
 
 
 def run_synthetic_regression_prep(
@@ -532,12 +757,52 @@ def run_synthetic_regression_baseline_evaluation(
     prep_runtime_environment: str,
     benchmark_runtime_environment: str,
     autogluon_runtime_environment: str,
+    baseline_concurrent_nodes=None,
 ) -> str:
     """
-    Submit 3 independent single-instance CPU jobs (bench_rt, DEEPSET_CPU_POOL).
+    Submit baseline CPU shards (bench_rt, DEEPSET_CPU_POOL) in concurrency-limited waves.
     pip=catboost==1.2.10, EAI=TABPFN_PYPI_EAI.
     """
     suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
+    baseline_concurrency = _resolve_baseline_concurrent_nodes(
+        "run_synthetic_regression_baseline_evaluation",
+        baseline_concurrent_nodes,
+    )
+
+    all_shards = list(range(SYNREG_CPU_SHARDS))
+    total_submitted = 0
+    for batch in _batched(all_shards, baseline_concurrency):
+        jobs = []
+        for i in batch:
+            lbl = f"synreg_baseline_shard_{i}"
+            job = _submit_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=DEEPSET_CPU_POOL,
+                env_vars=_synreg_shard_env(
+                    mode="baselines",
+                    suite_id=suite_id,
+                    num_shards=SYNREG_CPU_SHARDS,
+                    shard_index=i,
+                    results_stage=f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}",
+                ),
+                runtime_environment=benchmark_runtime_environment,
+                entrypoint="evaluate_synthetic_regression.py",
+                target_instances=1,
+                pip_requirements=SYNREG_BASELINE_PIP,
+                external_access_integrations=SYNREG_PYPI_EAI,
+            )
+            jobs.append((lbl, job))
+        _wait_job_group(jobs, session)
+        total_submitted += len(batch)
+        print(
+            f"[INFO] Baseline batch done: {total_submitted}/{SYNREG_CPU_SHARDS}",
+            flush=True,
+        )
+    return (
+        f"run_synthetic_regression_baseline_evaluation: ok "
+        f"shards={SYNREG_CPU_SHARDS} concurrency={baseline_concurrency}"
+    )
 
     jobs = []
     for i in range(SYNREG_CPU_SHARDS):
@@ -571,20 +836,24 @@ def run_synthetic_regression_autogluon_evaluation(
     prep_runtime_environment: str,
     benchmark_runtime_environment: str,
     autogluon_runtime_environment: str,
+    autogluon_concurrent_nodes=None,
 ) -> str:
     """
-    Submit 30 independent single-instance CPU jobs (ag_rt, AUTOGLUON_CPU_POOL).
-    Batch at SYNREG_AUTOGLUON_MAX_CONCURRENT concurrent.
+    Submit AutoGluon CPU shards (ag_rt, AUTOGLUON_CPU_POOL) in concurrency-limited waves.
     pip=autogluon.tabular==1.3.0, EAI=TABPFN_PYPI_EAI.
     """
     suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
     ag_time_limit = os.getenv("AUTOGLUON_TIME_LIMIT", "300")
     ag_presets = os.getenv("AUTOGLUON_PRESETS", "best_quality")
+    autogluon_concurrency = _resolve_autogluon_concurrent_nodes(
+        "run_synthetic_regression_autogluon_evaluation",
+        autogluon_concurrent_nodes,
+    )
 
     all_shards = list(range(SYNREG_AUTOGLUON_SHARDS))
     total_submitted = 0
 
-    for batch in _batched(all_shards, SYNREG_AUTOGLUON_MAX_CONCURRENT):
+    for batch in _batched(all_shards, autogluon_concurrency):
         jobs = []
         for i in batch:
             lbl = f"synreg_ag_shard_{i}"
@@ -614,7 +883,10 @@ def run_synthetic_regression_autogluon_evaluation(
         total_submitted += len(batch)
         print(f"[INFO] AutoGluon batch done: {total_submitted}/{SYNREG_AUTOGLUON_SHARDS}", flush=True)
 
-    return f"run_synthetic_regression_autogluon_evaluation: ok shards={SYNREG_AUTOGLUON_SHARDS}"
+    return (
+        f"run_synthetic_regression_autogluon_evaluation: ok "
+        f"shards={SYNREG_AUTOGLUON_SHARDS} concurrency={autogluon_concurrency}"
+    )
 
 
 def run_synthetic_regression_aggregation(
@@ -798,6 +1070,7 @@ def run_synthetic_regression_ood_full_baseline_evaluation(
     session,
     bench_rt: str = "2.5.0-py311",
     ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
 ) -> str:
     """Phase 3: Baselines — 3 CPU shards on DEEPSET_CPU_POOL."""
     _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
@@ -836,7 +1109,7 @@ def run_synthetic_regression_ood_full_autogluon_evaluation(
     print(f"[INFO] OOD full Phase 4: AutoGluon ({SYNREG_AUTOGLUON_SHARDS} shards) …", flush=True)
     all_ag_shards = list(range(SYNREG_AUTOGLUON_SHARDS))
     total_ag_submitted = 0
-    for batch in _batched(all_ag_shards, SYNREG_AUTOGLUON_MAX_CONCURRENT):
+    for batch in _batched(all_ag_shards, SYNREG_AUTOGLUON_CONCURRENT_NODES_DEFAULT):
         ag_batch_jobs = []
         for i in batch:
             lbl = f"ood_full_ag_shard_{i}"
@@ -1032,93 +1305,37 @@ def run_synthetic_regression_combined_deepset_evaluation(
     return f"run_synthetic_regression_combined_deepset_evaluation: ok shards={SYNREG_GPU_SHARDS}"
 
 
-def run_synthetic_regression_combined_baseline_evaluation(
-    session,
-    bench_rt: str = "2.5.0-py311",
-    ag_rt: str = "2.5.0-py311",
-) -> str:
-    """Phase 3: Baselines — 3 CPU shards on DEEPSET_CPU_POOL."""
-    _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
-    print(f"[INFO] Combined Phase 3: baselines ({SYNREG_CPU_SHARDS} shards) …", flush=True)
-    baseline_jobs = [
-        _submit_synreg(
-            session=session,
-            label=f"combined_baseline_shard_{i}",
-            compute_pool=DEEPSET_CPU_POOL,
-            env_vars=_synreg_shard_env(
-                mode="baselines",
-                suite_id=COMBINED_SUITE_ID,
-                num_shards=SYNREG_CPU_SHARDS,
-                shard_index=i,
-                results_stage=COMBINED_PARTS_PREFIX,
-            ),
-            runtime_environment=bench_rt,
-            entrypoint="evaluate_synthetic_regression.py",
-            target_instances=1,
-            pip_requirements=SYNREG_BASELINE_PIP,
-            external_access_integrations=SYNREG_PYPI_EAI,
-        )
-        for i in range(SYNREG_CPU_SHARDS)
-    ]
-    _wait_job_group(
-        [(f"combined_baseline_shard_{i}", job) for i, job in enumerate(baseline_jobs)],
-        session,
-    )
-    return f"run_synthetic_regression_combined_baseline_evaluation: ok shards={SYNREG_CPU_SHARDS}"
-
-
-def run_synthetic_regression_combined_autogluon_evaluation(
-    session,
-    bench_rt: str = "2.5.0-py311",
-    ag_rt: str = "2.5.0-py311",
-) -> str:
-    """Phase 4: AutoGluon — 30 CPU shards on AUTOGLUON_CPU_POOL (batched)."""
-    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
-    print(
-        f"[INFO] Combined Phase 4: AutoGluon ({SYNREG_AUTOGLUON_SHARDS} shards) …",
-        flush=True,
-    )
-    all_ag_shards = list(range(SYNREG_AUTOGLUON_SHARDS))
-    total_ag_submitted = 0
-    for batch in _batched(all_ag_shards, SYNREG_AUTOGLUON_MAX_CONCURRENT):
-        ag_batch_jobs = []
-        for i in batch:
-            lbl = f"combined_ag_shard_{i}"
-            job = _submit_synreg(
-                session=session,
-                label=lbl,
-                compute_pool=AUTOGLUON_CPU_POOL,
-                env_vars=_synreg_shard_env(
-                    mode="autogluon",
-                    suite_id=COMBINED_SUITE_ID,
-                    num_shards=SYNREG_AUTOGLUON_SHARDS,
-                    shard_index=i,
-                    results_stage=COMBINED_PARTS_PREFIX,
-                ),
-                runtime_environment=ag_rt,
-                entrypoint="evaluate_synthetic_regression.py",
-                target_instances=1,
-                pip_requirements=SYNREG_AG_PIP,
-                external_access_integrations=SYNREG_PYPI_EAI,
-            )
-            ag_batch_jobs.append((lbl, job))
-        _wait_job_group(ag_batch_jobs, session)
-        total_ag_submitted += len(batch)
-        print(
-            f"[INFO] Combined AG batch done: {total_ag_submitted}/{SYNREG_AUTOGLUON_SHARDS}",
-            flush=True,
-        )
-    return f"run_synthetic_regression_combined_autogluon_evaluation: ok shards={SYNREG_AUTOGLUON_SHARDS}"
-
-
 def run_synthetic_regression_combined_aggregation(
     session,
     bench_rt: str = "2.5.0-py311",
     ag_rt: str = "2.5.0-py311",
+    expected_ag_shards=None,
+    expected_baseline_shards=None,
+    expected_deepset_shards=None,
 ) -> str:
     """Phase 5: Aggregation — 1 CPU job; outputs to COMBINED_OUTPUT_STAGE."""
+    proc = "run_synthetic_regression_combined_aggregation"
+    resolved_deepset = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="EXPECTED_DEEPSET_SHARDS",
+        sql_arg=expected_deepset_shards, env_var="SYNREG_EXPECTED_DEEPSET_SHARDS",
+        default=SYNREG_GPU_SHARDS,
+    )
+    resolved_baseline = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="EXPECTED_BASELINE_SHARDS",
+        sql_arg=expected_baseline_shards, env_var="SYNREG_EXPECTED_BASELINE_SHARDS",
+        default=SYNREG_CPU_SHARDS,
+    )
+    resolved_ag = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="EXPECTED_AG_SHARDS",
+        sql_arg=expected_ag_shards, env_var="SYNREG_EXPECTED_AG_SHARDS",
+        default=SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT,
+    )
     _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
-    print("[INFO] Combined Phase 5: aggregation …", flush=True)
+    print(
+        f"[INFO] Combined Phase 5: aggregation "
+        f"(expected deepset={resolved_deepset} baseline={resolved_baseline} ag={resolved_ag}) …",
+        flush=True,
+    )
     agg_job = _submit_synreg(
         session=session,
         label="combined_aggregate",
@@ -1128,9 +1345,9 @@ def run_synthetic_regression_combined_aggregation(
             "SYNTHETIC_REGRESSION_SUITE_ID": COMBINED_SUITE_ID,
             "SYNREG_RESULTS_STAGE": COMBINED_PARTS_PREFIX,
             "SYNREG_OUTPUT_STAGE": COMBINED_OUTPUT_STAGE,
-            "SYNREG_EXPECTED_DEEPSET_SHARDS":  str(SYNREG_GPU_SHARDS),
-            "SYNREG_EXPECTED_BASELINE_SHARDS": str(SYNREG_CPU_SHARDS),
-            "SYNREG_EXPECTED_AG_SHARDS":       str(SYNREG_AUTOGLUON_SHARDS),
+            "SYNREG_EXPECTED_DEEPSET_SHARDS":  str(resolved_deepset),
+            "SYNREG_EXPECTED_BASELINE_SHARDS": str(resolved_baseline),
+            "SYNREG_EXPECTED_AG_SHARDS":       str(resolved_ag),
         },
         runtime_environment=bench_rt,
         entrypoint="evaluate_synthetic_regression.py",
@@ -1139,29 +1356,546 @@ def run_synthetic_regression_combined_aggregation(
         external_access_integrations=None,
     )
     _wait_done(agg_job, label="combined_aggregate", session=session)
-    return f"run_synthetic_regression_combined_aggregation: ok output={COMBINED_OUTPUT_STAGE}"
+    return (
+        f"run_synthetic_regression_combined_aggregation: ok output={COMBINED_OUTPUT_STAGE} "
+        f"expected_deepset={resolved_deepset} expected_baseline={resolved_baseline} "
+        f"expected_ag={resolved_ag}"
+    )
+
+
+def _run_baseline_shards_batched(
+    *,
+    session,
+    procedure_name: str,
+    label_prefix: str,
+    suite_id: str,
+    results_stage: str,
+    runtime_environment: str,
+    baseline_concurrent_nodes=None,
+) -> int:
+    concurrency = _resolve_baseline_concurrent_nodes(
+        procedure_name,
+        baseline_concurrent_nodes,
+    )
+    submitted = 0
+    for batch in _batched(list(range(SYNREG_CPU_SHARDS)), concurrency):
+        jobs = []
+        for i in batch:
+            lbl = f"{label_prefix}_{i}"
+            job = _submit_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=DEEPSET_CPU_POOL,
+                env_vars=_synreg_shard_env(
+                    mode="baselines",
+                    suite_id=suite_id,
+                    num_shards=SYNREG_CPU_SHARDS,
+                    shard_index=i,
+                    results_stage=results_stage,
+                ),
+                runtime_environment=runtime_environment,
+                entrypoint="evaluate_synthetic_regression.py",
+                target_instances=1,
+                pip_requirements=SYNREG_BASELINE_PIP,
+                external_access_integrations=SYNREG_PYPI_EAI,
+            )
+            jobs.append((lbl, job))
+        _wait_job_group(jobs, session)
+        submitted += len(batch)
+        print(
+            f"[INFO] {procedure_name} baseline batch done: "
+            f"{submitted}/{SYNREG_CPU_SHARDS}",
+            flush=True,
+        )
+    return concurrency
+
+
+def _run_autogluon_shards_batched(
+    *,
+    session,
+    procedure_name: str,
+    label_prefix: str,
+    suite_id: str,
+    results_stage: str,
+    runtime_environment: str,
+    autogluon_concurrent_nodes=None,
+) -> int:
+    concurrency = _resolve_autogluon_concurrent_nodes(
+        procedure_name,
+        autogluon_concurrent_nodes,
+    )
+    submitted = 0
+    for batch in _batched(list(range(SYNREG_AUTOGLUON_SHARDS)), concurrency):
+        jobs = []
+        for i in batch:
+            lbl = f"{label_prefix}_{i}"
+            job = _submit_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars=_synreg_shard_env(
+                    mode="autogluon",
+                    suite_id=suite_id,
+                    num_shards=SYNREG_AUTOGLUON_SHARDS,
+                    shard_index=i,
+                    results_stage=results_stage,
+                ),
+                runtime_environment=runtime_environment,
+                entrypoint="evaluate_synthetic_regression.py",
+                target_instances=1,
+                pip_requirements=SYNREG_AG_PIP,
+                external_access_integrations=SYNREG_PYPI_EAI,
+            )
+            jobs.append((lbl, job))
+        _wait_job_group(jobs, session)
+        submitted += len(batch)
+        print(
+            f"[INFO] {procedure_name} AutoGluon batch done: "
+            f"{submitted}/{SYNREG_AUTOGLUON_SHARDS}",
+            flush=True,
+        )
+    return concurrency
+
+
+def run_synthetic_regression_ood_full_baseline_evaluation(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
+) -> str:
+    _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
+    concurrency = _run_baseline_shards_batched(
+        session=session,
+        procedure_name="run_synthetic_regression_ood_full_baseline_evaluation",
+        label_prefix="ood_full_baseline_shard",
+        suite_id=OOD_FULL_SUITE_ID,
+        results_stage=OOD_FULL_PARTS_PREFIX,
+        runtime_environment=bench_rt,
+        baseline_concurrent_nodes=baseline_concurrent_nodes,
+    )
+    return (
+        f"run_synthetic_regression_ood_full_baseline_evaluation: ok "
+        f"shards={SYNREG_CPU_SHARDS} concurrency={concurrency}"
+    )
+
+
+def run_synthetic_regression_ood_full_autogluon_evaluation(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    autogluon_concurrent_nodes=None,
+) -> str:
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    concurrency = _run_autogluon_shards_batched(
+        session=session,
+        procedure_name="run_synthetic_regression_ood_full_autogluon_evaluation",
+        label_prefix="ood_full_ag_shard",
+        suite_id=OOD_FULL_SUITE_ID,
+        results_stage=OOD_FULL_PARTS_PREFIX,
+        runtime_environment=ag_rt,
+        autogluon_concurrent_nodes=autogluon_concurrent_nodes,
+    )
+    return (
+        f"run_synthetic_regression_ood_full_autogluon_evaluation: ok "
+        f"shards={SYNREG_AUTOGLUON_SHARDS} concurrency={concurrency}"
+    )
+
+
+def run_synthetic_regression_ood_full_evaluation(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
+    autogluon_concurrent_nodes=None,
+) -> str:
+    run_synthetic_regression_ood_full_prep(session, bench_rt, ag_rt)
+    run_synthetic_regression_ood_full_deepset_evaluation(session, bench_rt, ag_rt)
+    run_synthetic_regression_ood_full_baseline_evaluation(
+        session,
+        bench_rt,
+        ag_rt,
+        baseline_concurrent_nodes,
+    )
+    run_synthetic_regression_ood_full_autogluon_evaluation(
+        session,
+        bench_rt,
+        ag_rt,
+        autogluon_concurrent_nodes,
+    )
+    run_synthetic_regression_ood_full_aggregation(session, bench_rt, ag_rt)
+    return (
+        f"run_synthetic_regression_ood_full_evaluation: ok suite_id={OOD_FULL_SUITE_ID} "
+        f"deepset={OOD_FULL_GPU_SHARDS} baselines={SYNREG_CPU_SHARDS} "
+        f"ag={SYNREG_AUTOGLUON_SHARDS} output={OOD_FULL_OUTPUT_STAGE}"
+    )
+
+
+def run_synthetic_regression_combined_baseline_evaluation(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
+) -> str:
+    _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
+    concurrency = _run_baseline_shards_batched(
+        session=session,
+        procedure_name="run_synthetic_regression_combined_baseline_evaluation",
+        label_prefix="combined_baseline_shard",
+        suite_id=COMBINED_SUITE_ID,
+        results_stage=COMBINED_PARTS_PREFIX,
+        runtime_environment=bench_rt,
+        baseline_concurrent_nodes=baseline_concurrent_nodes,
+    )
+    return (
+        f"run_synthetic_regression_combined_baseline_evaluation: ok "
+        f"shards={SYNREG_CPU_SHARDS} concurrency={concurrency}"
+    )
+
+
+def run_synthetic_regression_combined_autogluon_evaluation(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    autogluon_cluster_shards=None,
+    autogluon_workers_per_shard=None,
+    autogluon_task_cpus=None,
+    autogluon_concurrent_clusters=None,
+    autogluon_time_limit=None,
+    autogluon_presets=None,
+    autogluon_entrypoint=None,
+) -> str:
+    """Phase 4: AutoGluon — distributed work-item clusters on AUTOGLUON_CPU_POOL.
+
+    Each logical shard is submitted as a Snowflake MLJob with target_instances=workers_per_shard,
+    backed by the Ray work-item entrypoint. The driver inside each MLJob owns exactly one shard
+    index and writes exactly one AutoGluon_shard{i}_of_{N}_detailed.csv file.
+
+    SQL callers:
+      CALL run_synthetic_regression_combined_autogluon_evaluation(bench_rt, ag_rt,
+           cluster_shards, workers_per_shard, task_cpus, concurrent_clusters,
+           time_limit_secs, presets, entrypoint);
+    """
+    proc = "run_synthetic_regression_combined_autogluon_evaluation"
+
+    cluster_shards = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_CLUSTER_SHARDS",
+        sql_arg=autogluon_cluster_shards, env_var="SYNREG_AUTOGLUON_CLUSTER_SHARDS",
+        default=SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT,
+    )
+    workers_per_shard = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_WORKERS_PER_SHARD",
+        sql_arg=autogluon_workers_per_shard, env_var="SYNREG_AUTOGLUON_WORKERS_PER_SHARD",
+        default=SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT,
+    )
+    task_cpus = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_TASK_CPUS",
+        sql_arg=autogluon_task_cpus, env_var="AUTOGLUON_TASK_CPUS",
+        default=SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT,
+    )
+    concurrent_clusters = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_CONCURRENT_CLUSTERS",
+        sql_arg=autogluon_concurrent_clusters, env_var="SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS",
+        default=SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS_DEFAULT,
+    )
+    time_limit = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_TIME_LIMIT",
+        sql_arg=autogluon_time_limit, env_var="AUTOGLUON_TIME_LIMIT",
+        default=300,
+    )
+    presets = _resolve_runtime_string_param(
+        procedure_name=proc, name="AUTOGLUON_PRESETS",
+        sql_arg=autogluon_presets, env_var="AUTOGLUON_PRESETS",
+        default="best_quality",
+    )
+    resolved_entrypoint = _resolve_runtime_string_param(
+        procedure_name=proc, name="AUTOGLUON_ENTRYPOINT",
+        sql_arg=autogluon_entrypoint, env_var="SYNREG_AUTOGLUON_ENTRYPOINT",
+        default=SYNREG_AUTOGLUON_ENTRYPOINT_DEFAULT,
+    )
+
+    if concurrent_clusters > cluster_shards:
+        raise ValueError(
+            f"{proc}: autogluon_concurrent_clusters={concurrent_clusters} > "
+            f"autogluon_cluster_shards={cluster_shards}. "
+            "Concurrent clusters cannot exceed total cluster shards."
+        )
+
+    max_requested_nodes = concurrent_clusters * workers_per_shard
+    print(
+        f"[INFO] {proc}: suite_id={COMBINED_SUITE_ID} "
+        f"cluster_shards={cluster_shards} workers_per_shard={workers_per_shard} "
+        f"task_cpus={task_cpus} concurrent_clusters={concurrent_clusters} "
+        f"max_requested_nodes={max_requested_nodes} "
+        f"time_limit={time_limit} presets={presets!r} entrypoint={resolved_entrypoint!r}",
+        flush=True,
+    )
+
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+
+    ag_min_tmp = os.getenv(
+        "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", "5368709120"
+    )
+
+    all_shard_indices = list(range(cluster_shards))
+    total_submitted = 0
+
+    for batch in _batched(all_shard_indices, concurrent_clusters):
+        jobs = []
+        for shard_index in batch:
+            lbl = f"combined_ag_cluster_{shard_index}"
+            try:
+                job = _submit_synreg(
+                    session=session,
+                    label=lbl,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars=_synreg_shard_env(
+                        mode="autogluon",
+                        suite_id=COMBINED_SUITE_ID,
+                        num_shards=cluster_shards,
+                        shard_index=shard_index,
+                        results_stage=COMBINED_PARTS_PREFIX,
+                        extra_env={
+                            "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
+                            "SYNREG_AUTOGLUON_CLUSTER_SHARDS": str(cluster_shards),
+                            "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(workers_per_shard),
+                            "SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS": str(concurrent_clusters),
+                            "AUTOGLUON_TIME_LIMIT": str(time_limit),
+                            "AUTOGLUON_PRESETS": presets,
+                            "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                            "SYNREG_OUTPUT_STAGE": COMBINED_OUTPUT_STAGE,
+                            "SYNREG_EXPECTED_AG_SHARDS": str(cluster_shards),
+                            "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES": ag_min_tmp,
+                        },
+                    ),
+                    runtime_environment=ag_rt,
+                    entrypoint=resolved_entrypoint,
+                    target_instances=workers_per_shard,
+                    pip_requirements=SYNREG_AG_PIP,
+                    external_access_integrations=SYNREG_PYPI_EAI,
+                )
+                jobs.append((lbl, job))
+            except Exception as e:
+                if _is_node_quota_error(e):
+                    raise RuntimeError(
+                        f"[QUOTA] Node quota exceeded during {proc}.\n"
+                        f"Requested clusters={concurrent_clusters}, "
+                        f"workers_per_shard={workers_per_shard}, "
+                        f"total_nodes={max_requested_nodes} on {AUTOGLUON_CPU_POOL}.\n"
+                        "Remediation: lower SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS, "
+                        "lower SYNREG_AUTOGLUON_WORKERS_PER_SHARD, suspend idle pools, "
+                        "or request a higher Snowflake node quota."
+                    ) from e
+                raise
+        _wait_job_group(jobs, session)
+        total_submitted += len(batch)
+        print(
+            f"[INFO] Combined AG cluster batch done: {total_submitted}/{cluster_shards}",
+            flush=True,
+        )
+
+    return (
+        f"run_synthetic_regression_combined_autogluon_evaluation: ok "
+        f"suite_id={COMBINED_SUITE_ID} cluster_shards={cluster_shards} "
+        f"workers_per_shard={workers_per_shard} task_cpus={task_cpus} "
+        f"concurrent_clusters={concurrent_clusters} max_requested_nodes={max_requested_nodes} "
+        f"time_limit={time_limit} presets={presets!r} entrypoint={resolved_entrypoint!r}"
+    )
 
 
 def run_synthetic_regression_combined_evaluation(
     session,
     bench_rt: str = "2.5.0-py311",
     ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
+    autogluon_cluster_shards=None,
+    autogluon_workers_per_shard=None,
+    autogluon_task_cpus=None,
+    autogluon_concurrent_clusters=None,
+    autogluon_time_limit=None,
+    autogluon_presets=None,
+    autogluon_entrypoint=None,
 ) -> str:
-    """All-in-one convenience wrapper. Calls all 5 phase functions in sequence.
+    """All-in-one combined suite wrapper — runs all 5 phases in sequence.
 
-    Prerequisites: both linear_poisson_v1_recommended and ood_linear_full_v1 must be
-    indexed in SYNTHETIC_REGRESSION_DATASET_INDEX before calling this procedure.
+    Prerequisites: linear_poisson_v1_recommended and ood_linear_full_v1 must be
+    indexed before calling this procedure.
     """
+    proc = "run_synthetic_regression_combined_evaluation"
+    # Resolve cluster_shards early so aggregation gets the same value.
+    resolved_cluster_shards = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_CLUSTER_SHARDS",
+        sql_arg=autogluon_cluster_shards, env_var="SYNREG_AUTOGLUON_CLUSTER_SHARDS",
+        default=SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT,
+    )
+    resolved_concurrency = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="SYNREG_BASELINE_CONCURRENT_NODES",
+        sql_arg=baseline_concurrent_nodes, env_var="SYNREG_BASELINE_CONCURRENT_NODES",
+        default=SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT,
+    )
+
     run_synthetic_regression_combined_prep(session, bench_rt, ag_rt)
     run_synthetic_regression_combined_deepset_evaluation(session, bench_rt, ag_rt)
-    run_synthetic_regression_combined_baseline_evaluation(session, bench_rt, ag_rt)
-    run_synthetic_regression_combined_autogluon_evaluation(session, bench_rt, ag_rt)
-    run_synthetic_regression_combined_aggregation(session, bench_rt, ag_rt)
+    run_synthetic_regression_combined_baseline_evaluation(
+        session, bench_rt, ag_rt,
+        baseline_concurrent_nodes=baseline_concurrent_nodes,
+    )
+    run_synthetic_regression_combined_autogluon_evaluation(
+        session, bench_rt, ag_rt,
+        autogluon_cluster_shards=autogluon_cluster_shards,
+        autogluon_workers_per_shard=autogluon_workers_per_shard,
+        autogluon_task_cpus=autogluon_task_cpus,
+        autogluon_concurrent_clusters=autogluon_concurrent_clusters,
+        autogluon_time_limit=autogluon_time_limit,
+        autogluon_presets=autogluon_presets,
+        autogluon_entrypoint=autogluon_entrypoint,
+    )
+    run_synthetic_regression_combined_aggregation(
+        session, bench_rt, ag_rt,
+        expected_ag_shards=resolved_cluster_shards,
+    )
     return (
         f"run_synthetic_regression_combined_evaluation: ok "
         f"suite_id={COMBINED_SUITE_ID} "
         f"deepset={SYNREG_GPU_SHARDS} baselines={SYNREG_CPU_SHARDS} "
-        f"ag={SYNREG_AUTOGLUON_SHARDS} output={COMBINED_OUTPUT_STAGE}"
+        f"baseline_concurrency={resolved_concurrency} "
+        f"ag_cluster_shards={resolved_cluster_shards} output={COMBINED_OUTPUT_STAGE}"
+    )
+
+
+def run_synthetic_regression_combined_baseline_capacity_probe(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    baseline_concurrent_nodes=None,
+) -> str:
+    """Capacity probe: submit N capacity_probe.py jobs to DEEPSET_CPU_POOL.
+
+    Tests whether the baseline CPU pool can scale to the requested node count
+    before committing to a full combined baseline evaluation run.
+    """
+    proc = "run_synthetic_regression_combined_baseline_capacity_probe"
+    n_probes = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="BASELINE_CONCURRENT_NODES",
+        sql_arg=baseline_concurrent_nodes, env_var="SYNREG_BASELINE_CONCURRENT_NODES",
+        default=SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT,
+    )
+    print(
+        f"[INFO] {proc}: submitting {n_probes} capacity probes to {DEEPSET_CPU_POOL}",
+        flush=True,
+    )
+    _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
+    jobs = []
+    for i in range(n_probes):
+        lbl = f"combined_baseline_cap_probe_{i}"
+        try:
+            job = _submit_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=DEEPSET_CPU_POOL,
+                env_vars={"CAPACITY_PROBE_INDEX": str(i), "CAPACITY_PROBE_TOTAL": str(n_probes)},
+                runtime_environment=bench_rt,
+                entrypoint="capacity_probe.py",
+                target_instances=1,
+                pip_requirements=None,
+                external_access_integrations=None,
+            )
+            jobs.append((lbl, job))
+        except Exception as e:
+            if _is_node_quota_error(e):
+                raise RuntimeError(
+                    f"[QUOTA] Node quota exceeded during {proc}.\n"
+                    f"Requested baseline_concurrent_nodes={n_probes} on {DEEPSET_CPU_POOL}.\n"
+                    "Remediation: lower SYNREG_BASELINE_CONCURRENT_NODES, "
+                    "suspend idle pools, or request a higher Snowflake node quota."
+                ) from e
+            raise
+    _wait_job_group(jobs, session)
+    return (
+        f"{proc}: ok baseline_concurrent_nodes={n_probes} pool={DEEPSET_CPU_POOL}"
+    )
+
+
+def run_synthetic_regression_combined_autogluon_capacity_probe(
+    session,
+    bench_rt: str = "2.5.0-py311",
+    ag_rt: str = "2.5.0-py311",
+    autogluon_cluster_shards=None,
+    autogluon_workers_per_shard=None,
+    autogluon_concurrent_clusters=None,
+) -> str:
+    """Capacity probe: test the concurrent node envelope for distributed AutoGluon.
+
+    Submits autogluon_concurrent_clusters capacity_probe.py jobs to AUTOGLUON_CPU_POOL,
+    each requesting autogluon_workers_per_shard target instances. This verifies the pool
+    can satisfy concurrent_clusters * workers_per_shard nodes simultaneously.
+
+    Recommended default: 6 clusters x 4 workers = 24 CPU_X64_M nodes.
+    """
+    proc = "run_synthetic_regression_combined_autogluon_capacity_probe"
+    cluster_shards = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_CLUSTER_SHARDS",
+        sql_arg=autogluon_cluster_shards, env_var="SYNREG_AUTOGLUON_CLUSTER_SHARDS",
+        default=SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT,
+    )
+    workers_per_shard = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_WORKERS_PER_SHARD",
+        sql_arg=autogluon_workers_per_shard, env_var="SYNREG_AUTOGLUON_WORKERS_PER_SHARD",
+        default=SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT,
+    )
+    concurrent_clusters = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_CONCURRENT_CLUSTERS",
+        sql_arg=autogluon_concurrent_clusters, env_var="SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS",
+        default=SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS_DEFAULT,
+    )
+    if concurrent_clusters > cluster_shards:
+        raise ValueError(
+            f"{proc}: autogluon_concurrent_clusters={concurrent_clusters} > "
+            f"autogluon_cluster_shards={cluster_shards}."
+        )
+    total_requested_nodes = concurrent_clusters * workers_per_shard
+    print(
+        f"[INFO] {proc}: submitting {concurrent_clusters} probes to {AUTOGLUON_CPU_POOL} "
+        f"each with target_instances={workers_per_shard} "
+        f"(total_requested_nodes={total_requested_nodes})",
+        flush=True,
+    )
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    jobs = []
+    for i in range(concurrent_clusters):
+        lbl = f"combined_ag_cap_probe_{i}"
+        try:
+            job = _submit_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "CAPACITY_PROBE_INDEX": str(i),
+                    "CAPACITY_PROBE_TOTAL": str(concurrent_clusters),
+                },
+                runtime_environment=ag_rt,
+                entrypoint="capacity_probe.py",
+                target_instances=workers_per_shard,
+                pip_requirements=None,
+                external_access_integrations=None,
+            )
+            jobs.append((lbl, job))
+        except Exception as e:
+            if _is_node_quota_error(e):
+                raise RuntimeError(
+                    f"[QUOTA] Node quota exceeded during {proc}.\n"
+                    f"Requested clusters={concurrent_clusters}, "
+                    f"workers_per_shard={workers_per_shard}, "
+                    f"total_nodes={total_requested_nodes} on {AUTOGLUON_CPU_POOL}.\n"
+                    "Remediation: lower SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS, "
+                    "lower SYNREG_AUTOGLUON_WORKERS_PER_SHARD, suspend idle pools, "
+                    "or request a higher Snowflake node quota."
+                ) from e
+            raise
+    _wait_job_group(jobs, session)
+    return (
+        f"{proc}: ok cluster_shards={cluster_shards} workers_per_shard={workers_per_shard} "
+        f"concurrent_clusters={concurrent_clusters} "
+        f"total_requested_nodes={total_requested_nodes} pool={AUTOGLUON_CPU_POOL}"
     )
 
 

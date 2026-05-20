@@ -4,7 +4,7 @@ prepare_ood_regression.py
 MLJob entrypoint that indexes OOD datasets into
 SYNTHETIC_REGRESSION_DATASET_INDEX.
 
-Reads the manifest from @EVAL_DATASET_STAGE/ood_parity/ood_manifest.json,
+Reads the manifest from @EVALUATION_DATASET_STAGE/ood_parity/ood_manifest.json,
 selects the first OOD_N_DATASETS // 4 datasets per regime (deterministic), and
 inserts rows into the shared SYNTHETIC_REGRESSION_DATASET_INDEX table, isolated
 by suite_id = OOD_SUITE_ID.
@@ -14,7 +14,7 @@ Safety invariants
 * Shared table SYNTHETIC_REGRESSION_DATASET_INDEX is NEVER DROPped.
   _truncate_ood_index() uses DELETE WHERE suite_id = OOD_SUITE_ID only.
 * Production suite rows (suite_id != OOD_SUITE_ID) are never touched.
-* OOD data lives on @EVAL_DATASET_STAGE; @META_DATASET_STAGE is untouched.
+* OOD data lives on @EVALUATION_DATASET_STAGE; @META_DATASET_STAGE is untouched.
 * create_synreg_index_table() is always called before _truncate_ood_index()
   to ensure the table exists before any DELETE.
 
@@ -86,7 +86,7 @@ if OOD_N_DATASETS % 4 != 0:
     )
 OOD_SPLIT_SEEDS = [0, 1, 2]
 OOD_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
-EVAL_STAGE_PREFIX = "@EVAL_DATASET_STAGE/ood_parity"
+EVAL_STAGE_PREFIX = "@EVALUATION_DATASET_STAGE/ood_parity"
 OOD_MANIFEST_PATH = f"{EVAL_STAGE_PREFIX}/ood_manifest.json"
 OOD_LOCAL_DIR = os.getenv("OOD_REGRESSION_LOCAL_DIR", "/tmp/ood_reg_prep")
 
@@ -159,7 +159,7 @@ def _make_ood_index_row(
 
 
 def _download_manifest(session) -> dict:
-    """Download ood_manifest.json from @EVAL_DATASET_STAGE and parse it."""
+    """Download ood_manifest.json from @EVALUATION_DATASET_STAGE and parse it."""
     local_dir = OOD_LOCAL_DIR
     os.makedirs(local_dir, exist_ok=True)
     session.file.get(OOD_MANIFEST_PATH, local_dir)
@@ -184,7 +184,7 @@ def prepare_ood_regression(session=None) -> str:
 
     Steps
     -----
-    1. Download ood_manifest.json from @EVAL_DATASET_STAGE.
+    1. Download ood_manifest.json from @EVALUATION_DATASET_STAGE.
     2. Select first OOD_N_DATASETS // 4 datasets per regime (deterministic).
     3. CREATE TABLE IF NOT EXISTS (ensure table exists before any DELETE).
     4. DELETE existing OOD suite rows (suite_id-scoped only).

@@ -18,11 +18,10 @@ MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 TRAIN_NUM_NODES             = 10
 
 # Model selector env vars — propagated to the pretrain MLJob so train.py builds
-# the correct model family. Default values preserve MODEL2 production behavior.
-DEFAULT_DEEPSET_MODEL_FAMILY  = os.getenv("DEEPSET_MODEL_FAMILY",  "market_aware")
+# the correct model family.
+DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_TRAINING_DATA_FAMILY  = os.getenv("TRAINING_DATA_FAMILY",  "synthetic_regression_combined")
-DEFAULT_MODEL_ARCH_VERSION    = os.getenv("MODEL_ARCH_VERSION",    "model2")
-DEFAULT_MODEL3_DESIGN_PATTERN = os.getenv("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
+DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
 def _wait_done(job, label):
@@ -74,13 +73,44 @@ def _validate_meta_dataset_index(session):
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
+    # Column existence check — catches missing columns before long GPU jobs
+    _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
+    try:
+        session.sql(
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_DATASET_INDEX LIMIT 1"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"META_DATASET_INDEX is missing one or more required columns "
+            f"({_REQUIRED_COLUMNS}). "
+            "Rebuild with CALL build_meta_dataset_index(); "
+            f"Error: {exc}"
+        ) from exc
+
+    # Stage file accessibility spot-check — catches empty/missing staged data
+    for _split in ("train", "val"):
+        try:
+            _files = session.sql(f"LIST @META_DATASET_STAGE/{_split}/").collect()
+            if not _files:
+                raise RuntimeError(
+                    f"No staged files found in @META_DATASET_STAGE/{_split}/. "
+                    "Re-upload training data before starting a GPU job."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"META_DATASET_INDEX references @META_DATASET_STAGE/{_split}/ "
+                f"but the stage directory is inaccessible: {exc}. "
+                "Verify stage permissions and re-upload data."
+            ) from exc
+
 
 def _run_pretrain_impl(
     session,
-    deepset_model_family: str,
+    model_family: str,
     training_data_family: str,
-    model_arch_version: str,
-    model3_design_pattern: str,
+    model_design_pattern: str,
 ) -> str:
     _validate_meta_dataset_index(session)
     print("Submitting pre-training job ...")
@@ -96,10 +126,9 @@ def _run_pretrain_impl(
             "HOME":                      "/tmp",
             "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
             "STRICT_WORLD_SIZE_CHECK":   "true",
-            "DEEPSET_MODEL_FAMILY":      deepset_model_family,
+            "MODEL_FAMILY":              model_family,
             "TRAINING_DATA_FAMILY":      training_data_family,
-            "MODEL_ARCH_VERSION":        model_arch_version,
-            "MODEL3_DESIGN_PATTERN":     model3_design_pattern,
+            "MODEL_DESIGN_PATTERN":     model_design_pattern,
         },
         session=session,
     )
@@ -114,22 +143,20 @@ def _run_pretrain_impl(
 
 
 def run_pretrain_pipeline(session) -> str:
-    """Zero-arg entrypoint: uses env-var defaults (MODEL2 production behavior)."""
+    """Zero-arg entrypoint: uses env-var defaults."""
     return _run_pretrain_impl(
         session,
-        DEFAULT_DEEPSET_MODEL_FAMILY,
+        DEFAULT_MODEL_FAMILY,
         DEFAULT_TRAINING_DATA_FAMILY,
-        DEFAULT_MODEL_ARCH_VERSION,
-        DEFAULT_MODEL3_DESIGN_PATTERN,
+        DEFAULT_MODEL_DESIGN_PATTERN,
     )
 
 
-def run_pretrain_pipeline_m3(
+def run_pretrain_pipeline_model(
     session,
-    deepset_model_family: str,
+    model_family: str,
     training_data_family: str,
-    model_arch_version: str,
-    model3_design_pattern: str,
+    model_design_pattern: str,
 ) -> str:
     """Parameterized entrypoint: explicit selectors for MODEL3 training.
 
@@ -137,14 +164,12 @@ def run_pretrain_pipeline_m3(
         CALL run_pretrain_pipeline(
             'market_exchangeable_icl',
             'synthetic_regression_combined',
-            'model3',
             'inductive_forecasting'
         );
     """
     return _run_pretrain_impl(
         session,
-        deepset_model_family,
+        model_family,
         training_data_family,
-        model_arch_version,
-        model3_design_pattern,
+        model_design_pattern,
     )

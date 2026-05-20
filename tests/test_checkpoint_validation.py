@@ -39,22 +39,29 @@ from evaluate_synthetic_regression import validate_checkpoint_payload, SYNREG_DE
 
 
 def _make_valid_payload(
-    model_family="market_aware",
+    model_family="market_exchangeable_icl",
     task_type="regression",
-    fmt=3,
+    fmt=4,
     include_metadata=True,
     meta_family=None,
 ):
-    """Build a valid checkpoint payload dict."""
+    """Build a valid MODEL3 checkpoint payload dict."""
     meta = {}
     if include_metadata:
         meta["model_family"] = meta_family if meta_family is not None else model_family
         if task_type is not None:
             meta["task_type"] = task_type
+        # MODEL3 required metadata fields
+        meta["model_arch_version"] = "model3"
+        meta["model_design_pattern"] = "inductive_forecasting"
+        meta["task_objective"] = "inductive_regression"
     return {
         "checkpoint_format_version": fmt,
-        "cfg": {"model_family": model_family, "d_phi": 128, "d_rho": 256, "pool": "pna",
-                "n_heads": 4, "n_sab_feat": 1, "n_sab_samp": 1,
+        "cfg": {"model_family": model_family,
+                "model_arch_version": "model3",
+                "model_design_pattern": "inductive_forecasting",
+                "d_phi": 128, "d_rho": 256, "pool": "pna",
+                "n_heads": 4, "n_sab_feat": 1,
                 "norm_feat": True, "norm_target": True, "dropout": 0.1},
         "state_dict": {"some_weight": torch.zeros(2)},
         "metadata": meta if include_metadata else None,
@@ -65,16 +72,36 @@ def _make_valid_payload(
 # validate_checkpoint_payload tests
 # ---------------------------------------------------------------------------
 
-def test_valid_market_aware_payload_passes():
-    """Full valid market_aware payload with task_type=regression, fmt=3 → no exception."""
-    payload = _make_valid_payload(model_family="market_aware", task_type="regression", fmt=3)
+def test_valid_model3_icl_payload_passes():
+    """Full valid MODEL3 ICL payload → no exception."""
+    payload = _make_valid_payload(model_family="market_exchangeable_icl", fmt=4)
     validate_checkpoint_payload(payload, "/tmp/test.pt")  # no exception
 
 
-def test_valid_deepset_payload_passes():
-    """Full valid deepset payload, fmt=2 → no exception."""
-    payload = _make_valid_payload(model_family="deepset", task_type="regression", fmt=2)
-    validate_checkpoint_payload(payload, "/tmp/test.pt")  # no exception
+def test_retired_market_aware_family_raises():
+    """market_aware model_family → RuntimeError (retired)."""
+    payload = {
+        "checkpoint_format_version": 3,
+        "cfg": {"model_family": "market_aware", "d_phi": 128, "d_rho": 256, "pool": "pna",
+                "n_heads": 4, "n_sab_feat": 1, "norm_feat": True, "norm_target": True, "dropout": 0.1},
+        "state_dict": {"w": torch.zeros(2)},
+        "metadata": {"model_family": "market_aware", "task_type": "regression"},
+    }
+    with pytest.raises(RuntimeError, match="retired"):
+        validate_checkpoint_payload(payload, "/tmp/test.pt")
+
+
+def test_retired_deepset_family_raises():
+    """deepset model_family → RuntimeError (retired)."""
+    payload = {
+        "checkpoint_format_version": 2,
+        "cfg": {"model_family": "deepset", "d_phi": 128, "d_rho": 256, "pool": "pna",
+                "n_heads": 4, "n_sab_feat": 1, "norm_feat": True, "norm_target": True, "dropout": 0.1},
+        "state_dict": {"w": torch.zeros(2)},
+        "metadata": {"model_family": "deepset", "task_type": "regression"},
+    }
+    with pytest.raises(RuntimeError, match="retired"):
+        validate_checkpoint_payload(payload, "/tmp/test.pt")
 
 
 def test_missing_cfg_fails():
@@ -86,7 +113,7 @@ def test_missing_cfg_fails():
 
 def test_missing_state_dict_fails():
     """Payload without 'state_dict' key → RuntimeError."""
-    payload = {"cfg": {"model_family": "deepset"}}
+    payload = {"cfg": {"model_family": "market_exchangeable_icl"}}
     with pytest.raises(RuntimeError, match="missing required 'state_dict'"):
         validate_checkpoint_payload(payload, "/tmp/test.pt")
 
@@ -106,16 +133,9 @@ def test_missing_task_type_warns():
 
 
 def test_model_family_mismatch_fails():
-    """cfg.model_family='deepset' but metadata.model_family='market_aware' → RuntimeError."""
-    payload = _make_valid_payload(model_family="deepset", meta_family="market_aware")
+    """cfg.model_family='market_exchangeable_icl' but metadata.model_family='market_exchangeable_completion' → RuntimeError."""
+    payload = _make_valid_payload(model_family="market_exchangeable_icl", meta_family="market_exchangeable_completion")
     with pytest.raises(RuntimeError, match="disagrees with"):
-        validate_checkpoint_payload(payload, "/tmp/test.pt")
-
-
-def test_market_aware_v2_warns():
-    """market_aware model with fmt=2 → UserWarning about checkpoint_format_version."""
-    payload = _make_valid_payload(model_family="market_aware", task_type="regression", fmt=2)
-    with pytest.warns(UserWarning, match="checkpoint_format_version"):
         validate_checkpoint_payload(payload, "/tmp/test.pt")
 
 
@@ -179,7 +199,7 @@ def _make_model3_payload(
     meta = {
         "model_family": meta_family if meta_family is not None else model_family,
         "model_arch_version": meta_arch,
-        "model3_design_pattern": meta_pattern,
+        "model_design_pattern": meta_pattern,
         "task_type": task_type,
         "task_objective": task_objective,
     }
@@ -188,7 +208,7 @@ def _make_model3_payload(
         "cfg": {
             "model_family": model_family,
             "model_arch_version": cfg_arch,
-            "model3_design_pattern": cfg_pattern,
+            "model_design_pattern": cfg_pattern,
             "d_phi": 64,
             "d_rho": 128,
             "pool": "pna",
@@ -243,13 +263,13 @@ def test_model3_cfg_arch_version_wrong_fails():
         validate_checkpoint_payload(payload, "/fake/bad_cfg_arch.pt")
 
 
-def test_model3_design_pattern_mismatch_fails():
-    """metadata.model3_design_pattern disagrees with cfg.model3_design_pattern → RuntimeError."""
+def test_model_design_pattern_mismatch_fails():
+    """metadata.model_design_pattern disagrees with cfg.model_design_pattern → RuntimeError."""
     payload = _make_model3_payload(
         cfg_pattern="inductive_forecasting",
         meta_pattern="transductive_completion",  # mismatch
     )
-    with pytest.raises(RuntimeError, match="model3_design_pattern"):
+    with pytest.raises(RuntimeError, match="model_design_pattern"):
         validate_checkpoint_payload(payload, "/fake/pattern_mismatch.pt")
 
 
@@ -258,3 +278,35 @@ def test_model3_wrong_task_objective_fails():
     payload = _make_model3_payload(task_objective="transductive_completion")
     with pytest.raises(RuntimeError, match="task_objective"):
         validate_checkpoint_payload(payload, "/fake/wrong_objective.pt")
+
+
+# ---------------------------------------------------------------------------
+# Fix 8: Merged HPO config checkpoint passes validation (Fix 10)
+# ---------------------------------------------------------------------------
+
+def test_best_pt_with_merged_hpo_config_passes_validation():
+    """Checkpoint produced after architecture sweep with merged best_config passes validation."""
+    import dataclasses
+    from model import ModelConfig
+    payload = {
+        "checkpoint_format_version": 4,
+        "cfg": dataclasses.asdict(ModelConfig(
+            d_phi=192,
+            n_sab_feat=2,
+            model_family="market_exchangeable_icl",
+            model_arch_version="model3",
+            model_design_pattern="inductive_forecasting",
+        )),
+        "state_dict": {},
+        "metadata": {
+            "model_family": "market_exchangeable_icl",
+            "model_arch_version": "model3",
+            "model_design_pattern": "inductive_forecasting",
+            "task_objective": "inductive_regression",
+            "task_type": "regression",
+            "hpo_sweep_mode": "architecture",
+            "pretrain_loaded": False,
+            "pretrain_policy": "allow_cold_start_on_arch_mismatch",
+        },
+    }
+    validate_checkpoint_payload(payload, "best.pt")  # must not raise

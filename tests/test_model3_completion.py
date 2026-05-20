@@ -1,7 +1,7 @@
 """
 tests/test_model3_completion.py
 
-Tests for MarketExchangeableCompletionModel — MODEL3 transductive completion.
+Tests for DeepSetCompletionModel — MODEL3 transductive completion.
 
 Covers:
   - ModelConfig validation for completion selectors
@@ -32,7 +32,7 @@ if SRC_DIR not in sys.path:
 
 from model import (
     ModelConfig,
-    MarketExchangeableCompletionModel,
+    DeepSetCompletionModel,
     _instantiate_model,
 )
 
@@ -45,7 +45,7 @@ def _comp_cfg(n_blocks=2, d_model=64, dropout=0.0):
     return ModelConfig(
         model_family="market_exchangeable_completion",
         model_arch_version="model3",
-        model3_design_pattern="transductive_completion",
+        model_design_pattern="transductive_completion",
         d_phi=d_model,
         n_sab_feat=n_blocks,
         n_heads=4,
@@ -55,7 +55,7 @@ def _comp_cfg(n_blocks=2, d_model=64, dropout=0.0):
 
 def _fresh_comp(n_blocks=2, d_model=64):
     cfg = _comp_cfg(n_blocks=n_blocks, d_model=d_model)
-    m = MarketExchangeableCompletionModel(cfg)
+    m = DeepSetCompletionModel(cfg)
     m.eval()
     return m
 
@@ -69,14 +69,14 @@ class TestCompletionModelConfig:
         cfg = _comp_cfg()
         assert cfg.model_family == "market_exchangeable_completion"
         assert cfg.model_arch_version == "model3"
-        assert cfg.model3_design_pattern == "transductive_completion"
+        assert cfg.model_design_pattern == "transductive_completion"
 
     def test_completion_family_requires_model3(self):
         with pytest.raises(ValueError, match="model_arch_version"):
             ModelConfig(
                 model_family="market_exchangeable_completion",
                 model_arch_version="model2",
-                model3_design_pattern="transductive_completion",
+                model_design_pattern="transductive_completion",
             )
 
     def test_completion_requires_transductive_pattern(self):
@@ -84,13 +84,18 @@ class TestCompletionModelConfig:
             ModelConfig(
                 model_family="market_exchangeable_icl",
                 model_arch_version="model3",
-                model3_design_pattern="transductive_completion",
+                model_design_pattern="transductive_completion",
             )
 
     def test_wrong_family_for_completion_class_raises(self):
-        cfg = ModelConfig(model_family="market_aware", d_phi=64)
+        cfg = ModelConfig(
+            model_family="market_exchangeable_icl",
+            model_arch_version="model3",
+            model_design_pattern="inductive_forecasting",
+            d_phi=64,
+        )
         with pytest.raises(ValueError, match="market_exchangeable_completion"):
-            MarketExchangeableCompletionModel(cfg)
+            DeepSetCompletionModel(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +106,7 @@ class TestFactoryRouting:
     def test_instantiate_completion(self):
         cfg = _comp_cfg()
         m = _instantiate_model(cfg)
-        assert isinstance(m, MarketExchangeableCompletionModel)
+        assert isinstance(m, DeepSetCompletionModel)
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +331,7 @@ class TestGradientFlow:
 class TestCheckpointV4:
     def test_checkpoint_format_version_4(self):
         cfg = _comp_cfg()
-        m = MarketExchangeableCompletionModel(cfg)
+        m = DeepSetCompletionModel(cfg)
         m.eval()
         tmp  = tempfile.mkdtemp()
         path = os.path.join(tmp, "model3_completion.pt")
@@ -336,7 +341,7 @@ class TestCheckpointV4:
             "state_dict": m.state_dict(),
             "metadata": {
                 "model_arch_version":    "model3",
-                "model3_design_pattern": "transductive_completion",
+                "model_design_pattern": "transductive_completion",
                 "model_family":          "market_exchangeable_completion",
                 "training_data_family":  "market_mental_model",
                 "task_objective":        "transductive_completion",
@@ -346,12 +351,12 @@ class TestCheckpointV4:
         ckpt = torch.load(path, weights_only=False)
         assert ckpt["checkpoint_format_version"] == 4
         assert ckpt["metadata"]["model_arch_version"] == "model3"
-        assert ckpt["metadata"]["model3_design_pattern"] == "transductive_completion"
+        assert ckpt["metadata"]["model_design_pattern"] == "transductive_completion"
         assert ckpt["metadata"]["task_objective"] == "transductive_completion"
 
     def test_reload_from_checkpoint(self):
         cfg = _comp_cfg()
-        m = MarketExchangeableCompletionModel(cfg)
+        m = DeepSetCompletionModel(cfg)
         m.eval()
         tmp  = tempfile.mkdtemp()
         path = os.path.join(tmp, "comp_reload.pt")

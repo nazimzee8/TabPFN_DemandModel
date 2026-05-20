@@ -1,7 +1,7 @@
 """
 train.py
 
-Training loop for the DeepSetModel inside a Snowpark Container Services (SPCS)
+Training loop for the DeepSetICLModel inside a Snowpark Container Services (SPCS)
 environment.  Reads meta-datasets from Parquet files, trains with early stopping,
 and uploads the best checkpoint to a Snowflake model stage.
 
@@ -31,7 +31,7 @@ except ImportError:
     WorkerResourceConfig = None
     get_context = None
 
-from model import DeepSetModel, ModelConfig, _instantiate_model
+from model import ModelConfig, _instantiate_model
 
 # ---------------------------------------------------------------------------
 # Key constants
@@ -45,7 +45,6 @@ D_RHO        = 256
 POOL         = "pna"      # "sum"|"mean"|"max"|"pna"|"learned"|"attn"|"multipool"
 N_HEADS      = 4
 N_SAB_FEAT   = 1
-N_SAB_SAMP   = 1
 NORM_FEAT    = True
 NORM_TARGET  = True
 LR           = 1e-3
@@ -56,7 +55,7 @@ USE_HUBER    = False   # off by default; toggle via hyper_params["use_huber"]
 LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse β
 HUBER_DELTA  = 1.0     # δ for Huber loss; robustness to Regime C heavy-tailed ε
 
-DEEPSET_MODEL_FAMILY = os.environ.get("DEEPSET_MODEL_FAMILY", "market_aware")
+MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "market_exchangeable_icl")
 TRAINING_DATA_FAMILY = os.environ.get(
     "TRAINING_DATA_FAMILY",
     "unknown"
@@ -92,17 +91,11 @@ TRAIN_SANITY_OUT_DIR       = os.environ.get("TRAIN_SANITY_OUT_DIR",       "/tmp/
 TRAIN_SANITY_WRITE_ALL_RANKS = os.environ.get("TRAIN_SANITY_WRITE_ALL_RANKS", "false").lower() == "true"
 
 # MODEL3 runtime selectors
-# Default: MODEL_ARCH_VERSION="model2" preserves existing MODEL2 behavior.
-# MODEL3 code paths only activate when MODEL_ARCH_VERSION="model3".
-MODEL_ARCH_VERSION    = os.environ.get("MODEL_ARCH_VERSION",    "model2")
-MODEL3_DESIGN_PATTERN = os.environ.get("MODEL3_DESIGN_PATTERN", "inductive_forecasting")
-if MODEL_ARCH_VERSION not in ("model2", "model3"):
+MODEL_ARCH_VERSION    = "model3"
+MODEL_DESIGN_PATTERN = os.environ.get("MODEL_DESIGN_PATTERN", "inductive_forecasting")
+if MODEL_DESIGN_PATTERN not in ("inductive_forecasting", "transductive_completion"):
     raise ValueError(
-        f"Invalid MODEL_ARCH_VERSION={MODEL_ARCH_VERSION!r}. Valid: 'model2', 'model3'"
-    )
-if MODEL3_DESIGN_PATTERN not in ("inductive_forecasting", "transductive_completion"):
-    raise ValueError(
-        f"Invalid MODEL3_DESIGN_PATTERN={MODEL3_DESIGN_PATTERN!r}. "
+        f"Invalid MODEL_DESIGN_PATTERN={MODEL_DESIGN_PATTERN!r}. "
         "Valid: 'inductive_forecasting', 'transductive_completion'"
     )
 
@@ -262,25 +255,34 @@ def _checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "norm_feat",
         "norm_target",
         "model_family",
+        "use_ridge_expert",
+        "gate_hidden_dim",
     )
     return {
         field: {
-            "saved": getattr(saved_cfg, field),
-            "current": getattr(current_cfg, field),
+            "saved": getattr(saved_cfg, field, None),
+            "current": getattr(current_cfg, field, None),
         }
         for field in fields
-        if getattr(saved_cfg, field) != getattr(current_cfg, field)
+        if getattr(saved_cfg, field, None) != getattr(current_cfg, field, None)
     }
 
 
-def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank):
+def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank,
+                              pretrain_load_policy="require_match"):
     """Download and warm-start model from a pretrain checkpoint.
 
     Called before torch.compile() and DDP wrapping so the plain nn.Module
     receives the state dict. Raises RuntimeError if PRETRAIN_CHECKPOINT_PATH
-    is set but the file cannot be downloaded (missing stage file). Skips
-    gracefully only on architecture mismatch so HPO trials can explore
-    configs beyond the pretrain defaults.
+    is set but the file cannot be downloaded (missing stage file).
+
+    Args:
+        pretrain_load_policy: One of:
+            - "require_match": raise RuntimeError on architecture mismatch (default).
+            - "allow_cold_start_on_arch_mismatch": log and skip load_state_dict on mismatch.
+
+    Returns:
+        tuple (pretrain_loaded: bool, pretrain_mismatch_reason: str|None)
     """
     import glob as _glob
     local_dir = f"/tmp/pretrain_ckpt_rank{rank}"
@@ -320,16 +322,28 @@ def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank):
         saved_cfg = _normalize_checkpoint_model_config(ckpt.get("cfg"), "pretrain checkpoint")
         arch_mismatches = _checkpoint_architecture_mismatches(saved_cfg, cfg)
         if arch_mismatches:
-            print(f"[PRETRAIN] rank {rank}: architecture mismatch "
-                  f"(mismatches={arch_mismatches}; saved={saved_cfg}, current={cfg}); "
-                  "starting from scratch.", flush=True)
-            return
+            if pretrain_load_policy == "allow_cold_start_on_arch_mismatch":
+                print(
+                    f"[PRETRAIN] rank {rank}: PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch: "
+                    f"mismatch {arch_mismatches}; starting from scratch.",
+                    flush=True,
+                )
+                return False, repr(arch_mismatches)
+            else:  # require_match
+                raise RuntimeError(
+                    f"[PRETRAIN] rank {rank}: Pretrain checkpoint architecture mismatch "
+                    f"(PRETRAIN_LOAD_POLICY=require_match): {arch_mismatches}; "
+                    f"saved={saved_cfg}, current={cfg}. "
+                    "Fix the architecture or use PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch."
+                )
         model.load_state_dict(ckpt["state_dict"])
         print(f"[PRETRAIN] rank {rank}: loaded pretrain checkpoint from {stage_path}", flush=True)
+        return True, None
     except RuntimeError:
         raise
     except Exception as exc:
         print(f"[PRETRAIN] rank {rank}: could not load {stage_path}: {exc}; starting from scratch.", flush=True)
+        return False, repr(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +475,19 @@ def train_fn():
     pretrain_ckpt_stage_path = os.environ.get("PRETRAIN_CHECKPOINT_PATH", "").strip()
     checkpoint_output_name   = os.environ.get("CHECKPOINT_OUTPUT_NAME", "best.pt")
 
+    # Pretrain load policy — controls behaviour on architecture mismatch
+    pretrain_load_policy = os.environ.get("PRETRAIN_LOAD_POLICY", "require_match").strip().lower()
+    _VALID_PRETRAIN_POLICIES = {"require_match", "allow_cold_start_on_arch_mismatch"}
+    if pretrain_load_policy not in _VALID_PRETRAIN_POLICIES:
+        raise ValueError(
+            f"Invalid PRETRAIN_LOAD_POLICY={pretrain_load_policy!r}. "
+            f"Allowed: {sorted(_VALID_PRETRAIN_POLICIES)}"
+        )
+
+    # Tracking variables — initialised before the pretrain block so they are always defined
+    pretrain_loaded = False
+    pretrain_mismatch_reason = None
+
     # Pre-training: BEST_CONFIG absent â†’ hyper_params={} â†’ all .get() fall back to
     # module-level defaults (LR=1e-3, D_PHI=128, MAX_EPOCHS=200, etc.). Correct.
     hyper_params = _json.loads(os.environ.get("BEST_CONFIG", "{}"))
@@ -473,9 +500,13 @@ def train_fn():
     pool         = hyper_params.get("pool",               POOL)
     max_epochs   = int(hyper_params.get("max_epochs",     MAX_EPOCHS))
 
-    use_huber   = bool(hyper_params.get("use_huber",   USE_HUBER))
-    lambda_l1   = float(hyper_params.get("lambda_l1",  LAMBDA_L1))
-    huber_delta = float(hyper_params.get("huber_delta", HUBER_DELTA))
+    use_huber        = bool(hyper_params.get("use_huber",        USE_HUBER))
+    lambda_l1        = float(hyper_params.get("lambda_l1",       LAMBDA_L1))
+    huber_delta      = float(hyper_params.get("huber_delta",     HUBER_DELTA))
+    use_ridge_expert = bool(hyper_params.get("use_ridge_expert", True))
+    ridge_lambda     = float(hyper_params.get("ridge_lambda",    1.0))
+    gate_hidden_dim  = int(hyper_params.get("gate_hidden_dim",   64))
+    n_sab_feat       = int(hyper_params.get("n_sab_feat",        N_SAB_FEAT))
 
     _huber_loss = nn.HuberLoss(delta=huber_delta) if use_huber else None
     loss_fn     = (lambda y_hat, y: _huber_loss(y_hat, y)) if use_huber else None
@@ -552,15 +583,17 @@ def train_fn():
         dist.init_process_group(backend="nccl")
 
     # --- Model ---
-    model_family = hyper_params.get("model_family", DEEPSET_MODEL_FAMILY)
-    _arch_version = hyper_params.get("model_arch_version", MODEL_ARCH_VERSION)
-    _design_pattern = hyper_params.get("model3_design_pattern", MODEL3_DESIGN_PATTERN)
+    model_family = hyper_params.get("model_family", MODEL_FAMILY)
+    _design_pattern = hyper_params.get("model_design_pattern", MODEL_DESIGN_PATTERN)
     cfg   = ModelConfig(d_phi=d_phi, d_rho=d_rho, pool=pool,
-                        n_heads=N_HEADS, n_sab_feat=N_SAB_FEAT, n_sab_samp=N_SAB_SAMP,
+                        n_heads=N_HEADS, n_sab_feat=n_sab_feat,
                         norm_feat=NORM_FEAT, norm_target=NORM_TARGET, dropout=dropout,
                         model_family=model_family,
-                        model_arch_version=_arch_version,
-                        model3_design_pattern=_design_pattern)
+                        model_arch_version="model3",
+                        model_design_pattern=_design_pattern,
+                        use_ridge_expert=use_ridge_expert,
+                        ridge_lambda=ridge_lambda,
+                        gate_hidden_dim=gate_hidden_dim)
     print(
         f"[train_fn] model_family={cfg.model_family} "
         f"training_data_family={TRAINING_DATA_FAMILY} "
@@ -569,7 +602,10 @@ def train_fn():
     )
     model = _instantiate_model(cfg).to(device)
     if pretrain_ckpt_stage_path:
-        _load_pretrain_checkpoint(model, pretrain_ckpt_stage_path, cfg, device, rank)
+        pretrain_loaded, pretrain_mismatch_reason = _load_pretrain_checkpoint(
+            model, pretrain_ckpt_stage_path, cfg, device, rank,
+            pretrain_load_policy=pretrain_load_policy,
+        )
     _run_train_sanity_gate(model, device, rank, is_main)
     model = torch.compile(model, mode="reduce-overhead")
     model = DistributedDataParallel(model, device_ids=[local_rank])
@@ -603,13 +639,7 @@ def train_fn():
                 ckpt = model.module if isinstance(model, DistributedDataParallel) else model
                 ckpt = ckpt._orig_mod if hasattr(ckpt, "_orig_mod") else ckpt
                 import dataclasses as _dc
-                _m3_families = {"market_exchangeable_icl", "market_exchangeable_completion"}
-                if cfg.model_family in _m3_families:
-                    format_version = 4
-                elif cfg.model_family == "market_aware":
-                    format_version = 3
-                else:
-                    format_version = 2
+                format_version = 4
                 _metadata = {
                     "source": "train.py",
                     "checkpoint_name": os.path.basename(checkpoint_output_name),
@@ -622,15 +652,26 @@ def train_fn():
                     "train_mse_at_best": float(train_mse_at_best),
                     "best_epoch": int(best_epoch),
                 }
-                # MODEL3 checkpoints carry additional metadata fields
-                if cfg.model_family in _m3_families:
-                    _metadata["model_arch_version"]    = MODEL_ARCH_VERSION
-                    _metadata["model3_design_pattern"] = MODEL3_DESIGN_PATTERN
-                    _metadata["task_objective"] = (
-                        "inductive_regression"
-                        if MODEL3_DESIGN_PATTERN == "inductive_forecasting"
-                        else "transductive_completion"
-                    )
+                _metadata["model_arch_version"]    = MODEL_ARCH_VERSION
+                _metadata["model_design_pattern"] = cfg.model_design_pattern
+                _metadata["task_objective"] = (
+                    "inductive_regression"
+                    if cfg.model_design_pattern == "inductive_forecasting"
+                    else "transductive_completion"
+                )
+                # Include Ridge Expert config and HPO sweep mode from best_config
+                _metadata["use_ridge_expert"] = cfg.use_ridge_expert
+                _metadata["ridge_lambda"]     = cfg.ridge_lambda
+                _metadata["gate_hidden_dim"]  = cfg.gate_hidden_dim
+                _metadata["n_sab_feat"]       = cfg.n_sab_feat
+                if hyper_params.get("hpo_sweep_mode"):
+                    _metadata["hpo_sweep_mode"] = hyper_params["hpo_sweep_mode"]
+                # Pretrain load policy tracking
+                _metadata["pretrain_loaded"]           = pretrain_loaded
+                _metadata["pretrain_checkpoint_path"]  = pretrain_ckpt_stage_path
+                _metadata["pretrain_policy"]           = pretrain_load_policy
+                if pretrain_mismatch_reason:
+                    _metadata["pretrain_mismatch_reason"] = pretrain_mismatch_reason
                 torch.save({
                     "checkpoint_format_version": format_version,
                     "cfg": _dc.asdict(ckpt.cfg),

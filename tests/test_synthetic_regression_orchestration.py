@@ -152,11 +152,11 @@ class TestShardCounts:
     def test_gpu_shard_count_is_10(self):
         assert orch.SYNREG_GPU_SHARDS == 10
 
-    def test_cpu_shard_count_is_3(self):
-        assert orch.SYNREG_CPU_SHARDS == 3
+    def test_cpu_shard_count_is_6(self):
+        assert orch.SYNREG_CPU_SHARDS == 6
 
-    def test_autogluon_shard_count_is_30(self):
-        assert orch.SYNREG_AUTOGLUON_SHARDS == 30
+    def test_autogluon_shard_count_is_60(self):
+        assert orch.SYNREG_AUTOGLUON_SHARDS == 60
 
     def test_total_job_count_deepset_eval(self, collector, fake_session, runtime_args):
         """10 GPU shards must be submitted for deepset evaluation."""
@@ -169,24 +169,24 @@ class TestShardCounts:
         assert len(deepset_jobs) == 10
 
     def test_total_job_count_baseline_eval(self, collector, fake_session, runtime_args):
-        """3 CPU shards must be submitted for baseline evaluation."""
+        """6 CPU shards must be submitted for baseline evaluation."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_baseline_evaluation(
                 fake_session, *runtime_args
             )
         baseline_jobs = [j for j in collector.submitted
                          if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
-        assert len(baseline_jobs) == 3
+        assert len(baseline_jobs) == 6
 
     def test_total_job_count_autogluon_eval(self, collector, fake_session, runtime_args):
-        """30 AG shards must be submitted for AutoGluon evaluation."""
+        """60 AG shards must be submitted for AutoGluon evaluation."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_autogluon_evaluation(
                 fake_session, *runtime_args
             )
         ag_jobs = [j for j in collector.submitted
                    if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"]
-        assert len(ag_jobs) == 30
+        assert len(ag_jobs) == 60
 
     def test_aggregation_submits_1_job(self, collector, fake_session, runtime_args):
         """Aggregation must submit exactly 1 job."""
@@ -409,8 +409,7 @@ class TestRuntimeProbesSerialized:
 class TestCapacityProbePhases:
     def test_capacity_probe_phases_are_non_overlapping(self, collector, fake_session, runtime_args):
         """
-        GPU capacity probe must complete before CPU probe submits;
-        CPU must complete before AG probe submits.
+        Baseline CPU capacity probe must complete before AG probe submits.
         """
         submit_events = []
         wait_events = []
@@ -442,19 +441,17 @@ class TestCapacityProbePhases:
                         if e[0] in ("phase_start", "phase_done")]
         phase_names = [e[1] for e in phase_events]
 
-        # GPU phase must start and complete before CPU, etc.
-        gpu_start = phase_names.index("synreg_cap_gpu")
-        gpu_done = phase_names.index("synreg_cap_gpu", gpu_start + 1) \
-            if "synreg_cap_gpu" in phase_names[gpu_start + 1:] else gpu_start + 1
-        cpu_start = next(
+        baseline_start = phase_names.index("synreg_cap_baseline")
+        baseline_done = phase_names.index("synreg_cap_baseline", baseline_start + 1)
+        ag_start = next(
             (i for i, (evt, name) in enumerate(phase_events)
-             if evt == "phase_start" and "cpu" in name.lower()), None
+             if evt == "phase_start" and "autogluon" in name.lower()), None
         )
-        if cpu_start is not None:
-            assert gpu_done <= cpu_start
+        assert ag_start is not None
+        assert baseline_done <= ag_start
 
-    def test_gpu_phase_submits_10_probes(self, fake_session, runtime_args):
-        """GPU capacity phase submits exactly 10 probe jobs."""
+    def test_cpu_capacity_phases_use_requested_concurrency(self, fake_session, runtime_args):
+        """CPU capacity phases submit exactly the requested probe jobs."""
         submitted_counts = {}
 
         def _mock_phase(session, phase_label, compute_pool, runtime_environment, count):
@@ -462,14 +459,32 @@ class TestCapacityProbePhases:
 
         with patch("run_synthetic_regression_evaluation._submit_and_wait_capacity_phase",
                    side_effect=_mock_phase):
-            orch.run_synthetic_regression_capacity_probe(fake_session, *runtime_args)
+            orch.run_synthetic_regression_capacity_probe(
+                fake_session, *runtime_args, 4, 12
+            )
 
-        gpu_count = submitted_counts.get("synreg_cap_gpu", 0)
-        cpu_count = submitted_counts.get("synreg_cap_cpu", 0)
-        ag_count = submitted_counts.get("synreg_cap_ag", 0)
-        assert gpu_count == 10
-        assert cpu_count == 3
-        assert ag_count == 30
+        assert submitted_counts == {
+            "synreg_cap_baseline": 4,
+            "synreg_cap_autogluon": 12,
+        }
+
+    def test_standalone_capacity_probes_use_requested_concurrency(self, fake_session, runtime_args):
+        submitted_counts = {}
+
+        def _mock_phase(session, phase_label, compute_pool, runtime_environment, count):
+            submitted_counts[phase_label] = (compute_pool, count)
+
+        with patch("run_synthetic_regression_evaluation._submit_and_wait_capacity_phase",
+                   side_effect=_mock_phase):
+            orch.run_synthetic_regression_baseline_capacity_probe(
+                fake_session, *runtime_args, 5
+            )
+            orch.run_synthetic_regression_autogluon_capacity_probe(
+                fake_session, *runtime_args, 17
+            )
+
+        assert submitted_counts["synreg_cap_baseline"] == (orch.DEEPSET_CPU_POOL, 5)
+        assert submitted_counts["synreg_cap_autogluon"] == (orch.AUTOGLUON_CPU_POOL, 17)
 
 
 # ---------------------------------------------------------------------------
@@ -568,21 +583,95 @@ class TestShardIndexRange:
         indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in deepset_jobs]
         assert sorted(indices) == list(range(10))
 
-    def test_baseline_shard_indices_0_to_2(self, collector, fake_session, runtime_args):
+    def test_baseline_shard_indices_0_to_5(self, collector, fake_session, runtime_args):
         with _patch_submit(collector):
             orch.run_synthetic_regression_baseline_evaluation(fake_session, *runtime_args)
         baseline_jobs = [j for j in collector.submitted
                          if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
         indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in baseline_jobs]
-        assert sorted(indices) == list(range(3))
+        assert sorted(indices) == list(range(6))
 
-    def test_autogluon_shard_indices_0_to_29(self, collector, fake_session, runtime_args):
+    def test_autogluon_shard_indices_0_to_59(self, collector, fake_session, runtime_args):
         with _patch_submit(collector):
             orch.run_synthetic_regression_autogluon_evaluation(fake_session, *runtime_args)
         ag_jobs = [j for j in collector.submitted
                    if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"]
         indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in ag_jobs]
-        assert sorted(indices) == list(range(30))
+        assert sorted(indices) == list(range(60))
+
+
+# ---------------------------------------------------------------------------
+# Tests: runtime concurrency controls
+# ---------------------------------------------------------------------------
+
+class TestRuntimeConcurrencyControls:
+    def test_default_concurrency_constants(self):
+        assert orch.SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT == 6
+        assert orch.SYNREG_AUTOGLUON_CONCURRENT_NODES_DEFAULT == 60
+
+    def test_env_vars_override_concurrency_defaults(self, monkeypatch):
+        monkeypatch.setenv("SYNREG_BASELINE_CONCURRENT_NODES", "2")
+        monkeypatch.setenv("SYNREG_AUTOGLUON_CONCURRENT_NODES", "7")
+
+        assert orch._resolve_baseline_concurrent_nodes("proc") == 2
+        assert orch._resolve_autogluon_concurrent_nodes("proc") == 7
+
+    def test_sql_args_override_env_vars(self, monkeypatch):
+        monkeypatch.setenv("SYNREG_BASELINE_CONCURRENT_NODES", "2")
+        monkeypatch.setenv("SYNREG_AUTOGLUON_CONCURRENT_NODES", "7")
+
+        assert orch._resolve_baseline_concurrent_nodes("proc", 4) == 4
+        assert orch._resolve_autogluon_concurrent_nodes("proc", 11) == 11
+
+    def test_invalid_concurrency_error_includes_context(self):
+        with pytest.raises(ValueError) as exc:
+            orch._resolve_baseline_concurrent_nodes(
+                "run_synthetic_regression_baseline_evaluation",
+                7,
+            )
+        msg = str(exc.value)
+        assert "run_synthetic_regression_baseline_evaluation" in msg
+        assert "requested concurrency 7" in msg
+        assert "shard count 6" in msg
+        assert orch.DEEPSET_CPU_POOL in msg
+
+    def test_lower_baseline_concurrency_batches_complete_shards(self, collector, fake_session, runtime_args):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_baseline_evaluation(
+                    fake_session, *runtime_args, 2
+                )
+
+        baseline_jobs = [j for j in collector.submitted
+                         if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
+        indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in baseline_jobs]
+        assert batch_sizes == [2, 2, 2]
+        assert sorted(indices) == list(range(6))
+
+    def test_lower_autogluon_concurrency_batches_complete_shards(self, collector, fake_session, runtime_args):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_autogluon_evaluation(
+                    fake_session, *runtime_args, 25
+                )
+
+        ag_jobs = [j for j in collector.submitted
+                   if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"]
+        indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in ag_jobs]
+        assert batch_sizes == [25, 25, 10]
+        assert sorted(indices) == list(range(60))
 
 
 # ---------------------------------------------------------------------------
@@ -837,3 +926,45 @@ class TestPipelineRecomposition:
             orch.run_synthetic_regression_combined_evaluation(fake_session)
         for fn_name in phase_fns:
             mocks[fn_name].assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests: retired env var absence
+# ---------------------------------------------------------------------------
+
+class TestLegacyEnvVarAbsence:
+    def test_deepset_model_family_absent_from_deepset_shards(self, collector, fake_session, runtime_args):
+        """Evaluation shard jobs must not carry the retired model-family env var."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
+
+        deepset_jobs = [j for j in collector.submitted
+                        if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "deepset"]
+        assert deepset_jobs, "No deepset jobs submitted"
+        for job in deepset_jobs:
+            assert "DEEPSET" + "_MODEL_FAMILY" not in job.env_vars, \
+                f"Job {job.label} has retired model-family env var in env_vars"
+
+    def test_model_arch_version_absent_from_deepset_shards(self, collector, fake_session, runtime_args):
+        """Evaluation shard jobs must NOT carry MODEL_ARCH_VERSION (hardcoded in train.py)."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
+
+        deepset_jobs = [j for j in collector.submitted
+                        if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "deepset"]
+        assert deepset_jobs, "No deepset jobs submitted"
+        for job in deepset_jobs:
+            assert "MODEL_ARCH_VERSION" not in job.env_vars, \
+                f"Job {job.label} has MODEL_ARCH_VERSION in env_vars"
+
+    def test_deepset_model_family_absent_from_baseline_shards(self, collector, fake_session, runtime_args):
+        """Baseline shard jobs must not carry the retired model-family env var."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_baseline_evaluation(fake_session, *runtime_args)
+
+        baseline_jobs = [j for j in collector.submitted
+                         if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
+        assert baseline_jobs, "No baseline jobs submitted"
+        for job in baseline_jobs:
+            assert "DEEPSET" + "_MODEL_FAMILY" not in job.env_vars, \
+                f"Baseline job {job.label} has retired model-family env var in env_vars"

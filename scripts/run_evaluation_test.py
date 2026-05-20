@@ -566,9 +566,9 @@ def _run_deepset_phase(session, runtimes):
     manifest_env = _benchmark_manifest_env()
     deepset_jobs = []
     for shard_idx in range(GPU_BENCHMARK_SHARDS):
-        label = f"DeepSetModel-MC benchmark shard {shard_idx + 1}/{GPU_BENCHMARK_SHARDS}"
+        label = f"MODEL3-ICL-MC benchmark shard {shard_idx + 1}/{GPU_BENCHMARK_SHARDS}"
         job = _submit_eval(session, label, GPU_POOL, {
-            "EVAL_MODE": "benchmark", "BENCHMARK_METHOD": "DeepSetModel-MC",
+            "EVAL_MODE": "benchmark", "BENCHMARK_METHOD": "MODEL3-ICL-MC",
             "MC_K": "8",
             "BENCHMARK_DEEPSET_CONTEXT_SIZE": "200",
             "BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES": "5",

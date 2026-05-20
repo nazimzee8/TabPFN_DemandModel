@@ -1,4 +1,4 @@
-﻿# Project Memory
+# Project Memory
 
 ## Snowflake Stage Ownership
 
@@ -24,7 +24,7 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 - Snowflake MLJob secrets use `spec.containers[].secrets[]`, not Kubernetes-style `env.valueFrom`.
 - Benchmark jobs must install their dependencies and fail loudly if any dependency is unavailable.
 - Benchmark ranking broke once when `predict_autogluon()` was inserted inside `add_rank_columns()` before the rank loop; keep aggregation smoke tests.
-- DeepSet benchmark uses `DeepSetModel-MC bounded-context ensemble`, not exact
+- DeepSet benchmark uses `retired MODEL1 model-MC bounded-context ensemble`, not exact
   full-context DeepSet inference. Snowflake OOM occurred when MC dropout forwarded
   the full 90% processed train split with the full test split. The fixed evaluation
   path still evaluates every assigned dataset, seed, and test row: 90/10 split
@@ -54,7 +54,7 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 - Snowflake ML `TunerConfig.max_concurrent_trials` is per node, not total cluster-wide concurrency.
 - Current GPU pool is `DEEPSET_GPU_POOL` on `GPU_NV_M`: 4 A10G GPUs per node, `MAX_NODES=10`. GPU_NV_L is not provisioned on this account.
 - Canonical HPO submission: `target_instances=5` in both `scripts/run_training_job.py` and `scripts/run_hpo_job.py`.
-- Canonical HPO tuner config: `num_trials=20`, `max_concurrent_trials=4`, and `resource_per_trial={"GPU": 1}`. 5 nodes Ã— 4 concurrent/node = 20 parallel one-GPU trials = 1 round of 20 trials.
+- Canonical HPO tuner config: `num_trials=20`, `max_concurrent_trials=4`, and `resource_per_trial={"GPU": 1}`. 5 nodes × 4 concurrent/node = 20 parallel one-GPU trials = 1 round of 20 trials.
 - Ray Tune metric reporting must be metrics-dict style for every metric, e.g. `tune.report({"val_mse": value})` or the local compatibility helper. Do not use keyword-style `tune.report(val_mse=value)` in Snowflake HPO; Snowflake's Ray runtime can raise `TypeError: report() got an unexpected keyword argument 'val_mse'`.
 - Preserve metric keys exactly, especially `val_mse`: `tune.run(metric="val_mse", mode="min")` selects the best trial by that key, and downstream `best_config.json` must remain `{lr, weight_decay, d_phi, d_rho, dropout, pool}`.
 - For HPO launched via `submit_from_stage`, parallel GPU capacity comes from the MLJob `target_instances` setting. Do not call `scale_cluster()` from `hpo.py` in this path.
@@ -62,22 +62,22 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 - Omitting `resource_per_trial={"GPU": 1}` is not a workaround. Snowflake does not allocate GPU resources to Tuner trials automatically, so GPU HPO trials must request GPUs explicitly.
 - If HPO trials are stuck or pending, first suspect over-requested GPU resources or insufficient compute-pool capacity. If trials run on CPU, first suspect a missing explicit GPU resource request.
 - Inspect `@MODEL_STAGE/hpo/hpo_failure.json` first for HPO failures. Use service logs only if that JSON artifact is missing or incomplete, which suggests failure before or outside Python artifact upload.
-- `debug/hpo_failure.json` is a **locally-downloaded snapshot** â€” it is not auto-synced from the stage. Always compare `LIST @MODEL_STAGE/hpo/` timestamps before concluding `main()` was not reached.
+- `debug/hpo_failure.json` is a **locally-downloaded snapshot** — it is not auto-synced from the stage. Always compare `LIST @MODEL_STAGE/hpo/` timestamps before concluding `main()` was not reached.
 - Do **not** add `uses_snowflake_trainer` (or other undocumented kwargs) to `TunerConfig`. The documented parameters are: `metric`, `mode`, `search_alg`, `num_trials`, `max_concurrent_trials`, `resource_per_trial`. Undocumented kwargs raise `TypeError` on library version bumps inside `main()`.
 - Legacy Snowflake ML Tuner path only: `ctx.report()` inside `train_for_hpo()` must pass `model=model.to("cpu")`. Without it, `tuner.run()` raises `TypeError: Path must be a string` when loading `TunerResults.best_model` after all trials finish.
-- Legacy Snowflake ML Tuner path only: `train_for_hpo()` must NOT wrap the model with `torch.compile()`. Snowflake pickle-serialises the model passed to `ctx.report(model=)`; compiled `OptimizedModule` objects are not picklable â€” all trials fail silently to store an artifact â†’ `best_model_path = None` â†’ same TypeError. `hpo_epoch_test.py` uses a plain uncompiled model and is the reference baseline.
+- Legacy Snowflake ML Tuner path only: `train_for_hpo()` must NOT wrap the model with `torch.compile()`. Snowflake pickle-serialises the model passed to `ctx.report(model=)`; compiled `OptimizedModule` objects are not picklable — all trials fail silently to store an artifact → `best_model_path = None` → same TypeError. `hpo_epoch_test.py` uses a plain uncompiled model and is the reference baseline.
 - `TunerResults.best_result` is a DataFrame; read the first row and prefer `config/<param>` columns, with raw parameter names only as compatibility fallback.
 - Before rerunning canceled HPO, confirm `hpo.py`, `train.py`, `model.py`, `snowflake_io.py`, `run_hpo_job.py`, `run_model_training_job.py`, and `run_training_job.py` are present under `@MODEL_STAGE/scripts/` and are not only `.gz` duplicates.
-- `SnowparkSQLException: 000603 (XX000) / Processing aborted due to error 300002` at `job.wait()` means the SPCS service terminated abnormally â€” the container crashed before reaching a clean terminal state, so `DESCRIBE SERVICE` returns 300002 instead of a status row. Diagnostic: (1) check `@MODEL_STAGE/hpo/hpo_failure.json` â€” if present it contains the Python traceback; (2) if absent, the container was killed before hpo.py's exception handler ran â€” inspect Snowsight container logs for OOM or pre-Python crash details. `_wait_done()` in `run_hpo_job.py` and `run_training_job.py` now catches 300002/000603 and re-raises as `RuntimeError` with this diagnostic guidance.
+- `SnowparkSQLException: 000603 (XX000) / Processing aborted due to error 300002` at `job.wait()` means the SPCS service terminated abnormally — the container crashed before reaching a clean terminal state, so `DESCRIBE SERVICE` returns 300002 instead of a status row. Diagnostic: (1) check `@MODEL_STAGE/hpo/hpo_failure.json` — if present it contains the Python traceback; (2) if absent, the container was killed before hpo.py's exception handler ran — inspect Snowsight container logs for OOM or pre-Python crash details. `_wait_done()` in `run_hpo_job.py` and `run_training_job.py` now catches 300002/000603 and re-raises as `RuntimeError` with this diagnostic guidance.
 
 ## Split Training Guardrails
 
-- Prefer split procedures: `CALL run_pretrain_pipeline();` â†’ `CALL run_hpo_pipeline();` â†’
+- Prefer split procedures: `CALL run_pretrain_pipeline();` → `CALL run_hpo_pipeline();` →
   `CALL run_model_training();`.
 - `run_model_training()` reads `@MODEL_STAGE/hpo/best_config.json`, passes it as `BEST_CONFIG`,
   and writes `@MODEL_STAGE/checkpoints/best.pt`.
 - Canonical training topology: `TRAIN_NUM_NODES=10`, `num_workers_per_node=4`,
-  `world_size=40` (10 Ã— 4). Both pretrain and final training use this topology.
+  `world_size=40` (10 × 4). Both pretrain and final training use this topology.
 - Full training uses the full indexed train/val splits; HPO uses the 200/40 subset.
 - Canonical production training shards `META_DATASET_INDEX` directly by DDP `rank` and
   `world_size` with SQL `ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1`
@@ -103,7 +103,7 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 
 - `run_hpo_epoch_test()` writes `@EPOCH_STAGE/hpo_timing.json`; `run_train_epoch_test()` writes `@EPOCH_STAGE/train_timing.json`.
 - Read `hpo_timing.json` by phase. HPO wall time includes MLJob startup, Ray/Tuner scheduling, metadata selection, stage materialization, and epoch compute; the epoch timing alone is not total HPO runtime.
-- For the current design, the intended decision gate is 5 x `GPU_NV_M` for HPO: 20 trials / 20 concurrent = 1 round Ã— 30 epochs â‰ˆ 31.6 min.
+- For the current design, the intended decision gate is 5 x `GPU_NV_M` for HPO: 20 trials / 20 concurrent = 1 round × 30 epochs ≈ 31.6 min.
 - Before epoch calibration, verify `hpo_epoch_test.py`, `train_epoch_test.py`, `train.py`, `model.py`, and `snowflake_io.py` exist under `@MODEL_STAGE/scripts/`.
 
 ## Kaggle Snowflake Download Troubleshooting
@@ -128,8 +128,8 @@ LIST @META_DATASET_STAGE/kaggle/;
 
 - HPO runs through Ray-based Snowflake ML Jobs, not Snowflake Tuner.
 - HPO uses 20 trials total.
-- HPO target topology is 5 nodes × 4 GPUs/workers per node = 20 concurrent one-GPU trial slots.
-- Pretraining and final training target topology is 10 nodes × 4 workers per node.
+- HPO target topology is 5 nodes � 4 GPUs/workers per node = 20 concurrent one-GPU trial slots.
+- Pretraining and final training target topology is 10 nodes � 4 workers per node.
 - HPO Ray workers must never perform Snowflake I/O.
 - All Snowflake stage access, Snowpark session creation, metadata selection, checkpoint download, and data materialization must happen only in the HPO driver before tune.run().
 - Ray workers must consume training/validation records and pretrain checkpoint payloads through Ray object store.
@@ -148,28 +148,28 @@ LIST @META_DATASET_STAGE/kaggle/;
 
 - HPO is currently working. Do not rewrite HPO when debugging final model training unless final training explicitly fails while reading @MODEL_STAGE/hpo/best_config.json.
 - Final model training is launched by run_model_training_job.py and uses train.py as the MLJob entrypoint.
-- Final training target topology is 10 nodes × 4 workers per node = 40 PyTorch workers.
+- Final training target topology is 10 nodes � 4 workers per node = 40 PyTorch workers.
 - run_model_training_job.py must keep target_instances equal to TRAIN_NUM_NODES.
 - train.py must keep PyTorchScalingConfig num_nodes equal to TRAIN_NUM_NODES and num_workers_per_node=4.
-- EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES × 4.
+- EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES � 4.
 - STRICT_WORLD_SIZE_CHECK must remain true for final model training.
 - Absence of train_failure.json means train.py's Python-side failure handler likely did not complete. Treat that absence as a diagnostic signal, not an indication that training succeeded.
 - If logs show "Unable to create mmap-ed active query log", "Failed to mmap", "activeQueryTracker", or "data/queries.active", classify the failure boundary as Snowflake MLJob/Ray runtime startup before train_fn unless train_fn logs are also present.
 - Do not diagnose failures as DataLoader, DDP, NCCL, model architecture, pretrain checkpoint, or world-size issues unless logs show train.py/train_fn was entered.
-- The required boundary log sequence is: "[train.py main] entered main" → "[train.py main] starting PyTorchDistributor.run" → "[train_fn] entered train_fn" → "[train_fn] topology:".
+- The required boundary log sequence is: "[train.py main] entered main" ? "[train.py main] starting PyTorchDistributor.run" ? "[train_fn] entered train_fn" ? "[train_fn] topology:".
 - If "[train_fn] topology:" appears, then world-size and worker topology can be diagnosed from actual logs.
 - If "[train_fn] topology:" does not appear, do not claim a world-size mismatch.
 - Prometheus mmap panic is an infrastructure/runtime startup symptom. No verified env var exists to disable Prometheus or Ray dashboard through submit_from_stage. Do not add speculative RAY_DISABLE or include_dashboard env vars.
 - If the Prometheus mmap panic persists after diagnostics confirm the failure boundary, escalate as a Snowflake MLJob/Ray runtime infrastructure issue rather than rewriting model code.
 - Always print diagnostic JSON payloads to stdout before attempting Snowflake stage upload so diagnostics survive even if stage upload fails.
-- Search container logs for "[TRAINING FAILURE JSON]" — full failure payload is printed before upload attempt.
-- Search container logs for "[train.py main] entered main" — confirms train.py was executed in the container.
-- Query LIST @MODEL_STAGE/checkpoints/ PATTERN='.*training_submission_started[.]json' — its presence confirms the stored procedure reached submit_from_stage; the train.py version additionally confirms train.py main() was reached.
+- Search container logs for "[TRAINING FAILURE JSON]" � full failure payload is printed before upload attempt.
+- Search container logs for "[train.py main] entered main" � confirms train.py was executed in the container.
+- Query LIST @MODEL_STAGE/checkpoints/ PATTERN='.*training_submission_started[.]json' � its presence confirms the stored procedure reached submit_from_stage; the train.py version additionally confirms train.py main() was reached.
 - train_failure.json is uploaded when distributor.run(...) raises inside train.py's Python exception handler; logs must still contain the full failure JSON even if upload fails.
 - Final training should warm-start from @MODEL_STAGE/checkpoints/pretrain.pt when present.
 - Final training writes @MODEL_STAGE/checkpoints/best.pt on success.
 - Do not reduce final training from 10 nodes to work around startup issues unless explicitly instructed.
-- Failure boundary diagnosis sequence: (1) no "[train.py main] entered main" → failure before train.py main; (2) no "[train.py main] starting PyTorchDistributor.run" → failure inside train.py main setup; (3) no "[train_fn] entered train_fn" → failure inside PyTorchDistributor/Ray worker launch; (4) no "[train_fn] topology:" → failure around get_context(); (5) topology present then failure → diagnose from actual train_fn error.
+- Failure boundary diagnosis sequence: (1) no "[train.py main] entered main" ? failure before train.py main; (2) no "[train.py main] starting PyTorchDistributor.run" ? failure inside train.py main setup; (3) no "[train_fn] entered train_fn" ? failure inside PyTorchDistributor/Ray worker launch; (4) no "[train_fn] topology:" ? failure around get_context(); (5) topology present then failure ? diagnose from actual train_fn error.
 - The canonical final-training topology is different from HPO: final training uses 10 nodes, HPO uses 5 nodes for 20 one-GPU trials.
 
 ## Snowflake MLJob Runtime Startup Guardrails
@@ -187,13 +187,13 @@ training boundary markers prove otherwise.
 
 ### Boundary markers
 
-- `[train.py main] entered main` — train.py executed in the container.
-- `[train.py main] starting PyTorchDistributor.run` — distributor about to launch.
-- `[train_fn] entered train_fn` — distributed training function reached; valid to debug DDP/model.
-- `[train_fn] topology` — worker topology visible; valid to debug world-size issues.
-- `[TRAINING FAILURE JSON]` — Python-side exception handler executed.
-- `[runtime_probe] entered Python` — runtime probe reached user Python code.
-- `[runtime_probe] completed` — runtime probe finished successfully.
+- `[train.py main] entered main` � train.py executed in the container.
+- `[train.py main] starting PyTorchDistributor.run` � distributor about to launch.
+- `[train_fn] entered train_fn` � distributed training function reached; valid to debug DDP/model.
+- `[train_fn] topology` � worker topology visible; valid to debug world-size issues.
+- `[TRAINING FAILURE JSON]` � Python-side exception handler executed.
+- `[runtime_probe] entered Python` � runtime probe reached user Python code.
+- `[runtime_probe] completed` � runtime probe finished successfully.
 
 ### Guardrail
 
@@ -217,7 +217,7 @@ CPU baseline shard jobs (carrying `BENCHMARK_METHODS` that include `CatBoost`) i
 eval/prep/aggregate/AutoGluon jobs pass no `pip_requirements`.
 
 `run_evaluation_test.py` must not rely on OS environment variables for runtime
-image names in production — local shell variables, SnowSQL session variables, and
+image names in production � local shell variables, SnowSQL session variables, and
 Snowsight worksheet variables do not become OS environment variables inside the
 Python stored procedure runtime. `run_evaluation_test.py` exposes the selected
 value in container env vars as `EVAL_RUNTIME_ENVIRONMENT`. Before
@@ -234,12 +234,12 @@ concurrently across `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and
 `AUTOGLUON_CPU_POOL` unless a higher node quota has been confirmed.
 
 Compute pool preflight handles SUSPENDED pools:
-- `SUSPENDED + AUTO_RESUME=TRUE` — returns immediately and lets `submit_from_stage()` trigger
+- `SUSPENDED + AUTO_RESUME=TRUE` � returns immediately and lets `submit_from_stage()` trigger
   the resume on first job submission. No ALTER is issued.
-- `SUSPENDED + AUTO_RESUME=FALSE` (or unknown) — issues `ALTER COMPUTE POOL X RESUME` and
+- `SUSPENDED + AUTO_RESUME=FALSE` (or unknown) � issues `ALTER COMPUTE POOL X RESUME` and
   sleeps 10 s before returning. This is the explicit-resume path.
 For development cost control: keep pools suspended between runs, keep `AUTO_RESUME=TRUE`,
-and use a short `AUTO_SUSPEND_SECS` (60–300 s). Do not keep `DEEPSET_GPU_POOL` warm
+and use a short `AUTO_SUSPEND_SECS` (60�300 s). Do not keep `DEEPSET_GPU_POOL` warm
 between debugging sessions.
 
 Evaluation dependency guardrail: never add a global benchmark dependency gate
@@ -251,7 +251,7 @@ XGBoost, LightGBM, and CatBoost are required only for those exact methods.
 
 AutoGluon runtime probe required imports: `autogluon.tabular`, `numpy`, `pandas`,
 `sklearn`, `scipy`, `pyarrow`, `torch`, and `snowflake.snowpark`. `xgboost`,
-`lightgbm`, and `catboost` are intentionally excluded — AutoGluon shards run
+`lightgbm`, and `catboost` are intentionally excluded � AutoGluon shards run
 `BENCHMARK_METHOD=AutoGluon`, which has no code path through those packages.
 The probe must include `scipy`, `pyarrow`, and `torch` because `evaluate.py`
 hard-imports them at module startup (not inside benchmark method branches), and
@@ -277,24 +277,24 @@ New canonical call:
 ### Runtime probe workflow
 
 Before debugging training code when infrastructure startup failures are suspected:
-1. `CALL run_training_runtime_probe(1);` — single-node probe.
+1. `CALL run_training_runtime_probe(1);` � single-node probe.
 2. Confirm `[runtime_probe] entered Python` appears in job logs.
-3. If single-node passes, `CALL run_training_runtime_probe(10);` — full-topology probe.
+3. If single-node passes, `CALL run_training_runtime_probe(10);` � full-topology probe.
 4. If full-topology passes, `CALL run_model_training();`.
 5. If either probe fails before `[runtime_probe] entered Python` and Prometheus mmap markers appear,
    escalate to Snowflake Support as a managed MLJob/Ray/Prometheus runtime issue.
 
 ### train_failure.json interpretation
 
-Absence of `train_failure.json` when Prometheus mmap panic appears is expected — the failure
+Absence of `train_failure.json` when Prometheus mmap panic appears is expected � the failure
 occurred before Python-side exception handling could run. Do not interpret absence as proof that
 diagnostics are broken.
 
 ### Topology invariants (do not change without explicit instruction)
 
-- Final training: 10 nodes × 4 workers = 40 world size, `target_instances=10`.
-- Pretraining: 10 nodes × 4 workers = 40 world size.
-- HPO: 5 nodes × 4 concurrent trials = 20 total trial slots.
+- Final training: 10 nodes � 4 workers = 40 world size, `target_instances=10`.
+- Pretraining: 10 nodes � 4 workers = 40 world size.
+- HPO: 5 nodes � 4 concurrent trials = 20 total trial slots.
 
 ## Evaluation Parallelism Guardrails
 
@@ -334,12 +334,12 @@ diagnostics are broken.
   `AUTOGLUON_CPU_POOL MAX_NODES` and account quota allow it.
 - `run_evaluation_capacity_probe()` is a lightweight pre-check that allocates nodes in
   the planned phase sizes (GPU=10, CPU=3, AutoGluon=30) using `capacity_probe.py` (no
-  model, no benchmark data, no heavy imports — just a 30-second sleep). Phases are
+  model, no benchmark data, no heavy imports � just a 30-second sleep). Phases are
   non-overlapping: GPU phase must finish before CPU phase starts; CPU phase must finish
   before AutoGluon phase starts. Recommended run order:
-  1. `CALL run_evaluation_runtime_probes(...)` — validate runtime images
-  2. `CALL run_evaluation_capacity_probe(...)` — validate node quota
-  3. `CALL run_evaluation_pipeline(...)` — full evaluation
+  1. `CALL run_evaluation_runtime_probes(...)` � validate runtime images
+  2. `CALL run_evaluation_capacity_probe(...)` � validate node quota
+  3. `CALL run_evaluation_pipeline(...)` � full evaluation
   If the capacity probe fails with a node limit error: `SHOW COMPUTE POOLS`; suspend
   idle pools; wait for active jobs to finish; or request higher Snowflake account node
   quota before retrying.
@@ -348,7 +348,7 @@ diagnostics are broken.
   If missing and `world_size > 1` is requested without shard mode, evaluate.py raises
   a clear RuntimeError.
 - **Split-phase evaluation design**: 5 independent stored procedures expose each benchmark
-  phase — `run_evaluation_prep`, `run_deepset_evaluation`, `run_baseline_evaluation`,
+  phase � `run_evaluation_prep`, `run_deepset_evaluation`, `run_baseline_evaluation`,
   `run_autogluon_evaluation`, `run_evaluation_aggregation`. Each targets only its own
   compute pool and can be called and retried independently.
 - **Manual pool suspend pattern**: completing a phase does NOT release its compute pool
@@ -360,7 +360,7 @@ diagnostics are broken.
   called once by the operator before the first split-phase procedure. The split procedures
   themselves do not re-run probes.
 - **`run_evaluation_pipeline()` sequencing change**: the monolithic pipeline was refactored
-  to use the same phase helpers; synthetic eval and prep are now sequential (prep → deepset
+  to use the same phase helpers; synthetic eval and prep are now sequential (prep ? deepset
   phase) rather than concurrent. Split procedures are the recommended path for tight quota.
 
 ## Benchmark Dataset and Dependency Boundary Guardrails
@@ -403,7 +403,7 @@ diagnostics are broken.
   sentinel as the default for its `pip_requirements` parameter. Do not remove
   this parameter or the sentinel. The Phase 4 baseline shard loop must always
   pass `pip_requirements=list(BASELINE_EXTRA_PIP_REQUIREMENTS)` explicitly at
-  the call site — do not revert to implicit inference from `BENCHMARK_METHODS`.
+  the call site � do not revert to implicit inference from `BENCHMARK_METHODS`.
   The explicit passing is the guarantee that `catboost` is installed before
   `evaluate.py` starts; removing it silently breaks baseline evaluation on any
   managed runtime that does not include `catboost`.
@@ -459,9 +459,9 @@ diagnostics are broken.
   normalization first; do not regenerate `pretrain.pt` unless the checkpoint is missing `cfg`
   or has a truly incompatible architecture.
 - `evaluate.py` loads checkpoints via `load_checkpoint_compat()`:
-  1. `torch.load(..., weights_only=True)` — preferred; works for v2 checkpoints.
-  2. `safe_globals([ModelConfig])` + `weights_only=True` — for legacy checkpoints.
-  3. `weights_only=False` — only if `ALLOW_UNSAFE_TORCH_LOAD=true`; prints security warning.
+  1. `torch.load(..., weights_only=True)` � preferred; works for v2 checkpoints.
+  2. `safe_globals([ModelConfig])` + `weights_only=True` � for legacy checkpoints.
+  3. `weights_only=False` � only if `ALLOW_UNSAFE_TORCH_LOAD=true`; prints security warning.
 - `ALLOW_UNSAFE_TORCH_LOAD_FOR_LEGACY_CHECKPOINTS` in `run_evaluation_test.py` is **currently
   `"true"`** as a temporary escape hatch for the legacy `best.pt` checkpoint (pre-v2 pickle
   format that fails both `weights_only=True` paths in `load_checkpoint_compat()`). All eval
@@ -509,7 +509,7 @@ diagnostics are broken.
   was received by the container.
 - The project EAI for PyPI access is `TABPFN_CATBOOST_PYPI_EAI`, created using
   `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`. Do not use `BENCHMARK_EXTERNAL_ACCESS` for
-  PyPI — that integration is scoped to OpenML and Kaggle hosts only.
+  PyPI � that integration is scoped to OpenML and Kaggle hosts only.
 - Always pin the CatBoost version (`CATBOOST_VERSION = "1.2.10"`). Do not float to
   unpinned `"catboost"`.
 - Notebook-level EAI toggles do not propagate into submitted ML Jobs. Never use
@@ -540,17 +540,17 @@ they must be installed per-job:
 
 > `openml` is resolved via **two paths**: the stored procedure `PACKAGES` clause (for
 > `CALL prepare_benchmark_datasets()`) AND `pip_requirements` in the ML Job (for
-> `run_evaluation_pipeline()` → `_submit_dataset_prep()`). Both paths are required.
+> `run_evaluation_pipeline()` ? `_submit_dataset_prep()`). Both paths are required.
 
 ### One EAI rule
 
-`TABPFN_PYPI_EAI = "TABPFN_PYPI_EAI"` — used for **all** pip installs.
+`TABPFN_PYPI_EAI = "TABPFN_PYPI_EAI"` � used for **all** pip installs.
 Replaces the former `TABPFN_CATBOOST_PYPI_EAI`. Created in `sql/run_training_job.sql` Step 2c.
 
 ### BENCHMARK_EXTERNAL_ACCESS vs PYPI_EAI
 
-- `BENCHMARK_EXTERNAL_ACCESS` — runtime API calls (OpenML downloads, Kaggle API). Network egress to external services.
-- `TABPFN_PYPI_EAI` — pip package install from PyPI. Uses `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`.
+- `BENCHMARK_EXTERNAL_ACCESS` � runtime API calls (OpenML downloads, Kaggle API). Network egress to external services.
+- `TABPFN_PYPI_EAI` � pip package install from PyPI. Uses `SNOWFLAKE.EXTERNAL_ACCESS.PYPI_RULE`.
 - The dataset prep job (`prepare_benchmark_datasets.py`) needs **both**.
 
 ### Canonical constants (scripts/run_evaluation_test.py)
@@ -580,8 +580,8 @@ Jobs that **must** carry `pip_requirements` + `TABPFN_PYPI_EAI`:
 - CPU baseline probe (probe index 2): `BASELINE_EXTRA_PIP_REQUIREMENTS`
 - Prep CPU runtime probe (probe index 3): `PREP_EXTRA_PIP_REQUIREMENTS`
 - AutoGluon CPU runtime probe (probe index 4): `AUTOGLUON_EXTRA_PIP_REQUIREMENTS`
-- CPU baseline shard jobs (×3): `BASELINE_EXTRA_PIP_REQUIREMENTS`
-- AutoGluon shard jobs (×30): `AUTOGLUON_EXTRA_PIP_REQUIREMENTS`
+- CPU baseline shard jobs (�3): `BASELINE_EXTRA_PIP_REQUIREMENTS`
+- AutoGluon shard jobs (�30): `AUTOGLUON_EXTRA_PIP_REQUIREMENTS`
 - `prepare_benchmark_datasets.py` ML Job: `PREP_EXTRA_PIP_REQUIREMENTS` +
   `["BENCHMARK_EXTERNAL_ACCESS", PYPI_EAI]`
 
@@ -594,7 +594,7 @@ Jobs that **must not** carry `pip_requirements`:
 - `probe_jobs[2].pip_requirements == list(BASELINE_EXTRA_PIP_REQUIREMENTS)`
 - `probe_jobs[3].pip_requirements == list(PREP_EXTRA_PIP_REQUIREMENTS)`
 - `probe_jobs[4].pip_requirements == list(AUTOGLUON_EXTRA_PIP_REQUIREMENTS)`
-- `probe_jobs[:2]` — no `pip_requirements`, no `external_access_integrations`
+- `probe_jobs[:2]` � no `pip_requirements`, no `external_access_integrations`
 - `probe_jobs[2/3/4].external_access_integrations == [PYPI_EAI]`
 - All baseline shard jobs: `external_access_integrations == [PYPI_EAI]`
 - All AutoGluon shard jobs: `pip_requirements == list(AUTOGLUON_EXTRA_PIP_REQUIREMENTS)` and `external_access_integrations == [PYPI_EAI]`
@@ -630,10 +630,10 @@ corrected architecture passes query sanity checks. The first priority is to elim
 collapse and early feature compression. HPO expansion comes after the model demonstrates
 query-sensitive behavior on controlled synthetic contexts.
 
-## MarketAwareDeepSetModel Production Default Guardrails
+## retired MODEL2 model Production Default Guardrails
 
-- `MarketAwareDeepSetModel` is the default production model (`DEEPSET_MODEL_FAMILY=market_aware`). Do not revert to `"deepset"` without an explicit ablation reason.
-- `load_best_deepset_checkpoint()` must always call `_instantiate_model(cfg)` — never hardcode the model class directly.
+- `retired MODEL2 model` is the default production model (`MODEL_FAMILY=market_aware`). Do not revert to `"deepset"` without an explicit ablation reason.
+- `load_best_deepset_checkpoint()` must always call `_instantiate_model(cfg)` � never hardcode the model class directly.
 - Sanity checks must be called with the same device as training: `run_all_checks(model=model, device=torch.device("cuda:0"))`.
 - `SYNREG_RUN_CHECKPOINT_GATES=true` and `SYNREG_CHECKPOINT_GATE_STRICT=true` are required defaults for all DeepSet synthetic regression shards. A failing gate (NaN/Inf, constant output, Ridge underperformance) invalidates evaluation results.
 - `TRAIN_RUN_SANITY_CHECKS=true` and `TRAIN_SANITY_CHECK_STRICT=true` run structural checks before `torch.compile()` and DDP wrapping. Do not disable without explicit justification.
@@ -641,5 +641,5 @@ query-sensitive behavior on controlled synthetic contexts.
 - `best_config.json` from HPO must include `model_family` (written by `hpo.py`). `train.py` reads it from `BEST_CONFIG` env var.
 - Checkpoint `metadata` must include `best_val_mse`, `train_mse_at_best`, `best_epoch` for the train/val gap gate.
 - **TRAINING_DATA_FAMILY must be explicit in all Snowflake production submissions.** `run_training_job.py`, `run_model_training_job.py`, and `run_hpo_job.py` all default to `synthetic_regression_combined` (combined suite `linear_all_v1`). Use `unknown` only for local/dev runs. Production synthetic regression evaluation checkpoints must be tagged `synthetic_regression_combined`. `train.py` raises `ValueError` at module load time for invalid values.
-- **MODEL3 architecture selectors.** `MODEL_ARCH_VERSION="model2"` (default) preserves MODEL2 behavior. `MODEL3_DESIGN_PATTERN="inductive_forecasting"` (default) does NOT activate MODEL3 code unless `MODEL_ARCH_VERSION="model3"` is also set. All three submission scripts propagate `DEFAULT_MODEL_ARCH_VERSION` and `DEFAULT_MODEL3_DESIGN_PATTERN` through `env_vars`. MODEL3 combinations: `model3`+`inductive_forecasting`→`market_exchangeable_icl`; `model3`+`transductive_completion`→`market_exchangeable_completion`. MODEL3 checkpoints use format version 4.
-- **MODEL3 must not mutate MODEL2 classes.** `MarketAwareDeepSetModel` is unchanged. MODEL3 is implemented as `MarketExchangeableICLModel` and `MarketExchangeableCompletionModel` with shared primitives (`ExchangeableMatrixBlock`, `ColumnEncoder`, `CellEncoder`, `_masked_mean`). Factory `_instantiate_model(cfg)` routes all four families.
+- **MODEL3 architecture selectors.** `MODEL_ARCH_VERSION="model2"` (default) preserves MODEL2 behavior. `MODEL_DESIGN_PATTERN="inductive_forecasting"` (default) does NOT activate MODEL3 code unless `MODEL_ARCH_VERSION="model3"` is also set. All three submission scripts propagate `DEFAULT_MODEL_ARCH_VERSION` and `DEFAULT_MODEL_DESIGN_PATTERN` through `env_vars`. MODEL3 combinations: `model3`+`inductive_forecasting`?`market_exchangeable_icl`; `model3`+`transductive_completion`?`market_exchangeable_completion`. MODEL3 checkpoints use format version 4.
+- **MODEL3 must not mutate MODEL2 classes.** `retired MODEL2 model` is unchanged. MODEL3 is implemented as `DeepSetICLModel` and `DeepSetCompletionModel` with shared primitives (`ExchangeableMatrixBlock`, `ColumnEncoder`, `CellEncoder`, `_masked_mean`). Factory `_instantiate_model(cfg)` routes all four families.

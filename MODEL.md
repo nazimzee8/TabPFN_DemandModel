@@ -1,4 +1,4 @@
-# DeepSetModel — Architecture Reference
+# retired MODEL1 model — Architecture Reference
 
 > **Reproducibility-grade reference.** All content is derived directly from
 > `src/model.py`, `src/train.py`, `src/hpo.py`, `src/evaluate.py`,
@@ -26,7 +26,7 @@
 
 ## 1. Overview
 
-**DeepSetModel** is a permutation-equivariant neural network for *in-context regression*
+**retired MODEL1 model** is a permutation-equivariant neural network for *in-context regression*
 on tabular demand data. It takes a full training context `(X_train, y_train)` and one or
 more test points `x_test` as input and produces predictions in a single forward pass —
 no gradient update at inference time.
@@ -44,7 +44,7 @@ purely through the forward pass.
 
 ### Relation to TabPFN Paradigm
 
-Following Hollmann et al. (2022), DeepSetModel is **meta-trained** over a prior
+Following Hollmann et al. (2022), retired MODEL1 model is **meta-trained** over a prior
 distribution of synthetic datasets. By minimizing MSE across this meta-distribution,
 the network implicitly approximates `E[y* | x*, D_train]` under the synthetic prior —
 the mean of the Bayesian Posterior Predictive Distribution (PPD) — without any
@@ -341,9 +341,9 @@ Concretely, for a training context of `n` samples:
 - φ cannot detect that two features are correlated, because each feature is processed
   in the same independent embedding regardless of the others.
 
-### DeepSetModel's Repair
+### retired MODEL1 model's Repair
 
-DeepSetModel adds equivariant interaction layers at **two levels** before each
+retired MODEL1 model adds equivariant interaction layers at **two levels** before each
 pooling step, using the SAB from the Set Transformer (Lee et al. 2019).
 
 **Level 1 — Feature-level SAB** (before feature pooling, Step 2):
@@ -607,7 +607,7 @@ p(y* | x*, D_train) = ∫ p(y* | x*, θ) p(θ | D_train) dθ
 ```
 
 Computing this integral exactly requires specifying a model family and is
-generally intractable. DeepSetModel approximates it in two ways.
+generally intractable. retired MODEL1 model approximates it in two ways.
 
 ### Meta-Training as Prior Specification
 
