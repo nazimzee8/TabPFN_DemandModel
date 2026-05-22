@@ -2,7 +2,7 @@
 Orchestrator for the MODEL3 training pipeline.
 
 Handler for the run_training_pipeline() Snowpark stored procedure.
-The Snowpark session is injected automatically by the stored procedure framework.
+Each public handler creates its own Snowpark session via Session.builder.getOrCreate().
 """
 import json
 import os
@@ -30,6 +30,11 @@ DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
 # MODEL3 architecture selectors — propagated to all training/HPO MLJob env_vars.
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
+
+
+def _get_session():
+    from snowflake.snowpark import Session
+    return Session.builder.getOrCreate()
 
 
 def _wait_done(job, label, session):
@@ -96,7 +101,8 @@ def _kaggle_secret_spec_overrides(secret_name):
     }
 
 
-def run_kaggle_download(session) -> str:
+def run_kaggle_download() -> str:
+    session = _get_session()
     print("Submitting Kaggle benchmark download job ...")
     kaggle_secret_name = "KAGGLE_API_SECRET"
     job = submit_from_stage(
@@ -125,7 +131,8 @@ def run_kaggle_download(session) -> str:
     )
 
 
-def build_meta_dataset_index(session) -> str:
+def build_meta_dataset_index() -> str:
+    session = _get_session()
     print("Submitting META_DATASET_INDEX build job ...")
     job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -252,24 +259,41 @@ def _validate_meta_dataset_index(session):
             ) from exc
 
 
-def run_pipeline(session) -> str:
+_GATE_HIDDEN_DIM_CANDIDATES = [32, 64, 128]
+
+
+def run_pipeline() -> str:
     """Full two-sweep training pipeline:
 
     Step 1: Validate META_DATASET_INDEX (counts + columns + stage access)
-    Step 2: Pre-training (pretrain.pt)
-    Step 3: HPO sweep 1 — ridge_residual (best_config_ridge_residual.json)
-    Step 4: MODEL3 DDP memory probe (worst-case: d_phi=256, n_blocks=2)
-    Step 5: HPO sweep 2 — architecture with baseline from sweep 1
-            (best_config_architecture.json + merged best_config.json)
+    Step 2: Pre-training (pretrain.pt, no BEST_CONFIG — establishes warm-start baseline)
+    Step 3: HPO sweep — ridge_residual (tunes optimizer/regularization/Ridge Expert)
+            Writes best_config_ridge_residual.json.
+    Step 4: MODEL3 DDP memory probe (worst-case d_phi=256, n_blocks=2)
+            Guards against OOM before the architecture HPO allocates GPU cluster.
+    Step 5: HPO sweep — architecture (tunes d_phi and n_sab_feat)
+            Reads best_config_ridge_residual.json via HPO_BASELINE_CONFIG_STAGE_PATH.
+            Writes best_config_architecture.json and merged best_config.json.
     Step 6: Load merged best_config.json
     Step 7: Final training with best_config + pretrain warm-start (best.pt)
     """
+    session = _get_session()
+    _common_env = {
+        "HOME":                      "/tmp",
+        "TRAIN_NUM_NODES":           str(TRAIN_NUM_NODES),
+        "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
+        "STRICT_WORLD_SIZE_CHECK":   "true",
+        "MODEL_FAMILY":              DEFAULT_MODEL_FAMILY,
+        "TRAINING_DATA_FAMILY":      DEFAULT_TRAINING_DATA_FAMILY,
+        "MODEL_DESIGN_PATTERN":     DEFAULT_MODEL_DESIGN_PATTERN,
+    }
+
     # ── Step 1: Validate META_DATASET_INDEX ──────────────────────────────────
     print("Step 1: Validating META_DATASET_INDEX ...")
     _validate_meta_dataset_index(session)
 
-    # ── Step 2: Pre-train with default hyperparameters ────────────────────────
-    print("Step 2: Submitting pre-training job ...")
+    # ── Step 2: Pre-training ──────────────────────────────────────────────────
+    print("Step 2: Submitting pre-training job (pretrain.pt) ...")
     pretrain_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="train.py",
@@ -277,14 +301,8 @@ def run_pipeline(session) -> str:
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=TRAIN_NUM_NODES,
         env_vars={
+            **_common_env,
             "CHECKPOINT_OUTPUT_NAME": "pretrain.pt",
-            "TRAIN_NUM_NODES": str(TRAIN_NUM_NODES),
-            "HOME": "/tmp",
-            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
-            "STRICT_WORLD_SIZE_CHECK": "true",
-            "MODEL_FAMILY":          DEFAULT_MODEL_FAMILY,
-            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
-            "MODEL_DESIGN_PATTERN": DEFAULT_MODEL_DESIGN_PATTERN,
         },
         session=session,
     )
@@ -296,24 +314,21 @@ def run_pipeline(session) -> str:
             f"{MODEL_STAGE}/checkpoints/. Check container logs before proceeding."
         )
 
-    # ── Step 3: HPO sweep 1 — ridge_residual ─────────────────────────────────
+    # ── Step 3: HPO sweep — ridge_residual ───────────────────────────────────
     print("Step 3: Submitting HPO ridge_residual sweep ...")
-    hpo_job = submit_from_stage(
+    hpo_rr_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
         compute_pool=GPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=5,
         env_vars={
-            "HOME": "/tmp",
-            "MODEL_FAMILY":          DEFAULT_MODEL_FAMILY,
-            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
-            "MODEL_DESIGN_PATTERN": DEFAULT_MODEL_DESIGN_PATTERN,
-            "HPO_SWEEP_MODE":        "ridge_residual",
+            **_common_env,
+            "HPO_SWEEP_MODE": "ridge_residual",
         },
         session=session,
     )
-    _wait_done(hpo_job, "HPO ridge_residual", session)
+    _wait_done(hpo_rr_job, "HPO ridge_residual", session)
 
     if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config_ridge_residual.json"):
         raise RuntimeError(
@@ -321,57 +336,54 @@ def run_pipeline(session) -> str:
             f"{MODEL_STAGE}/hpo/. Check container logs before proceeding."
         )
 
-    # ── Step 4: MODEL3 DDP memory probe (worst-case architecture candidates) ──
-    print("Step 4: Submitting MODEL3 DDP memory probe (pre-architecture HPO gate) ...")
-    probe_env = {
-        "HOME": "/tmp",
-        "TRAIN_NUM_NODES": str(TRAIN_NUM_NODES),
-        "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
-        "STRICT_WORLD_SIZE_CHECK": "true",
-        "MODEL_DESIGN_PATTERN": "inductive_forecasting",
-        "MODEL_FAMILY": "market_exchangeable_icl",
-        "MODEL_PROBE_N_CONTEXT": "200",
-        "MODEL_PROBE_P_FEATURES": "128",
-        "MODEL_PROBE_M_QUERY": "128",
-        "MODEL_PROBE_D_PHI": "256",    # max ARCH_D_PHI_CANDIDATES
-        "MODEL_PROBE_N_BLOCKS": "2",   # max ARCH_N_SAB_FEAT_CANDIDATES
-        "MODEL_PROBE_RUN_BACKWARD": "true",
-        "MODEL_PROBE_DTYPE": "float32",
-        "MODEL_PROBE_MAX_GPU_MEMORY_FRACTION": "0.9",
-        "MODEL_PROBE_STRICT_MEMORY_GUARD": "true",
-        "MODEL_PROBE_MEMORY_SAFETY_FACTOR": "1.5",
-        "MODEL_PROBE_OUTPUT_STAGE": f"{MODEL_STAGE}/diagnostics/",
-    }
+    # ── Step 4: MODEL3 DDP memory probe (pre-architecture HPO gate) ───────────
+    print("Step 4: Submitting MODEL3 DDP memory probe (d_phi=256, n_blocks=2) ...")
     probe_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="model_ddp_memory_probe.py",
         compute_pool=GPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=TRAIN_NUM_NODES,
-        env_vars=probe_env,
+        env_vars={
+            "HOME":                             "/tmp",
+            "TRAIN_NUM_NODES":                  str(TRAIN_NUM_NODES),
+            "EXPECTED_TRAIN_WORLD_SIZE":         str(TRAIN_NUM_NODES * 4),
+            "STRICT_WORLD_SIZE_CHECK":           "true",
+            "MODEL_ARCH_VERSION":               "model3",
+            "MODEL_DESIGN_PATTERN":             "inductive_forecasting",
+            "MODEL_FAMILY":                     "market_exchangeable_icl",
+            "MODEL_PROBE_N_CONTEXT":            "200",
+            "MODEL_PROBE_P_FEATURES":           "128",
+            "MODEL_PROBE_M_QUERY":              "128",
+            "MODEL_PROBE_D_PHI":                "256",
+            "MODEL_PROBE_N_BLOCKS":             "2",
+            "MODEL_PROBE_RUN_BACKWARD":         "true",
+            "MODEL_PROBE_DTYPE":                "float32",
+            "MODEL_PROBE_MAX_GPU_MEMORY_FRACTION": "0.9",
+            "MODEL_PROBE_STRICT_MEMORY_GUARD":  "true",
+            "MODEL_PROBE_MEMORY_SAFETY_FACTOR": "1.5",
+            "MODEL_PROBE_OUTPUT_STAGE":         f"{MODEL_STAGE}/diagnostics/",
+        },
         session=session,
     )
     _wait_done(probe_job, "MODEL3DDPMemoryProbe (pre-architecture HPO gate)", session)
 
-    # ── Step 5: HPO sweep 2 — architecture with baseline from sweep 1 ─────────
+    # ── Step 5: HPO sweep — architecture ─────────────────────────────────────
     print("Step 5: Submitting HPO architecture sweep ...")
-    arch_hpo_job = submit_from_stage(
+    hpo_arch_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
         compute_pool=GPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=5,
         env_vars={
-            "HOME": "/tmp",
-            "MODEL_FAMILY":          DEFAULT_MODEL_FAMILY,
-            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
-            "MODEL_DESIGN_PATTERN": DEFAULT_MODEL_DESIGN_PATTERN,
-            "HPO_SWEEP_MODE":        "architecture",
-            "HPO_BASELINE_CONFIG_STAGE_PATH": f"{MODEL_STAGE}/hpo/best_config_ridge_residual.json",
+            **_common_env,
+            "HPO_SWEEP_MODE":                    "architecture",
+            "HPO_BASELINE_CONFIG_STAGE_PATH":    f"{MODEL_STAGE}/hpo/best_config_ridge_residual.json",
         },
         session=session,
     )
-    _wait_done(arch_hpo_job, "HPO architecture", session)
+    _wait_done(hpo_arch_job, "HPO architecture", session)
 
     if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config.json"):
         raise RuntimeError(
@@ -379,14 +391,14 @@ def run_pipeline(session) -> str:
             f"{MODEL_STAGE}/hpo/. Check container logs before proceeding."
         )
 
-    # ── Step 6: Load merged best_config.json ─────────────────────────────────
+    # ── Step 6: Load merged best_config.json ──────────────────────────────────
     print("Step 6: Loading merged best_config.json ...")
     session.file.get(f"{MODEL_STAGE}/hpo/best_config.json", LOCAL_TMP_DIR)
     with open(os.path.join(LOCAL_TMP_DIR, "best_config.json")) as f:
         best_config = json.load(f)
-    print("Merged best config:", best_config)
+    print("Best config:", best_config)
 
-    # ── Step 7: Final training with best_config + pretrain warm-start ─────────
+    # ── Step 7: Final training ─────────────────────────────────────────────────
     print("Step 7: Submitting final training job ...")
     train_job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -395,16 +407,11 @@ def run_pipeline(session) -> str:
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=TRAIN_NUM_NODES,
         env_vars={
-            "BEST_CONFIG": json.dumps(best_config),
+            **_common_env,
+            "BEST_CONFIG":              json.dumps(best_config),
             "PRETRAIN_CHECKPOINT_PATH": f"{MODEL_STAGE}/checkpoints/pretrain.pt",
-            "PRETRAIN_LOAD_POLICY": "allow_cold_start_on_arch_mismatch",
-            "TRAIN_NUM_NODES": str(TRAIN_NUM_NODES),
-            "HOME": "/tmp",
-            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
-            "STRICT_WORLD_SIZE_CHECK": "true",
-            "MODEL_FAMILY":          DEFAULT_MODEL_FAMILY,
-            "TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
-            "MODEL_DESIGN_PATTERN": DEFAULT_MODEL_DESIGN_PATTERN,
+            "PRETRAIN_LOAD_POLICY":     "allow_cold_start_on_arch_mismatch",
+            "CHECKPOINT_OUTPUT_NAME":   "best.pt",
         },
         session=session,
     )
@@ -414,8 +421,7 @@ def run_pipeline(session) -> str:
     checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")
     return (
         "Training pipeline complete "
-        "(Validate → Pretrain → HPO ridge_residual → Memory probe → "
-        "HPO architecture → Merge config → Final training).\n\n"
+        "(Validate → Pretrain → HPO ridge_residual → MemProbe → HPO architecture → Final training).\n\n"
         "MODEL_STAGE hpo:\n"
         + "\n".join(f"  {p}" for p in hpo_contents)
         + "\n\nMODEL_STAGE checkpoints:\n"

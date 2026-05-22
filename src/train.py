@@ -55,6 +55,15 @@ USE_HUBER    = False   # off by default; toggle via hyper_params["use_huber"]
 LAMBDA_L1    = 0.0     # L1 penalty coefficient; helps Regime B sparse β
 HUBER_DELTA  = 1.0     # δ for Huber loss; robustness to Regime C heavy-tailed ε
 
+# Gate hidden dim — controls Ridge Expert gate MLP width.
+# Resolution order in train_fn: BEST_CONFIG["gate_hidden_dim"] > GATE_HIDDEN_DIM env var > 64.
+_GATE_HIDDEN_DIM_ENV = os.environ.get("GATE_HIDDEN_DIM", "").strip()
+DEFAULT_GATE_HIDDEN_DIM = int(_GATE_HIDDEN_DIM_ENV) if _GATE_HIDDEN_DIM_ENV else 64
+if DEFAULT_GATE_HIDDEN_DIM <= 0:
+    raise ValueError(
+        f"GATE_HIDDEN_DIM env var must be a positive integer, got {_GATE_HIDDEN_DIM_ENV!r}"
+    )
+
 MODEL_FAMILY = os.environ.get("MODEL_FAMILY", "market_exchangeable_icl")
 TRAINING_DATA_FAMILY = os.environ.get(
     "TRAINING_DATA_FAMILY",
@@ -287,7 +296,9 @@ def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank,
     import glob as _glob
     local_dir = f"/tmp/pretrain_ckpt_rank{rank}"
     os.makedirs(local_dir, exist_ok=True)
-    local_path = os.path.join(local_dir, "pretrain.pt")
+    # Derive expected local filename from the stage path (e.g. "pretrain_gate64.pt")
+    expected_filename = stage_path.rsplit("/", 1)[-1]
+    local_path = os.path.join(local_dir, expected_filename)
     try:
         from snowflake.snowpark import Session
         session = Session.builder.getOrCreate()
@@ -298,9 +309,15 @@ def _load_pretrain_checkpoint(model, stage_path, cfg, device, rank,
             if candidates:
                 local_path = candidates[0]
         if not os.path.exists(local_path):
+            # Last resort: any .pt file in the download directory
+            all_pts = sorted(_glob.glob(os.path.join(local_dir, "*.pt")))
+            if all_pts:
+                local_path = all_pts[0]
+        if not os.path.exists(local_path):
             raise RuntimeError(
                 f"[PRETRAIN] rank {rank}: PRETRAIN_CHECKPOINT_PATH was set to "
-                f"{stage_path!r} but the file could not be downloaded. "
+                f"{stage_path!r} but {expected_filename!r} could not be downloaded "
+                f"to {local_dir!r}. "
                 "Verify the file exists with: LIST @MODEL_STAGE/checkpoints/;"
             )
         # PyTorch 2.6+ compat: try weights_only=True first, fall back for legacy ModelConfig
@@ -505,7 +522,7 @@ def train_fn():
     huber_delta      = float(hyper_params.get("huber_delta",     HUBER_DELTA))
     use_ridge_expert = bool(hyper_params.get("use_ridge_expert", True))
     ridge_lambda     = float(hyper_params.get("ridge_lambda",    1.0))
-    gate_hidden_dim  = int(hyper_params.get("gate_hidden_dim",   64))
+    gate_hidden_dim  = int(hyper_params.get("gate_hidden_dim",   DEFAULT_GATE_HIDDEN_DIM))
     n_sab_feat       = int(hyper_params.get("n_sab_feat",        N_SAB_FEAT))
 
     _huber_loss = nn.HuberLoss(delta=huber_delta) if use_huber else None

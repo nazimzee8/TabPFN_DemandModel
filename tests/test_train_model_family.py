@@ -240,3 +240,164 @@ def test_training_data_family_synthetic_regression_combined_accepted(monkeypatch
     importlib.reload(train)
     assert train.TRAINING_DATA_FAMILY == "synthetic_regression_combined"
     importlib.reload(train)
+
+
+# ---------------------------------------------------------------------------
+# _load_pretrain_checkpoint filename-resolution tests
+# ---------------------------------------------------------------------------
+
+class TestLoadPretrainCheckpointFilenameResolution:
+    """Unit tests for _load_pretrain_checkpoint() gate-specific filename fix.
+
+    Regression for the bug where the function always looked for the hardcoded
+    local filename "pretrain.pt" instead of deriving it from the stage_path,
+    causing gate-specific checkpoints (pretrain_gate32.pt etc.) to never be found.
+    """
+
+    def _make_minimal_checkpoint(self, cfg, model):
+        """Create a minimal checkpoint dict that passes architecture checks."""
+        import dataclasses
+        return {
+            "checkpoint_format_version": 4,
+            "cfg": dataclasses.asdict(cfg),
+            "state_dict": model.state_dict(),
+            "metadata": {},
+        }
+
+    def _make_session_that_writes(self, filename: str, payload: dict):
+        """Return a mock session whose file.get writes <filename> into local_dir."""
+        import json as _json
+
+        def _file_get(stage_path, local_dir):
+            os.makedirs(local_dir, exist_ok=True)
+            dest = os.path.join(local_dir, filename)
+            torch.save(payload, dest)
+
+        session = MagicMock()
+        session.file.get.side_effect = _file_get
+        return session
+
+    def _call(self, stage_path, session, model=None, cfg=None, rank=0):
+        """Call _load_pretrain_checkpoint with the given stage_path and mocked session.
+
+        Session is imported locally inside _load_pretrain_checkpoint via
+        'from snowflake.snowpark import Session', so we inject a stub into
+        sys.modules rather than patching a module-level attribute.
+        Use distinct rank values per test so each gets an isolated /tmp dir.
+        """
+        import sys
+        import train
+        from model import ModelConfig, _instantiate_model
+
+        if cfg is None:
+            cfg = ModelConfig()
+        if model is None:
+            model = _instantiate_model(cfg)
+
+        # Build a stub snowpark module whose Session.builder.getOrCreate() returns
+        # the provided mock session.
+        mock_snowpark = MagicMock()
+        mock_snowpark.Session.builder.getOrCreate.return_value = session
+
+        old = sys.modules.get("snowflake.snowpark")
+        sys.modules["snowflake.snowpark"] = mock_snowpark
+        try:
+            return train._load_pretrain_checkpoint(
+                model, stage_path, cfg, device="cpu", rank=rank,
+                pretrain_load_policy="require_match",
+            )
+        finally:
+            if old is None:
+                sys.modules.pop("snowflake.snowpark", None)
+            else:
+                sys.modules["snowflake.snowpark"] = old
+
+    def test_gate64_filename_searched_not_pretrain_pt(self):
+        """When stage_path ends in pretrain_gate64.pt, the loader must find
+        pretrain_gate64.pt locally, not fail looking for pretrain.pt."""
+        from model import ModelConfig, _instantiate_model
+
+        cfg = ModelConfig()
+        model = _instantiate_model(cfg)
+        ckpt = self._make_minimal_checkpoint(cfg, model)
+        session = self._make_session_that_writes("pretrain_gate64.pt", ckpt)
+
+        # rank=10 gives a fresh isolated tmp dir
+        loaded, reason = self._call(
+            "@MODEL_STAGE/checkpoints/pretrain_gate64.pt", session, model, cfg,
+            rank=10,
+        )
+        assert loaded is True, f"Expected pretrain_loaded=True, got reason={reason!r}"
+        assert reason is None
+
+    def test_gate32_filename_searched(self):
+        """Same resolution works for pretrain_gate32.pt."""
+        from model import ModelConfig, _instantiate_model
+
+        cfg = ModelConfig()
+        model = _instantiate_model(cfg)
+        ckpt = self._make_minimal_checkpoint(cfg, model)
+        session = self._make_session_that_writes("pretrain_gate32.pt", ckpt)
+
+        loaded, reason = self._call(
+            "@MODEL_STAGE/checkpoints/pretrain_gate32.pt", session, model, cfg,
+            rank=11,
+        )
+        assert loaded is True
+
+    def test_gate128_filename_searched(self):
+        """Same resolution works for pretrain_gate128.pt."""
+        from model import ModelConfig, _instantiate_model
+
+        cfg = ModelConfig()
+        model = _instantiate_model(cfg)
+        ckpt = self._make_minimal_checkpoint(cfg, model)
+        session = self._make_session_that_writes("pretrain_gate128.pt", ckpt)
+
+        loaded, reason = self._call(
+            "@MODEL_STAGE/checkpoints/pretrain_gate128.pt", session, model, cfg,
+            rank=12,
+        )
+        assert loaded is True
+
+    def test_regression_old_hardcoded_pretrain_pt_would_have_failed(self):
+        """Regression: the old code looked for 'pretrain.pt'; show that if file.get
+        writes 'pretrain_gate64.pt' only, os.path.exists('pretrain.pt') is False."""
+        tmp = tempfile.mkdtemp()
+        # Simulate what file.get writes for a gate checkpoint
+        torch.save({"state_dict": {}}, os.path.join(tmp, "pretrain_gate64.pt"))
+        # The old hardcoded path would be:
+        old_local_path = os.path.join(tmp, "pretrain.pt")
+        assert not os.path.exists(old_local_path), (
+            "If this assertion fails, the regression condition no longer holds."
+        )
+
+    def test_missing_file_raises_runtime_error_with_filename_and_list_hint(self):
+        """FileNotFoundError-equivalent: RuntimeError includes expected filename,
+        local_dir, and 'LIST @MODEL_STAGE/checkpoints/' remediation hint.
+        Uses rank=999 to ensure a clean tmp dir (no leftover .pt files)."""
+        def _file_get_noop(stage_path, local_dir):
+            os.makedirs(local_dir, exist_ok=True)
+            # Intentionally write no file — simulates a failed download
+
+        session = MagicMock()
+        session.file.get.side_effect = _file_get_noop
+
+        from model import ModelConfig, _instantiate_model
+        cfg = ModelConfig()
+        model = _instantiate_model(cfg)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            self._call(
+                "@MODEL_STAGE/checkpoints/pretrain_gate64.pt",
+                session, model, cfg,
+                rank=999,  # fresh dir: /tmp/pretrain_ckpt_rank999
+            )
+
+        msg = str(exc_info.value)
+        assert "pretrain_gate64.pt" in msg, f"Expected filename in error: {msg!r}"
+        assert "LIST @MODEL_STAGE/checkpoints/" in msg, (
+            f"Expected LIST hint in error: {msg!r}"
+        )
+        # Rank must appear so distributed logs can be correlated
+        assert "rank 999" in msg, f"Expected rank in error: {msg!r}"

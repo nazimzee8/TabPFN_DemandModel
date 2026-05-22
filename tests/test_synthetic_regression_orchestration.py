@@ -122,6 +122,9 @@ def _patch_submit(collector: JobCollector):
             self._stack.enter_context(
                 patch("run_synthetic_regression_evaluation._list_stage", return_value=[])
             )
+            self._stack.enter_context(
+                patch("run_synthetic_regression_evaluation._stage_file_exists", return_value=True)
+            )
             return self
 
         def __exit__(self, *args):
@@ -131,16 +134,26 @@ def _patch_submit(collector: JobCollector):
 
 
 def _assert_unsafe_torch_load_for_eval_shards(jobs: list[_FakeJob]) -> None:
-    eval_modes = {"deepset", "baselines", "autogluon"}
-    eval_jobs = [
+    # Only deepset and baselines call torch.load; autogluon never does.
+    torch_load_modes = {"deepset", "baselines"}
+    torch_load_jobs = [
         job for job in jobs
-        if job.env_vars.get("SYNTHETIC_REGRESSION_MODE") in eval_modes
+        if job.env_vars.get("SYNTHETIC_REGRESSION_MODE") in torch_load_modes
     ]
-    assert eval_jobs, "No synthetic regression eval shard jobs found"
-    for job in eval_jobs:
+    assert torch_load_jobs, "No deepset/baselines shard jobs found"
+    for job in torch_load_jobs:
         assert job.env_vars.get("ALLOW_UNSAFE_TORCH_LOAD") == "true", (
             f"{job.label} mode={job.env_vars.get('SYNTHETIC_REGRESSION_MODE')!r} "
             "missing ALLOW_UNSAFE_TORCH_LOAD=true"
+        )
+    # AutoGluon shards must NOT receive ALLOW_UNSAFE_TORCH_LOAD.
+    autogluon_jobs = [
+        job for job in jobs
+        if job.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"
+    ]
+    for job in autogluon_jobs:
+        assert "ALLOW_UNSAFE_TORCH_LOAD" not in job.env_vars, (
+            f"{job.label}: ALLOW_UNSAFE_TORCH_LOAD must not be set for autogluon mode"
         )
 
 
@@ -264,7 +277,7 @@ class TestPipAndEAIAssignments:
 
 class TestUnsafeTorchLoadEnv:
     def test_main_eval_shards_set_allow_unsafe_torch_load(self, collector, fake_session, runtime_args):
-        """Main DeepSet, baseline, and AutoGluon shards must carry trusted-checkpoint load env."""
+        """DeepSet and baseline shards must carry ALLOW_UNSAFE_TORCH_LOAD; autogluon must not."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
             orch.run_synthetic_regression_baseline_evaluation(fake_session, *runtime_args)
@@ -287,7 +300,7 @@ class TestUnsafeTorchLoadEnv:
         _assert_unsafe_torch_load_for_eval_shards(ood_jobs)
 
     def test_ood_full_eval_shards_set_allow_unsafe_torch_load(self, collector, fake_session):
-        """OOD full DeepSet, baseline, and AutoGluon shards must carry trusted-checkpoint load env."""
+        """OOD full DeepSet and baseline shards must carry ALLOW_UNSAFE_TORCH_LOAD; autogluon must not."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_ood_full_deepset_evaluation(fake_session)
             orch.run_synthetic_regression_ood_full_baseline_evaluation(fake_session)
@@ -296,7 +309,7 @@ class TestUnsafeTorchLoadEnv:
         _assert_unsafe_torch_load_for_eval_shards(collector.submitted)
 
     def test_combined_eval_shards_set_allow_unsafe_torch_load(self, collector, fake_session):
-        """Combined DeepSet, baseline, and AutoGluon shards must carry trusted-checkpoint load env."""
+        """Combined DeepSet and baseline shards must carry ALLOW_UNSAFE_TORCH_LOAD; autogluon must not."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_combined_deepset_evaluation(fake_session)
             orch.run_synthetic_regression_combined_baseline_evaluation(fake_session)
@@ -349,7 +362,10 @@ class TestPhaseGating:
             )
 
         with patch("run_synthetic_regression_evaluation._submit_synreg",
-                   side_effect=_mock_submit_synreg):
+                   side_effect=_mock_submit_synreg), \
+             patch("run_synthetic_regression_evaluation._stage_file_exists", return_value=True), \
+             patch("run_synthetic_regression_evaluation._ensure_compute_pool_usable"), \
+             patch("run_synthetic_regression_evaluation._wait_job_group"):
             orch.run_synthetic_regression_deepset_evaluation(fake_session, *runtime_args)
             orch.run_synthetic_regression_baseline_evaluation(fake_session, *runtime_args)
 
@@ -450,8 +466,8 @@ class TestCapacityProbePhases:
         assert ag_start is not None
         assert baseline_done <= ag_start
 
-    def test_cpu_capacity_phases_use_requested_concurrency(self, fake_session, runtime_args):
-        """CPU capacity phases submit exactly the requested probe jobs."""
+    def test_cpu_capacity_phases_use_single_wave_envelope(self, fake_session, runtime_args):
+        """CPU capacity phases submit exactly the required single-wave probe jobs."""
         submitted_counts = {}
 
         def _mock_phase(session, phase_label, compute_pool, runtime_environment, count):
@@ -460,15 +476,29 @@ class TestCapacityProbePhases:
         with patch("run_synthetic_regression_evaluation._submit_and_wait_capacity_phase",
                    side_effect=_mock_phase):
             orch.run_synthetic_regression_capacity_probe(
-                fake_session, *runtime_args, 4, 12
+                fake_session, *runtime_args
             )
 
         assert submitted_counts == {
-            "synreg_cap_baseline": 4,
-            "synreg_cap_autogluon": 12,
+            "synreg_cap_baseline": orch.SYNREG_CPU_SHARDS,
+            "synreg_cap_autogluon": orch.SYNREG_AUTOGLUON_SHARDS,
         }
 
-    def test_standalone_capacity_probes_use_requested_concurrency(self, fake_session, runtime_args):
+    def test_capacity_probes_reject_lower_concurrency(self, fake_session, runtime_args):
+        with pytest.raises(ValueError):
+            orch.run_synthetic_regression_capacity_probe(
+                fake_session, *runtime_args, 4, 12
+            )
+        with pytest.raises(ValueError):
+            orch.run_synthetic_regression_baseline_capacity_probe(
+                fake_session, *runtime_args, 5
+            )
+        with pytest.raises(ValueError):
+            orch.run_synthetic_regression_autogluon_capacity_probe(
+                fake_session, *runtime_args, 17
+            )
+
+    def test_standalone_capacity_probes_use_single_wave_envelope(self, fake_session, runtime_args):
         submitted_counts = {}
 
         def _mock_phase(session, phase_label, compute_pool, runtime_environment, count):
@@ -477,14 +507,59 @@ class TestCapacityProbePhases:
         with patch("run_synthetic_regression_evaluation._submit_and_wait_capacity_phase",
                    side_effect=_mock_phase):
             orch.run_synthetic_regression_baseline_capacity_probe(
-                fake_session, *runtime_args, 5
+                fake_session, *runtime_args
             )
             orch.run_synthetic_regression_autogluon_capacity_probe(
-                fake_session, *runtime_args, 17
+                fake_session, *runtime_args
             )
 
-        assert submitted_counts["synreg_cap_baseline"] == (orch.DEEPSET_CPU_POOL, 5)
-        assert submitted_counts["synreg_cap_autogluon"] == (orch.AUTOGLUON_CPU_POOL, 17)
+        assert submitted_counts["synreg_cap_baseline"] == (
+            orch.DEEPSET_CPU_POOL, orch.SYNREG_CPU_SHARDS
+        )
+        assert submitted_counts["synreg_cap_autogluon"] == (
+            orch.AUTOGLUON_CPU_POOL, orch.SYNREG_AUTOGLUON_SHARDS
+        )
+
+    def test_combined_capacity_probes_use_single_wave_envelope(self, collector, fake_session):
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_baseline_capacity_probe(fake_session)
+            orch.run_synthetic_regression_combined_autogluon_capacity_probe(fake_session)
+
+        baseline_probes = [
+            j for j in collector.submitted
+            if j.label.startswith("combined_baseline_cap_probe_")
+        ]
+        ag_probes = [
+            j for j in collector.submitted
+            if j.label.startswith("combined_ag_cap_probe_")
+        ]
+        assert len(baseline_probes) == orch.SYNREG_CPU_SHARDS
+        assert len(ag_probes) == orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT
+        assert {j.target_instances for j in ag_probes} == {
+            orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
+        }
+        assert {j.entrypoint for j in baseline_probes} == {"capacity_probe.py"}
+        assert {j.entrypoint for j in ag_probes} == {"ray_capacity_probe.py"}
+        for job in ag_probes:
+            assert job.env_vars["EXPECTED_RAY_NODES"] == str(
+                orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
+            )
+            assert job.env_vars["EXPECTED_RAY_CPUS_MIN"] == str(
+                orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
+            )
+
+    def test_combined_autogluon_capacity_probe_rejects_lower_clusters(self, fake_session):
+        with pytest.raises(ValueError) as exc:
+            orch.run_synthetic_regression_combined_autogluon_capacity_probe(
+                fake_session,
+                autogluon_cluster_shards=6,
+                autogluon_concurrent_clusters=3,
+            )
+
+        msg = str(exc.value)
+        assert "run_synthetic_regression_combined_autogluon_capacity_probe" in msg
+        assert "AUTOGLUON_CONCURRENT_CLUSTERS=3" in msg
+        assert "AUTOGLUON_CLUSTER_SHARDS=6" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +577,162 @@ class TestTargetInstancesAlwaysOne:
         for job in collector.submitted:
             assert job.target_instances == 1, \
                 f"Job {job.label} has target_instances={job.target_instances}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Multi-instance entrypoint allowlist guard
+# ---------------------------------------------------------------------------
+
+class TestMultiInstanceGuard:
+    """Verify _submit_synreg's allowlist-based multi-instance guard."""
+
+    def test_allows_ray_capacity_probe_multi_instance(self, fake_session):
+        """ray_capacity_probe.py with target_instances > 1 must pass the multi-instance guard."""
+        try:
+            orch._submit_synreg(
+                session=fake_session,
+                label="ag_cap_probe_0",
+                compute_pool=orch.AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "EXPECTED_RAY_NODES": "4",
+                    "EXPECTED_RAY_CPUS_MIN": "4",
+                },
+                runtime_environment="2.5.0-py311",
+                entrypoint="ray_capacity_probe.py",
+                target_instances=4,
+            )
+        except RuntimeError as exc:
+            assert "Refusing target_instances" not in str(exc), (
+                f"multi-instance guard incorrectly rejected ray_capacity_probe.py: {exc}"
+            )
+        except Exception:
+            pass  # ImportError for Snowflake is expected in test environment
+
+    def test_allows_autogluon_ray_multi_instance(self, fake_session):
+        """evaluate_synthetic_regression_autogluon_ray.py with target_instances > 1 must pass."""
+        try:
+            orch._submit_synreg(
+                session=fake_session,
+                label="combined_ag_cluster_0",
+                compute_pool=orch.AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "SYNTHETIC_REGRESSION_MODE": "autogluon",
+                    "SYNTHETIC_REGRESSION_SUITE_ID": "linear_all_v1",
+                    "SYNTHETIC_REGRESSION_NUM_SHARDS": "6",
+                    "SYNTHETIC_REGRESSION_SHARD_INDEX": "0",
+                    "SYNREG_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
+                    "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
+                },
+                runtime_environment="2.5.0-py311",
+                entrypoint="evaluate_synthetic_regression_autogluon_ray.py",
+                target_instances=4,
+            )
+        except RuntimeError as exc:
+            assert "Refusing target_instances" not in str(exc), (
+                f"multi-instance guard incorrectly rejected autogluon_ray entrypoint: {exc}"
+            )
+        except Exception:
+            pass  # ImportError for Snowflake is expected in test environment
+
+    def test_rejects_capacity_probe_multi_instance(self, fake_session):
+        """capacity_probe.py (non-Ray) with target_instances > 1 must be rejected."""
+        with pytest.raises(RuntimeError, match="Refusing target_instances"):
+            orch._submit_synreg(
+                session=fake_session,
+                label="bad_cap_probe",
+                compute_pool=orch.DEEPSET_CPU_POOL,
+                env_vars={},
+                runtime_environment="2.5.0-py311",
+                entrypoint="capacity_probe.py",
+                target_instances=4,
+            )
+
+    def test_rejects_evaluate_synthetic_regression_multi_instance(self, fake_session):
+        """evaluate_synthetic_regression.py with target_instances > 1 must be rejected."""
+        with pytest.raises(RuntimeError, match="Refusing target_instances"):
+            orch._submit_synreg(
+                session=fake_session,
+                label="bad_deepset_shard",
+                compute_pool=orch.DEEPSET_GPU_POOL,
+                env_vars={
+                    "SYNTHETIC_REGRESSION_MODE": "deepset",
+                    "ALLOW_UNSAFE_TORCH_LOAD": "true",
+                },
+                runtime_environment="2.5.0-py311",
+                entrypoint="evaluate_synthetic_regression.py",
+                target_instances=2,
+            )
+
+    def test_combined_autogluon_capacity_probe_submits_ray_capacity_probe(
+        self, collector, fake_session
+    ):
+        """Combined AutoGluon capacity probe must use ray_capacity_probe.py with target_instances=workers_per_shard."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_autogluon_capacity_probe(fake_session)
+
+        ag_probes = [
+            j for j in collector.submitted
+            if j.label.startswith("combined_ag_cap_probe_")
+        ]
+        assert ag_probes, "No combined AG capacity probe jobs found"
+        for job in ag_probes:
+            assert job.entrypoint == "ray_capacity_probe.py", (
+                f"Expected ray_capacity_probe.py, got {job.entrypoint!r}"
+            )
+            assert job.target_instances == orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT, (
+                f"Expected target_instances={orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT}, "
+                f"got {job.target_instances}"
+            )
+
+    def test_combined_autogluon_evaluation_submits_autogluon_ray(
+        self, collector, fake_session
+    ):
+        """Combined AutoGluon evaluation must use evaluate_synthetic_regression_autogluon_ray.py with target_instances=workers_per_shard."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_autogluon_evaluation(fake_session)
+
+        ag_jobs = [
+            j for j in collector.submitted
+            if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"
+        ]
+        assert ag_jobs, "No combined AG evaluation jobs found"
+        for job in ag_jobs:
+            assert job.entrypoint == "evaluate_synthetic_regression_autogluon_ray.py", (
+                f"Expected autogluon_ray entrypoint, got {job.entrypoint!r}"
+            )
+            assert job.target_instances == orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT, (
+                f"Expected target_instances={orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT}, "
+                f"got {job.target_instances}"
+            )
+
+    def test_combined_all_in_one_preserves_ray_entrypoint_and_agg_shard_count(
+        self, collector, fake_session
+    ):
+        """All-in-one combined evaluation must pass autogluon_ray entrypoint through and
+        aggregation must expect the same cluster_shards count."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_evaluation(fake_session)
+
+        ag_jobs = [
+            j for j in collector.submitted
+            if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"
+        ]
+        agg_jobs = [
+            j for j in collector.submitted
+            if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "aggregate"
+        ]
+        assert ag_jobs, "No AG jobs submitted by all-in-one"
+        assert agg_jobs, "No aggregation job submitted by all-in-one"
+
+        for job in ag_jobs:
+            assert job.entrypoint == "evaluate_synthetic_regression_autogluon_ray.py"
+
+        cluster_shards = int(ag_jobs[0].env_vars["SYNREG_AUTOGLUON_CLUSTER_SHARDS"])
+        expected_ag_shards = agg_jobs[0].env_vars.get("SYNREG_EXPECTED_AG_SHARDS")
+        assert expected_ag_shards == str(cluster_shards), (
+            f"Aggregation SYNREG_EXPECTED_AG_SHARDS={expected_ag_shards!r} "
+            f"does not match cluster_shards={cluster_shards}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -609,33 +840,46 @@ class TestRuntimeConcurrencyControls:
         assert orch.SYNREG_BASELINE_CONCURRENT_NODES_DEFAULT == 6
         assert orch.SYNREG_AUTOGLUON_CONCURRENT_NODES_DEFAULT == 60
 
-    def test_env_vars_override_concurrency_defaults(self, monkeypatch):
-        monkeypatch.setenv("SYNREG_BASELINE_CONCURRENT_NODES", "2")
-        monkeypatch.setenv("SYNREG_AUTOGLUON_CONCURRENT_NODES", "7")
+    def test_env_vars_must_match_single_wave_shard_counts(self, monkeypatch):
+        monkeypatch.setenv("SYNREG_BASELINE_CONCURRENT_NODES", "6")
+        monkeypatch.setenv("SYNREG_AUTOGLUON_CONCURRENT_NODES", "60")
 
-        assert orch._resolve_baseline_concurrent_nodes("proc") == 2
-        assert orch._resolve_autogluon_concurrent_nodes("proc") == 7
+        assert orch._resolve_baseline_concurrent_nodes("proc") == 6
+        assert orch._resolve_autogluon_concurrent_nodes("proc") == 60
 
     def test_sql_args_override_env_vars(self, monkeypatch):
         monkeypatch.setenv("SYNREG_BASELINE_CONCURRENT_NODES", "2")
         monkeypatch.setenv("SYNREG_AUTOGLUON_CONCURRENT_NODES", "7")
 
-        assert orch._resolve_baseline_concurrent_nodes("proc", 4) == 4
-        assert orch._resolve_autogluon_concurrent_nodes("proc", 11) == 11
+        assert orch._resolve_baseline_concurrent_nodes("proc", 6) == 6
+        assert orch._resolve_autogluon_concurrent_nodes("proc", 60) == 60
 
     def test_invalid_concurrency_error_includes_context(self):
         with pytest.raises(ValueError) as exc:
             orch._resolve_baseline_concurrent_nodes(
                 "run_synthetic_regression_baseline_evaluation",
-                7,
+                2,
             )
         msg = str(exc.value)
         assert "run_synthetic_regression_baseline_evaluation" in msg
-        assert "requested concurrency 7" in msg
-        assert "shard count 6" in msg
+        assert "BASELINE_CONCURRENT_NODES=2" in msg
+        assert "SYNREG_CPU_SHARDS=6" in msg
+        assert orch.DEEPSET_CPU_POOL in msg
+        assert "Remediation" in msg
+
+    def test_lower_baseline_concurrency_fails_fast(self, fake_session, runtime_args):
+        with pytest.raises(ValueError) as exc:
+            orch.run_synthetic_regression_baseline_evaluation(
+                fake_session, *runtime_args, 2
+            )
+
+        msg = str(exc.value)
+        assert "run_synthetic_regression_baseline_evaluation" in msg
+        assert "BASELINE_CONCURRENT_NODES=2" in msg
+        assert "SYNREG_CPU_SHARDS=6" in msg
         assert orch.DEEPSET_CPU_POOL in msg
 
-    def test_lower_baseline_concurrency_batches_complete_shards(self, collector, fake_session, runtime_args):
+    def test_baseline_default_single_wave_waits_once(self, collector, fake_session, runtime_args):
         batch_sizes = []
 
         def _mock_wait_group(labeled_jobs, session):
@@ -645,16 +889,28 @@ class TestRuntimeConcurrencyControls:
             with patch("run_synthetic_regression_evaluation._wait_job_group",
                        side_effect=_mock_wait_group):
                 orch.run_synthetic_regression_baseline_evaluation(
-                    fake_session, *runtime_args, 2
+                    fake_session, *runtime_args
                 )
 
         baseline_jobs = [j for j in collector.submitted
                          if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
         indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in baseline_jobs]
-        assert batch_sizes == [2, 2, 2]
+        assert batch_sizes == [orch.SYNREG_CPU_SHARDS]
         assert sorted(indices) == list(range(6))
 
-    def test_lower_autogluon_concurrency_batches_complete_shards(self, collector, fake_session, runtime_args):
+    def test_lower_autogluon_concurrency_fails_fast(self, fake_session, runtime_args):
+        with pytest.raises(ValueError) as exc:
+            orch.run_synthetic_regression_autogluon_evaluation(
+                fake_session, *runtime_args, 25
+            )
+
+        msg = str(exc.value)
+        assert "run_synthetic_regression_autogluon_evaluation" in msg
+        assert "AUTOGLUON_CONCURRENT_NODES=25" in msg
+        assert "SYNREG_AUTOGLUON_SHARDS=60" in msg
+        assert orch.AUTOGLUON_CPU_POOL in msg
+
+    def test_autogluon_default_single_wave_waits_once(self, collector, fake_session, runtime_args):
         batch_sizes = []
 
         def _mock_wait_group(labeled_jobs, session):
@@ -664,13 +920,13 @@ class TestRuntimeConcurrencyControls:
             with patch("run_synthetic_regression_evaluation._wait_job_group",
                        side_effect=_mock_wait_group):
                 orch.run_synthetic_regression_autogluon_evaluation(
-                    fake_session, *runtime_args, 25
+                    fake_session, *runtime_args
                 )
 
         ag_jobs = [j for j in collector.submitted
                    if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"]
         indices = [int(j.env_vars["SYNTHETIC_REGRESSION_SHARD_INDEX"]) for j in ag_jobs]
-        assert batch_sizes == [25, 25, 10]
+        assert batch_sizes == [orch.SYNREG_AUTOGLUON_SHARDS]
         assert sorted(indices) == list(range(60))
 
 
@@ -810,6 +1066,19 @@ class TestOODFullSplitPhase:
         for job in baseline_jobs:
             assert job.compute_pool == orch.DEEPSET_CPU_POOL
 
+    def test_ood_full_baseline_default_single_wave_waits_once(self, collector, fake_session):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_ood_full_baseline_evaluation(fake_session)
+
+        assert batch_sizes == [orch.SYNREG_CPU_SHARDS]
+
     def test_ood_full_autogluon_evaluation_submits_ag_shards(self, collector, fake_session):
         """OOD full AG phase submits SYNREG_AUTOGLUON_SHARDS jobs on AUTOGLUON_CPU_POOL."""
         with _patch_submit(collector):
@@ -819,6 +1088,19 @@ class TestOODFullSplitPhase:
         assert len(ag_jobs) == orch.SYNREG_AUTOGLUON_SHARDS
         for job in ag_jobs:
             assert job.compute_pool == orch.AUTOGLUON_CPU_POOL
+
+    def test_ood_full_autogluon_default_single_wave_waits_once(self, collector, fake_session):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_ood_full_autogluon_evaluation(fake_session)
+
+        assert batch_sizes == [orch.SYNREG_AUTOGLUON_SHARDS]
 
     def test_ood_full_aggregation_submits_agg_job(self, collector, fake_session):
         """OOD full agg phase submits 1 job with mode=aggregate and SYNREG_OUTPUT_STAGE=OOD_FULL_OUTPUT_STAGE."""
@@ -862,13 +1144,105 @@ class TestCombinedSplitPhase:
                          if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "baselines"]
         assert len(baseline_jobs) == orch.SYNREG_CPU_SHARDS
 
+    def test_combined_baseline_default_single_wave_waits_once(self, collector, fake_session):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_combined_baseline_evaluation(fake_session)
+
+        assert batch_sizes == [orch.SYNREG_CPU_SHARDS]
+
     def test_combined_autogluon_evaluation_submits_ag_shards(self, collector, fake_session):
-        """Combined AG phase submits SYNREG_AUTOGLUON_SHARDS jobs on AUTOGLUON_CPU_POOL."""
+        """Combined AG phase submits SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT cluster jobs
+        on AUTOGLUON_CPU_POOL (distributed ray_work_items mode: 6 × 4 workers)."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_combined_autogluon_evaluation(fake_session)
         ag_jobs = [j for j in collector.submitted
                    if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"]
-        assert len(ag_jobs) == orch.SYNREG_AUTOGLUON_SHARDS
+        assert len(ag_jobs) == orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT
+
+    def test_combined_autogluon_jobs_carry_ray_and_memory_guard_env(self, collector, fake_session):
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_autogluon_evaluation(fake_session)
+
+        ag_jobs = [
+            j for j in collector.submitted
+            if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"
+        ]
+        assert ag_jobs
+        for job in ag_jobs:
+            assert job.entrypoint == "evaluate_synthetic_regression_autogluon_ray.py"
+            assert job.target_instances == orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
+            assert job.pip_requirements == orch.SYNREG_AG_PIP
+            assert job.external_access_integrations == orch.SYNREG_PYPI_EAI
+            assert job.env_vars["SYNREG_AUTOGLUON_DISTRIBUTED_MODE"] == "ray_work_items"
+            assert job.env_vars["SYNREG_AUTOGLUON_CLUSTER_SHARDS"] == str(
+                orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT
+            )
+            assert job.env_vars["SYNREG_AUTOGLUON_WORKERS_PER_SHARD"] == str(
+                orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
+            )
+            assert job.env_vars["SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS"] == str(
+                orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT
+            )
+            assert job.env_vars["SYNREG_AUTOGLUON_MAX_IN_FLIGHT"] == str(
+                orch.SYNREG_AUTOGLUON_MAX_IN_FLIGHT_DEFAULT
+            )
+            assert job.env_vars["BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES"] == str(
+                orch.SYNREG_AUTOGLUON_MIN_TMP_FREE_BYTES_DEFAULT
+            )
+            assert job.env_vars["BENCHMARK_CPU_MAX_PROCESSED_FEATURES"] == str(
+                orch.SYNREG_AUTOGLUON_MAX_FEATURES_DEFAULT
+            )
+            assert job.env_vars["BENCHMARK_CPU_MAX_MATRIX_BYTES"] == str(
+                orch.SYNREG_AUTOGLUON_MAX_MATRIX_BYTES_DEFAULT
+            )
+            assert job.env_vars["BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES"] == str(
+                orch.SYNREG_AUTOGLUON_MAX_DATASET_BYTES_DEFAULT
+            )
+
+    def test_combined_autogluon_default_single_wave_waits_once(self, collector, fake_session):
+        batch_sizes = []
+
+        def _mock_wait_group(labeled_jobs, session):
+            batch_sizes.append(len(labeled_jobs))
+
+        with _patch_submit(collector):
+            with patch("run_synthetic_regression_evaluation._wait_job_group",
+                       side_effect=_mock_wait_group):
+                orch.run_synthetic_regression_combined_autogluon_evaluation(fake_session)
+
+        assert batch_sizes == [orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT]
+
+    def test_combined_autogluon_lower_concurrent_clusters_fails_fast(self, fake_session):
+        with pytest.raises(ValueError) as exc:
+            orch.run_synthetic_regression_combined_autogluon_evaluation(
+                fake_session,
+                autogluon_cluster_shards=6,
+                autogluon_concurrent_clusters=3,
+            )
+
+        msg = str(exc.value)
+        assert "run_synthetic_regression_combined_autogluon_evaluation" in msg
+        assert "AUTOGLUON_CONCURRENT_CLUSTERS=3" in msg
+        assert "AUTOGLUON_CLUSTER_SHARDS=6" in msg
+        assert orch.AUTOGLUON_CPU_POOL in msg
+
+    def test_ray_entrypoint_uses_snowflake_ray_cluster_and_memory_preflight(self):
+        text = (ROOT / "scripts" / "evaluate_synthetic_regression_autogluon_ray.py").read_text()
+        assert 'ray.init(\n        address="auto"' in text
+        assert "ray.nodes()" in text
+        assert "SYNREG_AUTOGLUON_WORKERS_PER_SHARD" in text
+        assert "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES" in text
+        assert "ray.put(dataset_payload)" in text
+        assert text.index("dataset_bytes = _dataset_payload_nbytes") < text.index(
+            "ray.put(dataset_payload)"
+        )
 
     def test_combined_aggregation_submits_agg_job(self, collector, fake_session):
         """Combined agg phase submits 1 job with SYNREG_OUTPUT_STAGE=COMBINED_OUTPUT_STAGE."""

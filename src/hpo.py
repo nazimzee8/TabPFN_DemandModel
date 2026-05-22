@@ -34,6 +34,10 @@ TRIAL_MAX_EPOCHS      = 30   # max epochs per HPO trial (early stopping via PATI
 ARCH_D_PHI_CANDIDATES      = [64, 128, 192, 256]
 ARCH_N_SAB_FEAT_CANDIDATES = [1, 2]
 
+# Gate hidden dim candidates — each requires its own pretrain checkpoint.
+# Must match the tune.choice([...]) values in the ridge_residual search space.
+GATE_HIDDEN_DIM_CANDIDATES = [32, 64, 128]
+
 # MODEL3 runtime selectors — propagated to HPO workers via env vars.
 # MODEL_ARCH_VERSION is hardcoded to "model3".
 MODEL_ARCH_VERSION = "model3"
@@ -151,28 +155,43 @@ def _merge_sweep_configs(baseline_config, arch_config):
 
 # ── pretrain checkpoint check ─────────────────────────────────────────────────
 
-def _check_pretrain_checkpoint():
-    """Return @MODEL_STAGE/checkpoints/pretrain.pt or fail before HPO trials."""
-    stage_path = "@MODEL_STAGE/checkpoints/pretrain.pt"
+def _check_pretrain_checkpoints():
+    """Return {32: stage_path, 64: stage_path, 128: stage_path} or fail before HPO trials.
+
+    Requires one pretrain_gate<N>.pt per GATE_HIDDEN_DIM_CANDIDATES entry.
+    Call CALL run_pretrain_pipeline(..., gate_hidden_dim) for each candidate first.
+    """
+    from snowflake.snowpark import Session
+    session = Session.builder.getOrCreate()
     try:
-        from snowflake.snowpark import Session
-        session = Session.builder.getOrCreate()
         rows = session.sql("LIST @MODEL_STAGE/checkpoints/").collect()
     except Exception as exc:
         raise RuntimeError(
-            "[HPO] Could not verify mandatory pretrain checkpoint at "
-            f"{stage_path}: {exc}"
+            f"[HPO] Could not verify mandatory pretrain checkpoints: {exc}"
         ) from exc
 
-    if any(str(r[0]).rstrip("/").endswith("/pretrain.pt") for r in rows):
-        print(f"[HPO] Pretrain checkpoint found: {stage_path}", flush=True)
-        return stage_path
+    found_names = {str(r[0]).rstrip("/").rsplit("/", 1)[-1] for r in rows}
+    checkpoint_map = {}
+    missing = []
+    for gate_dim in GATE_HIDDEN_DIM_CANDIDATES:
+        filename = f"pretrain_gate{gate_dim}.pt"
+        stage_path = f"@MODEL_STAGE/checkpoints/{filename}"
+        if filename in found_names:
+            checkpoint_map[gate_dim] = stage_path
+            print(f"[HPO] Pretrain checkpoint found: {stage_path}", flush=True)
+        else:
+            missing.append(filename)
 
-    raise FileNotFoundError(
-        "[HPO] Mandatory pretrain checkpoint is missing. Expected "
-        f"{stage_path}. Run CALL run_pretrain_pipeline() before HPO and verify "
-        "with: LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain[.]pt';"
-    )
+    if missing:
+        raise FileNotFoundError(
+            f"[HPO] Mandatory pretrain checkpoints missing: {missing}. "
+            "Run CALL run_pretrain_pipeline(MODEL_FAMILY, TRAINING_DATA_FAMILY, "
+            "MODEL_DESIGN_PATTERN, gate_hidden_dim) for each candidate before HPO. "
+            f"Expected files: {[f'pretrain_gate{d}.pt' for d in GATE_HIDDEN_DIM_CANDIDATES]}. "
+            "Verify with: LIST @MODEL_STAGE/checkpoints/;"
+        )
+
+    return checkpoint_map
 
 
 # ── metadata / cardinality helpers (no heavy imports) ────────────────────────
@@ -397,13 +416,21 @@ def _download_pretrain_checkpoint_on_driver(stage_path, local_root):
     from snowflake.snowpark import Session
 
     os.makedirs(local_root, exist_ok=True)
-    local_path = os.path.join(local_root, "pretrain.pt")
+    # Derive expected local filename from the stage path
+    expected_filename = stage_path.rsplit("/", 1)[-1]  # e.g. "pretrain_gate64.pt"
+    local_path = os.path.join(local_root, expected_filename)
     session = Session.builder.getOrCreate()
     session.file.get(stage_path, local_root)
     if not os.path.exists(local_path):
+        # session.file.get may rename; try glob variants of the expected name
         candidates = sorted(_glob.glob(local_path + "*"))
         if candidates:
             local_path = candidates[0]
+    if not os.path.exists(local_path):
+        # Last resort: any .pt file present in the directory
+        all_pts = sorted(_glob.glob(os.path.join(local_root, "*.pt")))
+        if all_pts:
+            local_path = all_pts[0]
     if not os.path.exists(local_path):
         raise FileNotFoundError(
             f"[HPO driver] Failed to download mandatory pretrain checkpoint "
@@ -412,7 +439,12 @@ def _download_pretrain_checkpoint_on_driver(stage_path, local_root):
     return local_path
 
 
-def _prepare_hpo_payload_on_driver(hpo_rows, pretrain_checkpoint_path):
+def _prepare_hpo_payload_on_driver(hpo_rows, checkpoint_map):
+    """Materialise HPO data and load all gate-specific pretrain checkpoints.
+
+    checkpoint_map: {gate_dim: stage_path} as returned by _check_pretrain_checkpoints().
+    Returns (payload, gate_ckpt_map) where gate_ckpt_map: {gate_dim: checkpoint_dict}.
+    """
     from snowflake_io import materialize_indexed_meta_dataset
     from train import load_parquet
 
@@ -447,18 +479,24 @@ def _prepare_hpo_payload_on_driver(hpo_rows, pretrain_checkpoint_path):
             f"{counts}; expected {HPO_SPLIT_LIMITS}"
         )
 
-    local_checkpoint = _download_pretrain_checkpoint_on_driver(
-        pretrain_checkpoint_path,
-        "/tmp/hpo_driver_pretrain",
-    )
+    gate_ckpt_map = {}
+    for gate_dim, stage_path in checkpoint_map.items():
+        local_root = f"/tmp/hpo_driver_pretrain_{gate_dim}"
+        local_checkpoint = _download_pretrain_checkpoint_on_driver(stage_path, local_root)
+        checkpoint = _load_torch_checkpoint_cpu(local_checkpoint)
+        gate_ckpt_map[gate_dim] = checkpoint
+        print(
+            f"[HPO driver] loaded pretrain checkpoint gate_hidden_dim={gate_dim}:",
+            {"stage_path": stage_path, "local_path": local_checkpoint},
+            flush=True,
+        )
+
     print(
-        "[HPO driver] downloaded pretrain checkpoint:",
-        {"stage_path": pretrain_checkpoint_path, "local_path": local_checkpoint},
+        f"[HPO driver] loaded {len(gate_ckpt_map)} gate pretrain checkpoints: "
+        f"{sorted(gate_ckpt_map.keys())}",
         flush=True,
     )
-    checkpoint = _load_torch_checkpoint_cpu(local_checkpoint)
-    print("[HPO driver] loaded pretrain checkpoint on CPU", flush=True)
-    return payload, checkpoint
+    return payload, gate_ckpt_map
 
 
 def _report_hpo_metric(metrics):
@@ -572,8 +610,13 @@ def build_hpo_search_space(tune, baseline_config=None) -> dict:
 
 # ── Ray Tune trainable ────────────────────────────────────────────────────────
 
-def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
-    """Return a Ray Tune function trainable over Ray object-store payloads."""
+def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_map_ref):
+    """Return a Ray Tune function trainable over Ray object-store payloads.
+
+    pretrain_ckpt_map_ref: Ray object store ref to {gate_dim: checkpoint_dict}.
+    Each trial selects the checkpoint matching its sampled gate_hidden_dim.
+    A mismatch is a hard error (not a cold-start fallback).
+    """
     def ray_trainable(config):
         import sys
         import torch
@@ -603,7 +646,6 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
         use_huber        = bool(config.get("use_huber",        False))
         huber_delta      = float(config.get("huber_delta",    1.0))
         lambda_l1        = float(config.get("lambda_l1",      0.0))
-        hpo_sweep_mode   = str(config.get("hpo_sweep_mode",   "ridge_residual"))
 
         device  = "cuda" if torch.cuda.is_available() else "cpu"
         use_amp = device == "cuda"
@@ -619,7 +661,7 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
         )
 
         hpo_payload = ray.get(hpo_data_ref)
-        pretrain_ckpt = ray.get(pretrain_ckpt_ref)
+        pretrain_ckpt_map = ray.get(pretrain_ckpt_map_ref)
         train_records = hpo_payload.get("train", [])
         val_records   = hpo_payload.get("val",   [])
         record_counts = {"train": len(train_records), "val": len(val_records)}
@@ -634,6 +676,15 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
                 f"found {record_counts}"
             )
 
+        # Select the pretrain checkpoint matching this trial's gate_hidden_dim
+        if gate_hidden_dim not in pretrain_ckpt_map:
+            raise RuntimeError(
+                f"[HPO trial] No pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}. "
+                f"Available gate dims: {sorted(pretrain_ckpt_map.keys())}. "
+                "Run CALL run_pretrain_pipeline(..., gate_hidden_dim) for all candidates."
+            )
+        pretrain_ckpt = pretrain_ckpt_map[gate_hidden_dim]
+
         cfg = ModelConfig(
             d_phi=d_phi, d_rho=d_rho, pool=pool,
             n_heads=N_HEADS, n_sab_feat=n_sab_feat,
@@ -645,29 +696,27 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref):
             ridge_lambda=ridge_lambda,
             gate_hidden_dim=gate_hidden_dim,
         )
-        model     = _instantiate_model(cfg).to(device)
+        model = _instantiate_model(cfg).to(device)
 
         if not pretrain_ckpt:
-            raise RuntimeError("[HPO trial] Missing mandatory pretrain checkpoint payload")
+            raise RuntimeError(
+                f"[HPO trial] Missing mandatory pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}"
+            )
         _saved_cfg = pretrain_ckpt.get("cfg")
         _arch_mismatches = checkpoint_architecture_mismatches(_saved_cfg, cfg)
         if _arch_mismatches:
-            if hpo_sweep_mode == "architecture":
-                print(
-                    f"[HPO trial] architecture sweep: pretrain checkpoint mismatch "
-                    f"({_arch_mismatches}); starting this trial from scratch.",
-                    flush=True,
-                )
-            else:
-                raise RuntimeError(
-                    f"[HPO trial] Pretrain checkpoint architecture mismatch: "
-                    f"{_arch_mismatches}; saved={_saved_cfg}, current={cfg}. "
-                    "Fix the architecture or run with HPO_SWEEP_MODE='architecture' "
-                    "to allow cold-start trials on mismatch."
-                )
-        else:
-            model.load_state_dict(pretrain_ckpt["state_dict"])
-            print("[HPO trial] Loaded pretrain checkpoint from Ray object store.", flush=True)
+            raise RuntimeError(
+                f"[HPO trial] Pretrain checkpoint architecture mismatch for "
+                f"gate_hidden_dim={gate_hidden_dim}: {_arch_mismatches}; "
+                f"saved={_saved_cfg}, current={cfg}. "
+                f"The pretrain_gate{gate_hidden_dim}.pt checkpoint must exactly "
+                "match the trial architecture (d_phi, gate_hidden_dim, etc.)."
+            )
+        model.load_state_dict(pretrain_ckpt["state_dict"])
+        print(
+            f"[HPO trial] Loaded pretrain_gate{gate_hidden_dim}.pt from Ray object store.",
+            flush=True,
+        )
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         scaler    = torch.cuda.amp.GradScaler(enabled=False)   # BF16 needs no loss scaling
@@ -737,7 +786,22 @@ def main():
     print("hpo.py: all imports OK", flush=True)
 
     # ── Ray cluster initialization ────────────────────────────────────────────
-    pretrain_checkpoint_path = _check_pretrain_checkpoint()
+    # Gate-specific pretrain checkpoints are required for ridge_residual mode.
+    # Architecture sweep uses cold-start (allow_cold_start_on_arch_mismatch) so
+    # gate-specific checkpoints are optional; an empty map means all trials cold-start.
+    if HPO_SWEEP_MODE == "ridge_residual":
+        checkpoint_map = _check_pretrain_checkpoints()
+    else:
+        # architecture sweep: gate checkpoints optional; cold-start on mismatch
+        try:
+            checkpoint_map = _check_pretrain_checkpoints()
+        except FileNotFoundError:
+            checkpoint_map = {}
+            print(
+                "[HPO architecture] No gate-specific pretrain checkpoints found; "
+                "all trials will cold-start (PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch).",
+                flush=True,
+            )
 
     # ── metadata selection ────────────────────────────────────────────────────
     hpo_rows           = select_hpo_index_rows()
@@ -781,9 +845,9 @@ def main():
         baseline_config = _load_baseline_config_from_stage(HPO_BASELINE_CONFIG_STAGE_PATH)
         print("[HPO driver] loaded baseline config from", HPO_BASELINE_CONFIG_STAGE_PATH, flush=True)
 
-    hpo_payload, pretrain_ckpt = _prepare_hpo_payload_on_driver(
+    hpo_payload, gate_ckpt_map = _prepare_hpo_payload_on_driver(
         hpo_rows,
-        pretrain_checkpoint_path,
+        checkpoint_map,
     )
 
     # address="auto" connects to the Ray cluster that submit_from_stage() already
@@ -801,8 +865,12 @@ def main():
         )
 
     hpo_data_ref = ray.put(hpo_payload)
-    pretrain_ckpt_ref = ray.put(pretrain_ckpt)
-    print("[HPO driver] published HPO payload and pretrain checkpoint to Ray object store", flush=True)
+    pretrain_ckpt_map_ref = ray.put(gate_ckpt_map)
+    print(
+        "[HPO driver] published HPO payload and gate pretrain checkpoint map to Ray object store:",
+        {"gate_dims": sorted(gate_ckpt_map.keys())},
+        flush=True,
+    )
     _run_ray_object_store_preflight(ray)
 
     # ── Guard: HPO only supports inductive training ────────────────────────────
@@ -851,7 +919,7 @@ def main():
     # tune.run() functional API: stable across Ray 1.x and 2.x.
     # FIFO scheduler + no search_alg = random sampling, matching prior RandomSearch behavior.
     # resources_per_trial={"gpu": 1}: Ray uses lowercase keys.
-    trainable = _build_ray_trainable(hpo_data_ref, pretrain_ckpt_ref)
+    trainable = _build_ray_trainable(hpo_data_ref, pretrain_ckpt_map_ref)
     analysis = tune.run(
         trainable,
         config=search_space,
@@ -899,12 +967,15 @@ def main():
         "hpo_sweep_mode":       HPO_SWEEP_MODE,
 
         "_meta": {
-            "best_val_mse":              float(best_val_mse) if best_val_mse is not None else None,
-            "num_trials":                NUM_TRIALS,
-            "trial_max_epochs":          TRIAL_MAX_EPOCHS,
-            "pretrain_warm_start_policy": (
-                "cold_start_on_mismatch" if HPO_SWEEP_MODE == "architecture"
-                else "fail_on_mismatch"
+            "best_val_mse":               float(best_val_mse) if best_val_mse is not None else None,
+            "num_trials":                 NUM_TRIALS,
+            "trial_max_epochs":           TRIAL_MAX_EPOCHS,
+            "pretrain_warm_start_policy": "fail_on_mismatch",
+            "pretrain_checkpoint_map": {
+                str(gate_dim): path for gate_dim, path in checkpoint_map.items()
+            },
+            "pretrain_checkpoint_stage_path": checkpoint_map.get(
+                int(best_config_raw.get("gate_hidden_dim", 64)), ""
             ),
         },
     }

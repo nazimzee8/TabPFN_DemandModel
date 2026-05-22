@@ -336,3 +336,155 @@ def test_default_use_ridge_expert_is_true():
     assert cfg.use_ridge_expert is True, (
         f"Expected use_ridge_expert=True by default, got {cfg.use_ridge_expert}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision / dtype safety (fix for bfloat16 AMP dtype mismatch)
+# ---------------------------------------------------------------------------
+
+class TestRidgeExpertMixedPrecision:
+    """
+    Regression tests for the AMP dtype mismatch fix.
+
+    Under torch.autocast(bfloat16), X_norm, y_norm, and xq_norm can arrive
+    with different dtypes (e.g. X_norm fp32, y_norm bf16). Before the fix,
+    torch.linalg.solve(A, b) raised RuntimeError due to mismatched dtypes.
+
+    Policy verified here:
+      - solve always runs in float32
+      - output dtype matches x_test_norm.dtype (downstream-compatible)
+      - output shape is unchanged
+    """
+
+    def _make_inputs(self, n, p, m, X_dtype, y_dtype, xq_dtype, device="cpu"):
+        torch.manual_seed(42)
+        X  = torch.randn(n, p, dtype=X_dtype,  device=device)
+        y  = torch.randn(n,    dtype=y_dtype,   device=device)
+        xq = torch.randn(m, p, dtype=xq_dtype,  device=device)
+        return X, y, xq
+
+    # ---- 1. all-fp32 -------------------------------------------------------
+
+    def test_all_fp32_primal(self):
+        """All-fp32 inputs, primal path (n >= p)."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(50, 5, 6,
+                                      torch.float32, torch.float32, torch.float32)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.float32
+
+    def test_all_fp32_dual(self):
+        """All-fp32 inputs, dual path (n < p)."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(5, 50, 6,
+                                      torch.float32, torch.float32, torch.float32)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.float32
+
+    # ---- 2. all-bf16 -------------------------------------------------------
+
+    def test_all_bf16_primal(self):
+        """All-bf16 inputs, primal path — solve must not raise dtype mismatch."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(50, 5, 6,
+                                      torch.bfloat16, torch.bfloat16, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.bfloat16, (
+            f"Output must be bfloat16 to match x_test_norm.dtype, got {out.dtype}"
+        )
+
+    def test_all_bf16_dual(self):
+        """All-bf16 inputs, dual path — solve must not raise dtype mismatch."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(5, 50, 6,
+                                      torch.bfloat16, torch.bfloat16, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.bfloat16
+
+    # ---- 3. mixed dtypes (the actual failure scenario) ---------------------
+
+    def test_mixed_X_fp32_y_bf16_primal(self):
+        """X_norm=fp32, y_norm=bf16, xq=bf16 — the scenario that triggered the bug."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(50, 5, 6,
+                                      torch.float32, torch.bfloat16, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.bfloat16
+
+    def test_mixed_X_fp32_y_bf16_dual(self):
+        """X_norm=fp32, y_norm=bf16, xq=bf16 — dual path."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(5, 50, 6,
+                                      torch.float32, torch.bfloat16, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.bfloat16
+
+    def test_mixed_X_bf16_y_fp32_primal(self):
+        """X_norm=bf16, y_norm=fp32 — opposite mixed case."""
+        ridge = RidgeExpert()
+        X, y, xq = self._make_inputs(50, 5, 6,
+                                      torch.bfloat16, torch.float32, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (6,)
+        assert out.dtype == torch.bfloat16
+
+    def test_output_dtype_tracks_xq(self):
+        """Output dtype always equals x_test_norm.dtype, regardless of X/y dtypes."""
+        ridge = RidgeExpert()
+        for xq_dtype in (torch.float32, torch.bfloat16):
+            X, y, xq = self._make_inputs(20, 4, 5,
+                                          torch.float32, torch.bfloat16, xq_dtype)
+            out = ridge.predict(X, y, xq, lam=0.5)
+            assert out.dtype == xq_dtype, (
+                f"Expected output dtype {xq_dtype}, got {out.dtype}"
+            )
+
+    def test_shape_unchanged_under_mixed_dtype(self):
+        """Output shape (m,) is preserved regardless of input dtypes."""
+        ridge = RidgeExpert()
+        n, p, m = 30, 8, 7
+        X, y, xq = self._make_inputs(n, p, m,
+                                      torch.float32, torch.bfloat16, torch.bfloat16)
+        out = ridge.predict(X, y, xq, lam=1.0)
+        assert out.shape == (m,), f"Expected ({m},), got {out.shape}"
+
+    # ---- 4. CUDA autocast path (skipped when no GPU) -----------------------
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_autocast_bf16_primal(self):
+        """Inside torch.amp.autocast(bfloat16), predict() must not raise."""
+        ridge = RidgeExpert()
+        torch.manual_seed(0)
+        n, p, m = 50, 5, 6
+        X  = torch.randn(n, p).cuda()
+        y  = torch.randn(n).cuda()
+        xq = torch.randn(m, p).cuda()
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = ridge.predict(X, y, xq, lam=1.0)
+
+        assert out.shape == (m,)
+        # Under autocast the inputs become bf16, so output should be bf16
+        assert out.dtype == torch.bfloat16
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_autocast_bf16_dual(self):
+        """Dual path inside torch.amp.autocast(bfloat16) must not raise."""
+        ridge = RidgeExpert()
+        torch.manual_seed(1)
+        n, p, m = 5, 50, 6
+        X  = torch.randn(n, p).cuda()
+        y  = torch.randn(n).cuda()
+        xq = torch.randn(m, p).cuda()
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            out = ridge.predict(X, y, xq, lam=1.0)
+
+        assert out.shape == (m,)
+        assert out.dtype == torch.bfloat16

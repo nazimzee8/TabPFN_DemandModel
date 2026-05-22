@@ -245,18 +245,34 @@ class RidgeExpert:
             lam          : float  — ridge regularisation λ (must be > 0)
 
         Returns:
-            (m,) float tensor — ridge predictions
+            (m,) float tensor — ridge predictions cast back to x_test_norm.dtype
         """
-        n, p = X_norm.shape
-        kw = dict(device=X_norm.device, dtype=X_norm.dtype)
-        if n >= p:
-            A    = X_norm.T @ X_norm + lam * torch.eye(p, **kw)
-            beta = torch.linalg.solve(A, X_norm.T @ y_norm)   # (p,)
-        else:
-            K     = X_norm @ X_norm.T + lam * torch.eye(n, **kw)
-            alpha = torch.linalg.solve(K, y_norm)              # (n,)
-            beta  = X_norm.T @ alpha                           # (p,)
-        return x_test_norm @ beta                              # (m,)
+        original_dtype = x_test_norm.dtype
+        device_type = X_norm.device.type
+
+        # Disable AMP locally so torch.linalg.solve always receives matching
+        # float32 tensors.  Mixed-precision inference (bfloat16) on the
+        # DeepSet / encoder / SAB path is unaffected — only this closed-form
+        # solve runs in float32.
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            X  = X_norm.to(dtype=torch.float32)
+            y  = y_norm.to(dtype=torch.float32)
+            xq = x_test_norm.to(dtype=torch.float32)
+
+            n, p = X.shape
+            kw = dict(device=X.device, dtype=torch.float32)
+
+            if n >= p:
+                A    = X.T @ X + lam * torch.eye(p, **kw)
+                beta = torch.linalg.solve(A, X.T @ y)   # (p,)
+            else:
+                K     = X @ X.T + lam * torch.eye(n, **kw)
+                alpha = torch.linalg.solve(K, y)          # (n,)
+                beta  = X.T @ alpha                        # (p,)
+
+            pred = xq @ beta                               # (m,)
+
+        return pred.to(dtype=original_dtype)
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,11 @@ if DEFAULT_HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
     )
 
 
+def _get_session():
+    from snowflake.snowpark import Session
+    return Session.builder.getOrCreate()
+
+
 def _wait_done(job, label):
     try:
         job.wait()
@@ -125,8 +130,9 @@ def _run_hpo_impl(
     )
 
 
-def run_hpo_pipeline(session) -> str:
+def run_hpo_pipeline() -> str:
     """Zero-arg entrypoint: uses env-var defaults including DEFAULT_HPO_SWEEP_MODE."""
+    session = _get_session()
     return _run_hpo_impl(
         session,
         DEFAULT_MODEL_FAMILY,
@@ -138,7 +144,6 @@ def run_hpo_pipeline(session) -> str:
 
 
 def run_hpo_pipeline_model(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -154,6 +159,7 @@ def run_hpo_pipeline_model(
             'inductive_forecasting'
         );
     """
+    session = _get_session()
     return _run_hpo_impl(
         session,
         model_family,
@@ -165,7 +171,6 @@ def run_hpo_pipeline_model(
 
 
 def run_hpo_pipeline_model_sweep(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -197,6 +202,7 @@ def run_hpo_pipeline_model_sweep(
             f"Invalid HPO_SWEEP_MODE={_mode!r}. "
             f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
         )
+    session = _get_session()
     return _run_hpo_impl(
         session,
         model_family,
@@ -208,7 +214,6 @@ def run_hpo_pipeline_model_sweep(
 
 
 def run_hpo_pipeline_model_sweep_with_baseline(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -236,6 +241,7 @@ def run_hpo_pipeline_model_sweep_with_baseline(
             f"Invalid HPO_SWEEP_MODE={_mode!r}. "
             f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
         )
+    session = _get_session()
     return _run_hpo_impl(
         session,
         model_family,

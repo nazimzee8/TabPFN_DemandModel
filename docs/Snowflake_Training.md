@@ -19,74 +19,64 @@ written back to Snowflake.
 5. **Call `build_meta_dataset_index()`**. This submits a CPU MLJob that lists staged synthetic parquet, reads scalar metadata inside Snowflake, rebuilds `META_DATASET_INDEX`, and validates `train=800`, `val=100`, `test=100`.
 6. **Optionally call `download_kaggle_to_stage()`**. This submits an MLJob that receives Kaggle credentials at runtime and stages raw Kaggle benchmark inputs under `@META_DATASET_STAGE/kaggle/`.
 7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_DATASET_STAGE/benchmark_prepared/`.
-8. **Call `run_pretrain_pipeline()`**. Pretrain writes mandatory
-   `@MODEL_STAGE/checkpoints/pretrain.pt`; verify it before HPO starts.
-9. **Call `run_hpo_pipeline()` — two-sweep strategy (recommended)**. HPO requires `pretrain.pt`
-   and produces sweep-specific output files plus a merged `best_config.json`.
+8. **Run gate-specific pretrain jobs** — one per `gate_hidden_dim` candidate (32, 64, 128).
+   HPO tunes `gate_hidden_dim` across all three; each HPO trial warm-starts from its matching
+   `pretrain_gate<N>.pt`. All three checkpoints must exist before HPO starts.
 
-   **Sweep 1 — ridge_residual (run first):**
+   ```sql
+   CALL run_pretrain_pipeline(
+       'market_exchangeable_icl', 'synthetic_regression_combined',
+       'inductive_forecasting', 32
+   );
+   CALL run_pretrain_pipeline(
+       'market_exchangeable_icl', 'synthetic_regression_combined',
+       'inductive_forecasting', 64
+   );
+   CALL run_pretrain_pipeline(
+       'market_exchangeable_icl', 'synthetic_regression_combined',
+       'inductive_forecasting', 128
+   );
+   LIST @MODEL_STAGE/checkpoints/ PATTERN='.*pretrain_gate.*[.]pt';
+   ```
+
+   Each job writes `@MODEL_STAGE/checkpoints/pretrain_gate<N>.pt` with the gate MLP of
+   the matching width. Verify all three exist before starting HPO.
+
+9. **Call `run_hpo_pipeline()` — ridge_residual sweep (single sweep, production-ready).**
+   HPO requires all three gate-specific pretrain checkpoints and samples `gate_hidden_dim` across
+   them. Fixed architecture: `d_phi=128`, `n_sab_feat=1` (not tuned in this release).
+
    ```sql
    CALL run_hpo_pipeline(
        'market_exchangeable_icl', 'synthetic_regression_combined',
        'inductive_forecasting', 'ridge_residual'
    );
+   SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
    ```
-   Writes `@MODEL_STAGE/hpo/best_config_ridge_residual.json` and (same content)
-   `@MODEL_STAGE/hpo/best_config.json`. Fixed architecture (`d_phi=128`, `n_sab_feat=1`);
-   tunes `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim`, `use_huber`,
-   `huber_delta`, `lambda_l1`. Fails the trial on pretrain checkpoint mismatch.
 
-   **MODEL3 DDP Memory Probe (mandatory gate before architecture sweep):**
-   Run at worst-case shape before architecture HPO. Failure must stop the pipeline.
-   ```sql
-   CALL run_model_ddp_memory_probe(
-       'model3', 'inductive_forecasting', 'market_exchangeable_icl',
-       200, 128, 128, 256, 2, TRUE
-   );
-   ```
-   Probe shape: `d_phi=256` (max), `n_blocks=2` (max) — covers all ARCH_D_PHI_CANDIDATES and
-   ARCH_N_SAB_FEAT_CANDIDATES. Use `RUN_BACKWARD=TRUE` (MODEL3 trains with backprop; forward-only
-   understates peak memory). Results at `@MODEL_STAGE/diagnostics/model_ddp_memory_probe.json`.
+   Tuned parameters: `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim`,
+   `use_huber`, `huber_delta`, `lambda_l1`. Fails hard on pretrain checkpoint mismatch.
 
-   **Sweep 2 — architecture (run after probe passes):**
-   ```sql
-   CALL run_hpo_pipeline(
-       'market_exchangeable_icl', 'synthetic_regression_combined',
-       'inductive_forecasting', 'architecture',
-       '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
-   );
-   ```
-   Requires `HPO_BASELINE_CONFIG_STAGE_PATH` pointing to `best_config_ridge_residual.json` from
-   sweep 1. Freezes all optimizer/regularization params from baseline; tunes only
-   `d_phi ∈ {64,128,192,256}` and `n_sab_feat ∈ {1,2}`. Writes:
-   - `best_config_architecture.json` — architecture sweep winner.
-   - `best_config.json` — **merged**: `d_phi`/`n_sab_feat` from sweep 2, all other params from
-     sweep 1. `_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture` record provenance.
+   Writes `@MODEL_STAGE/hpo/best_config.json` with `_meta.pretrain_checkpoint_stage_path`
+   recording which `pretrain_gate<N>.pt` the winning trial used.
 
-   **HPO stage outputs summary:**
-   | File | When written |
-   |------|-------------|
-   | `best_config_ridge_residual.json` | After sweep 1 |
-   | `best_config.json` (= sweep 1) | After sweep 1 |
-   | `best_config_architecture.json` | After sweep 2 |
-   | `best_config.json` (merged) | After sweep 2 |
+   **Architecture HPO (`HPO_SWEEP_MODE=architecture`) is intentionally disabled for this
+   release.** Architecture is fixed at `d_phi=128`, `n_sab_feat=1`. Re-enable only after
+   adding matching pretrain checkpoint matrices for every `d_phi`/`n_sab_feat` candidate.
 
-   `best_config.json` always has: `lr`, `weight_decay`, `d_phi`, `d_rho`, `dropout`, `pool`,
-   `n_sab_feat`, `use_ridge_expert` (always `true`), `ridge_lambda`, `gate_hidden_dim`,
-   `use_huber`, `huber_delta`, `lambda_l1`, `hpo_sweep_mode`, and a `_meta` block.
+10. **Call `run_model_training()`**. Reads `best_config.json` from `@MODEL_STAGE/hpo/` and
+    resolves the pretrain checkpoint strictly — no cold-start, no legacy fallback:
+    - Preferred: `best_config._meta.pretrain_checkpoint_stage_path` (set by HPO).
+    - Fallback: `@MODEL_STAGE/checkpoints/pretrain_gate<gate_hidden_dim>.pt`.
+    - Raises `FileNotFoundError` before job submission if no valid checkpoint is found.
 
-10. **Call `run_model_training()`**. Training consumes `best_config.json` through `BEST_CONFIG`
-    and writes `@MODEL_STAGE/checkpoints/best.pt`. The saved checkpoint `metadata` includes
-    `best_val_mse`, `train_mse_at_best`, `best_epoch`, `pretrain_loaded`, `pretrain_policy`, and
-    (when a mismatch occurred) `pretrain_mismatch_reason`.
+    Always uses `PRETRAIN_LOAD_POLICY=require_match` — raises `RuntimeError` on any
+    architecture mismatch. Writes `@MODEL_STAGE/checkpoints/best.pt` (v4 format).
 
-    **Pretrain Checkpoint Policy (`PRETRAIN_LOAD_POLICY`):** set automatically by
-    `run_model_training_job.py` based on `best_config.hpo_sweep_mode`:
-    - `ridge_residual` → `require_match`: raises RuntimeError on architecture mismatch (fail-fast).
-    - `architecture` → `allow_cold_start_on_arch_mismatch`: logs warning and cold-starts if the
-      pretrain checkpoint's architecture differs from the merged best config. This allows the new
-      `d_phi`/`n_sab_feat` from sweep 2 to differ from the pretrain checkpoint.
-11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/;`.
+    The saved checkpoint `metadata` includes `best_val_mse`, `train_mse_at_best`,
+    `best_epoch`, `pretrain_loaded`, `pretrain_policy`.
+
+11. **Verify `best.pt`** with `LIST @MODEL_STAGE/checkpoints/ PATTERN='.*best[.]pt';`.
 12. **Run evaluation** — two options depending on Snowflake account node quota:
     - **Split-phase (recommended under tight quota)**: call each phase independently
       and suspend its pool before starting the next (see *Split-Phase Evaluation Under
@@ -576,7 +566,8 @@ Resource split:
   (`linear_all_v1`) default: 6 logical work-item clusters × 4 target instances = up to 24 concurrent
   CPU_X64_M nodes. Each cluster runs `evaluate_synthetic_regression_autogluon_ray.py` with Ray
   distributing independent dataset/seed/condition work items. Main and OOD suites use legacy
-  single-node sharded paths (`evaluate_synthetic_regression.py`).
+  single-node sharded paths (`evaluate_synthetic_regression.py`), so the pool remains capped at
+  60 nodes to support those strict single-wave runs.
 
 Evaluation dependency checks are method-aware. The shared prepared-benchmark
 path requires scikit-learn for splitting, preprocessing, and metrics for
@@ -2326,11 +2317,18 @@ single-node path used by the main and OOD suites.
 | `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | 6 | Number of logical shard files written |
 | `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` | 4 | `target_instances` per MLJob cluster |
 | `AUTOGLUON_TASK_CPUS` | 1 | CPUs per individual AutoGluon fit task |
-| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Max simultaneous MLJob clusters |
+| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Required single-wave MLJob clusters; must equal cluster shards |
+| `SYNREG_AUTOGLUON_MAX_IN_FLIGHT` | 4 | Max Ray work items submitted before collecting results |
+| `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES` | 5368709120 | Per-task `/tmp` free-space guard before fitting |
+| `BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES` | 2147483648 | Driver-side raw dataset payload guard before `ray.put` |
+| `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` | 512 | Per-task processed feature cap |
+| `BENCHMARK_CPU_MAX_MATRIX_BYTES` | 2147483648 | Per-task train+holdout matrix byte cap |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
 | `SYNREG_AUTOGLUON_ENTRYPOINT` | `evaluate_synthetic_regression_autogluon_ray.py` | Entrypoint |
 
-Each MLJob cluster runs the Ray entrypoint. The driver process:
+Each MLJob cluster runs the Ray entrypoint. The entrypoint calls `ray.init(address="auto")`
+to attach to the Snowflake-provisioned multi-node Ray cluster and fails before writing a
+CSV if fewer than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` Ray nodes are alive. The driver process:
 1. Loads `SYNTHETIC_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
 2. Expands rows to explicit `(dataset, split_seed, condition)` work items
 3. Assigns this cluster's shard using `assign_synthetic_regression_shard(items, shard_index, num_shards)`
@@ -2347,10 +2345,11 @@ Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CL
 -- Step 0: Stage updated scripts (SnowSQL only)
 -- PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/evaluate_synthetic_regression_autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://src/evaluate_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- Verify:
--- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|evaluate_synthetic_regression_autogluon_ray|capacity_probe)[.]py';
+-- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|evaluate_synthetic_regression_autogluon_ray|capacity_probe|ray_capacity_probe)[.]py';
 
 -- Step 1: Capacity probes (verify node envelope before evaluation)
 CALL run_synthetic_regression_combined_baseline_capacity_probe(

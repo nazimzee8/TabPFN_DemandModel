@@ -112,8 +112,9 @@ def _call_probe(monkeypatch=None, **override_kwargs):
     session = _make_session()
     with patch("run_model_training_job.submit_from_stage", side_effect=_make_fake_submit(jobs)), \
          patch("run_model_training_job._wait_done"), \
-         patch("run_model_training_job._list_stage", return_value=[]):
-        result = run_model_training_job.run_model_ddp_memory_probe(session, **defaults)
+         patch("run_model_training_job._list_stage", return_value=[]), \
+         patch("run_model_training_job._get_session", return_value=session):
+        result = run_model_training_job.run_model_ddp_memory_probe(**defaults)
     return jobs, result
 
 
@@ -194,9 +195,9 @@ class TestLauncherEnvVars:
 
         with patch("run_model_training_job.submit_from_stage", side_effect=_capture), \
              patch("run_model_training_job._wait_done"), \
-             patch("run_model_training_job._list_stage", return_value=[]):
+             patch("run_model_training_job._list_stage", return_value=[]), \
+             patch("run_model_training_job._get_session", return_value=session):
             run_model_training_job.run_model_ddp_memory_probe(
-                session,
                 model_design_pattern="inductive_forecasting",
                 model_family="market_exchangeable_icl",
                 n_context=200, p_features=128, m_query=128,
@@ -219,9 +220,8 @@ class TestLauncherEnvVars:
 
 class TestLauncherValidation:
     def _probe(self, **kwargs):
-        return run_model_training_job.run_model_ddp_memory_probe(
-            _make_session(), **kwargs
-        )
+        with patch("run_model_training_job._get_session", return_value=_make_session()):
+            return run_model_training_job.run_model_ddp_memory_probe(**kwargs)
 
     def _defaults(self, **override):
         d = dict(

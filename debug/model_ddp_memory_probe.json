@@ -1,0 +1,49 @@
+{
+  "model_design_pattern": "inductive_forecasting",
+  "model_family": "market_exchangeable_icl",
+  "probe_type": "model_ddp_memory_probe",
+  "ranks": [
+    {
+      "backward_ok": false,
+      "cuda_device_name": "NVIDIA A10G",
+      "cuda_free_memory_bytes_before": 23684841472,
+      "cuda_total_memory_bytes": 23684841472,
+      "device": "cuda:0",
+      "error": "[model_ddp_memory_probe] rank=0 static memory guard triggered: estimated_reserved_bytes=100,663,296,000 > limit=21,316,357,324 (cuda_total=23,684,841,472, max_fraction=0.9, max_tensor_bytes_override=None). H-tensor estimate: m=128*n=200*p=128*d=256*4B = 3,355,443,200B; activation_factor=20; safety_factor=1.5. Reduce shape parameters or increase GPU memory limit.",
+      "forward_ok": false,
+      "hostname": "job-1",
+      "local_rank": 0,
+      "rank": 0,
+      "status": "error",
+      "traceback": "Traceback (most recent call last):\n  File \"/mnt/job_stage/app/model_ddp_memory_probe.py\", line 492, in probe_fn\n    raise RuntimeError(msg)\nRuntimeError: [model_ddp_memory_probe] rank=0 static memory guard triggered: estimated_reserved_bytes=100,663,296,000 > limit=21,316,357,324 (cuda_total=23,684,841,472, max_fraction=0.9, max_tensor_bytes_override=None). H-tensor estimate: m=128*n=200*p=128*d=256*4B = 3,355,443,200B; activation_factor=20; safety_factor=1.5. Reduce shape parameters or increase GPU memory limit.\n",
+      "world_size": 40
+    }
+  ],
+  "shape": {
+    "d_phi": 256,
+    "dtype": "float32",
+    "m_query": 128,
+    "n_blocks": 2,
+    "n_context": 200,
+    "p_features": 128,
+    "run_backward": true
+  },
+  "static_estimate": {
+    "activation_factor": 20,
+    "estimated_reserved_bytes": 100663296000,
+    "h_tensor_bytes": 3355443200,
+    "safety_factor": 1.5
+  },
+  "status": "error",
+  "summary": {
+    "max_peak_allocated_bytes": null,
+    "max_peak_reserved_bytes": null,
+    "max_reserved_fraction": null,
+    "min_free_memory_before_bytes": null
+  },
+  "world": {
+    "actual_world_size": 1,
+    "expected_world_size": 40,
+    "train_num_nodes": 10
+  }
+}

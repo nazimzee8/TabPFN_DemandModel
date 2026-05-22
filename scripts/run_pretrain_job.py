@@ -24,6 +24,11 @@ DEFAULT_TRAINING_DATA_FAMILY  = os.getenv("TRAINING_DATA_FAMILY",  "synthetic_re
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
+def _get_session():
+    from snowflake.snowpark import Session
+    return Session.builder.getOrCreate()
+
+
 def _wait_done(job, label):
     job.wait()
     if job.status == "DONE":
@@ -142,8 +147,60 @@ def _run_pretrain_impl(
     )
 
 
-def run_pretrain_pipeline(session) -> str:
+def _run_pretrain_gate_impl(
+    session,
+    model_family: str,
+    training_data_family: str,
+    model_design_pattern: str,
+    gate_hidden_dim: int,
+) -> str:
+    """Run pretrain for one gate candidate, writing pretrain_gate<N>.pt.
+
+    gate_hidden_dim must be one of the HPO candidates: 32, 64, or 128.
+    This must be called for all three candidates before run_hpo_pipeline().
+    """
+    _validate_meta_dataset_index(session)
+    gate_dim = int(gate_hidden_dim)
+    if gate_dim not in (32, 64, 128):
+        raise ValueError(
+            f"gate_hidden_dim={gate_dim} is not a valid HPO candidate. "
+            "Allowed values: 32, 64, 128."
+        )
+    checkpoint_name = f"pretrain_gate{gate_dim}.pt"
+    print(f"Submitting pre-training job for gate_hidden_dim={gate_dim} ({checkpoint_name}) ...")
+    pretrain_job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="train.py",
+        compute_pool=GPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=TRAIN_NUM_NODES,
+        env_vars={
+            "CHECKPOINT_OUTPUT_NAME":    checkpoint_name,
+            "GATE_HIDDEN_DIM":           str(gate_dim),
+            "TRAIN_NUM_NODES":           str(TRAIN_NUM_NODES),
+            "HOME":                      "/tmp",
+            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
+            "STRICT_WORLD_SIZE_CHECK":   "true",
+            "MODEL_FAMILY":              model_family,
+            "TRAINING_DATA_FAMILY":      training_data_family,
+            "MODEL_DESIGN_PATTERN":     model_design_pattern,
+        },
+        session=session,
+    )
+    _wait_done(pretrain_job, f"Pre-training gate_hidden_dim={gate_dim}")
+
+    checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")
+    return (
+        f"Pre-training pipeline complete (gate_hidden_dim={gate_dim}, "
+        f"checkpoint={checkpoint_name}).\n\n"
+        "MODEL_STAGE checkpoints:\n"
+        + "\n".join(f"  {p}" for p in checkpoint_contents)
+    )
+
+
+def run_pretrain_pipeline() -> str:
     """Zero-arg entrypoint: uses env-var defaults."""
+    session = _get_session()
     return _run_pretrain_impl(
         session,
         DEFAULT_MODEL_FAMILY,
@@ -153,7 +210,6 @@ def run_pretrain_pipeline(session) -> str:
 
 
 def run_pretrain_pipeline_model(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -167,9 +223,40 @@ def run_pretrain_pipeline_model(
             'inductive_forecasting'
         );
     """
+    session = _get_session()
     return _run_pretrain_impl(
         session,
         model_family,
         training_data_family,
         model_design_pattern,
+    )
+
+
+def run_pretrain_pipeline_model_gate(
+    model_family: str,
+    training_data_family: str,
+    model_design_pattern: str,
+    gate_hidden_dim: int,
+) -> str:
+    """Gate-specific pretrain: writes pretrain_gate<N>.pt for one HPO candidate.
+
+    Must be called for each gate candidate (32, 64, 128) before run_hpo_pipeline().
+    The HPO search space tunes gate_hidden_dim and each trial needs a matching
+    pretrain checkpoint; one shared checkpoint cannot serve all gate widths.
+
+    Usage:
+        CALL run_pretrain_pipeline(
+            'market_exchangeable_icl',
+            'synthetic_regression_combined',
+            'inductive_forecasting',
+            64
+        );
+    """
+    session = _get_session()
+    return _run_pretrain_gate_impl(
+        session,
+        model_family,
+        training_data_family,
+        model_design_pattern,
+        int(gate_hidden_dim),
     )

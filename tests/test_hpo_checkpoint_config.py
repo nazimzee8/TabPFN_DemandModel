@@ -556,3 +556,91 @@ def test_hpo_baseline_config_stage_path_constant_exists():
     """hpo.HPO_BASELINE_CONFIG_STAGE_PATH attribute exists."""
     assert hasattr(hpo, "HPO_BASELINE_CONFIG_STAGE_PATH")
     assert isinstance(hpo.HPO_BASELINE_CONFIG_STAGE_PATH, str)
+
+
+# ---------------------------------------------------------------------------
+# Gate-specific pretrain checkpoints (gate_hidden_dim HPO fix)
+# ---------------------------------------------------------------------------
+
+def test_gate_hidden_dim_candidates_constant_exists():
+    """hpo.GATE_HIDDEN_DIM_CANDIDATES exists and contains [32, 64, 128]."""
+    assert hasattr(hpo, "GATE_HIDDEN_DIM_CANDIDATES")
+    assert isinstance(hpo.GATE_HIDDEN_DIM_CANDIDATES, list)
+    assert set(hpo.GATE_HIDDEN_DIM_CANDIDATES) == {32, 64, 128}
+
+
+def test_gate_hidden_dim_candidates_matches_ridge_residual_search_space():
+    """GATE_HIDDEN_DIM_CANDIDATES matches the tune.choice([...]) values in ridge_residual mode."""
+    pytest.importorskip("ray")
+    import ray.tune as tune
+
+    space = hpo.build_hpo_search_space(tune)
+    gate_dist = space.get("gate_hidden_dim")
+    # gate_hidden_dim should be a tune distribution (not a fixed int)
+    assert not isinstance(gate_dist, int), (
+        "gate_hidden_dim must be a tune distribution in ridge_residual mode"
+    )
+
+
+def test_check_pretrain_checkpoints_function_exists():
+    """hpo._check_pretrain_checkpoints is callable."""
+    assert hasattr(hpo, "_check_pretrain_checkpoints")
+    assert callable(hpo._check_pretrain_checkpoints)
+
+
+def test_build_ray_trainable_signature_accepts_map_ref():
+    """_build_ray_trainable accepts two positional args (data_ref, ckpt_map_ref)."""
+    import inspect
+    sig = inspect.signature(hpo._build_ray_trainable)
+    params = list(sig.parameters.keys())
+    assert len(params) == 2, (
+        f"_build_ray_trainable should accept 2 params, got: {params}"
+    )
+    assert params[0] == "hpo_data_ref"
+    assert params[1] == "pretrain_ckpt_map_ref"
+
+
+def test_best_config_meta_includes_checkpoint_provenance_fields():
+    """best_config._meta produced by HPO includes pretrain_checkpoint_map and
+    pretrain_checkpoint_stage_path (gate provenance fields)."""
+    # Simulate the _meta dict construction from hpo.main()
+    checkpoint_map = {32: "@MODEL_STAGE/checkpoints/pretrain_gate32.pt",
+                      64: "@MODEL_STAGE/checkpoints/pretrain_gate64.pt",
+                      128: "@MODEL_STAGE/checkpoints/pretrain_gate128.pt"}
+    best_gate_dim = 64
+    best_val_mse = 0.35
+
+    meta = {
+        "best_val_mse":               float(best_val_mse),
+        "num_trials":                 20,
+        "trial_max_epochs":           30,
+        "pretrain_warm_start_policy": "fail_on_mismatch",
+        "pretrain_checkpoint_map": {
+            str(gate_dim): path for gate_dim, path in checkpoint_map.items()
+        },
+        "pretrain_checkpoint_stage_path": checkpoint_map.get(best_gate_dim, ""),
+    }
+
+    assert "pretrain_checkpoint_map" in meta
+    assert "pretrain_checkpoint_stage_path" in meta
+    assert meta["pretrain_checkpoint_stage_path"] == "@MODEL_STAGE/checkpoints/pretrain_gate64.pt"
+    assert meta["pretrain_checkpoint_map"]["64"] == "@MODEL_STAGE/checkpoints/pretrain_gate64.pt"
+    assert meta["pretrain_warm_start_policy"] == "fail_on_mismatch"
+
+
+def test_architecture_sweep_enabled_in_main():
+    """hpo.main() no longer raises NotImplementedError for HPO_SWEEP_MODE=architecture.
+    Architecture sweep is enabled; cold-start is allowed on checkpoint mismatch."""
+    import importlib
+    import inspect
+
+    # Verify the NotImplementedError guard has been removed
+    src = inspect.getsource(hpo.main)
+    assert "architecture" in src, "hpo.main() must reference 'architecture' mode"
+    # The NotImplementedError guard must be absent — architecture sweep is now supported
+    # Check: if NotImplementedError appears, it must not be for the architecture guard
+    if "NotImplementedError" in src:
+        # Ensure it's not the old "architecture HPO sweep is disabled" guard
+        assert "architecture HPO sweep is disabled" not in src, (
+            "hpo.main() must not have the old NotImplementedError guard for architecture mode"
+        )

@@ -160,20 +160,26 @@ class TestRunPipelinePropagation:
              patch("run_training_job._wait_done"), \
              patch("run_training_job._validate_meta_dataset_index"), \
              patch("run_training_job._stage_file_exists", return_value=True), \
-             patch("run_training_job._list_stage", return_value=[]):
-            run_training_job.run_pipeline(session)
+             patch("run_training_job._list_stage", return_value=[]), \
+             patch("run_training_job._get_session", return_value=session):
+            run_training_job.run_pipeline()
 
         importlib.reload(run_training_job)
         return submitted
 
     def test_pretrain_job_receives_family(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch)
-        pretrain = next(
+        # Pipeline now submits a single pretrain job (pretrain.pt, two-sweep strategy)
+        pretrain_jobs = [
             j for j in jobs
             if j.entrypoint == "train.py"
-            and j.env_vars.get("CHECKPOINT_OUTPUT_NAME") == "pretrain.pt"
+            and j.env_vars.get("CHECKPOINT_OUTPUT_NAME", "") == "pretrain.pt"
+        ]
+        assert pretrain_jobs, (
+            "Expected a single pretrain job with CHECKPOINT_OUTPUT_NAME=pretrain.pt"
         )
-        assert pretrain.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        for pretrain in pretrain_jobs:
+            assert pretrain.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
 
     def test_hpo_job_receives_family(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch)
@@ -232,8 +238,9 @@ class TestRunModelTrainingPropagation:
              patch("run_model_training_job._wait_done"), \
              patch("run_model_training_job._validate_meta_dataset_index"), \
              patch("run_model_training_job._stage_file_exists", return_value=True), \
-             patch("run_model_training_job._list_stage", return_value=[]):
-            run_model_training_job.run_model_training(session)
+             patch("run_model_training_job._list_stage", return_value=[]), \
+             patch("run_model_training_job._get_session", return_value=session):
+            run_model_training_job.run_model_training()
 
         importlib.reload(run_model_training_job)
         return submitted
@@ -305,8 +312,9 @@ class TestRunHpoJobPropagation:
         with patch("run_hpo_job.submit_from_stage",
                    side_effect=_make_fake_submit(submitted)), \
              patch("run_hpo_job._wait_done"), \
-             patch("run_hpo_job._list_stage", return_value=[]):
-            run_hpo_job.run_hpo_pipeline(session)
+             patch("run_hpo_job._list_stage", return_value=[]), \
+             patch("run_hpo_job._get_session", return_value=session):
+            run_hpo_job.run_hpo_pipeline()
 
         assert len(submitted) == 1
         assert submitted[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
@@ -324,8 +332,9 @@ class TestRunHpoJobPropagation:
         with patch("run_hpo_job.submit_from_stage",
                    side_effect=_make_fake_submit(submitted)), \
              patch("run_hpo_job._wait_done"), \
-             patch("run_hpo_job._list_stage", return_value=[]):
-            run_hpo_job.run_hpo_pipeline(session)
+             patch("run_hpo_job._list_stage", return_value=[]), \
+             patch("run_hpo_job._get_session", return_value=session):
+            run_hpo_job.run_hpo_pipeline()
 
         job = submitted[0]
         assert "MODEL_FAMILY" in job.env_vars, "MODEL_FAMILY missing from HPO job env_vars"

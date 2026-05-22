@@ -353,6 +353,8 @@ def load_best_deepset_checkpoint():
     6. run_permutation_tests(model) — fail fast
     7. Return (model, payload)
     """
+    import glob as _glob
+
     session = Session.builder.getOrCreate()
 
     ckpt_dir = str(Path(SYNREG_CKPT_LOCAL).parent)
@@ -360,11 +362,39 @@ def load_best_deepset_checkpoint():
 
     print(f"[INFO] Checkpoint stage path: {SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH}", flush=True)
     session.file.get(SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH, ckpt_dir)
-    print(f"[INFO] Checkpoint saved to {SYNREG_CKPT_LOCAL}", flush=True)
+
+    # Resolve local checkpoint path: Snowflake may rename downloaded files.
+    # Try: (1) SYNREG_CKPT_LOCAL if set explicitly, (2) filename derived from stage path,
+    # (3) glob variants, (4) any .pt file in directory, (5) raise.
+    if os.environ.get("SYNTHETIC_REGRESSION_CKPT_LOCAL"):
+        # Explicitly set by operator — trust it.
+        local_path = SYNREG_CKPT_LOCAL
+    else:
+        expected_filename = SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH.rsplit("/", 1)[-1]
+        local_path = os.path.join(ckpt_dir, expected_filename)
+        if not os.path.exists(local_path):
+            # Snowflake sometimes appends suffixes; try glob variants.
+            candidates = sorted(_glob.glob(local_path + "*"))
+            if candidates:
+                local_path = candidates[0]
+        if not os.path.exists(local_path):
+            # Fall back to any .pt in the directory.
+            all_pts = sorted(_glob.glob(os.path.join(ckpt_dir, "*.pt")))
+            if all_pts:
+                local_path = all_pts[0]
+        if not os.path.exists(local_path):
+            raise RuntimeError(
+                f"[load_best_deepset_checkpoint] Checkpoint {expected_filename!r} could not be "
+                f"downloaded to {ckpt_dir!r}. "
+                f"Stage path: {SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH!r}. "
+                f"Verify with: LIST @MODEL_STAGE/checkpoints/;"
+            )
+
+    print(f"[INFO] Checkpoint resolved to {local_path}", flush=True)
 
     device = deepset_inference_device()
-    payload = safe_torch_load_with_legacy_escape_hatch(SYNREG_CKPT_LOCAL, device)
-    validate_checkpoint_payload(payload, SYNREG_CKPT_LOCAL)
+    payload = safe_torch_load_with_legacy_escape_hatch(local_path, device)
+    validate_checkpoint_payload(payload, local_path)
     cfg = normalize_checkpoint_cfg(payload)
     print(f"[INFO] Checkpoint model_family={cfg.model_family}", flush=True)
 

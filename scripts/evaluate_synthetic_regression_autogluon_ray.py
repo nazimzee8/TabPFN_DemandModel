@@ -73,6 +73,7 @@ TASK_CPUS = _env_int("AUTOGLUON_TASK_CPUS", 1)
 TIME_LIMIT = _env_int("AUTOGLUON_TIME_LIMIT", 300)
 PRESETS = os.getenv("AUTOGLUON_PRESETS", "best_quality")
 MIN_TMP_FREE_BYTES = _env_int("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", 5368709120)
+MAX_DATASET_BYTES = _env_int("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", 2147483648)
 LOCAL_CACHE = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
 CPU_MAX_FEATURES = _env_int("BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 512)
 CPU_MAX_MATRIX_BYTES = _env_int("BENCHMARK_CPU_MAX_MATRIX_BYTES", 2147483648)
@@ -114,6 +115,11 @@ if TASK_CPUS < 1:
 
 if TIME_LIMIT < 1:
     raise RuntimeError(f"[ag_ray] AUTOGLUON_TIME_LIMIT={TIME_LIMIT} must be >= 1.")
+
+if WORKERS_PER_SHARD < 1:
+    raise RuntimeError(
+        f"[ag_ray] SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD} must be >= 1."
+    )
 
 # ---------------------------------------------------------------------------
 # Imports (after env validation to surface env errors first)
@@ -157,17 +163,25 @@ except ImportError as exc:
 print("[ag_ray] ray init starting", flush=True)
 try:
     ray.init(
+        address="auto",
         ignore_reinit_error=True,
         log_to_driver=True,
         include_dashboard=False,
     )
     cluster_resources = ray.cluster_resources()
     available_cpus = int(cluster_resources.get("CPU", 0))
+    live_nodes = [node for node in ray.nodes() if node.get("Alive")]
     print(
         f"[ag_ray] ray init complete  cluster_cpus={available_cpus} "
-        f"cluster_resources={dict(cluster_resources)}",
+        f"live_nodes={len(live_nodes)} cluster_resources={dict(cluster_resources)}",
         flush=True,
     )
+    if len(live_nodes) < WORKERS_PER_SHARD:
+        raise RuntimeError(
+            f"[ag_ray] Ray cluster has only {len(live_nodes)} live nodes but "
+            f"SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD}. "
+            "Snowflake did not attach the requested target_instances to this MLJob."
+        )
     if available_cpus < TASK_CPUS:
         raise RuntimeError(
             f"[ag_ray] Ray cluster has only {available_cpus} CPUs but "
@@ -399,11 +413,40 @@ def _load_dataset_for_item(item: dict) -> dict:
     return load_prepared_synthetic_dataset(item, LOCAL_CACHE)
 
 
+def _dataset_payload_nbytes(payload: dict) -> int:
+    total = 0
+    for value in payload.values():
+        nbytes = getattr(value, "nbytes", None)
+        if nbytes is not None:
+            total += int(nbytes)
+    return total
+
+
+def _base_row_for_item(item: dict) -> dict:
+    return {
+        "suite_id": SUITE_ID,
+        "suite_family": item.get("suite_family", "primary"),
+        "dataset_id": item.get("dataset_id"),
+        "dataset_seed": item.get("dataset_seed"),
+        "split_seed": int(item.get("split_seed", 0)),
+        "prior_regime": item.get("prior_regime"),
+        "method": "AutoGluon",
+        "logical_dataset_key": (
+            item.get("logical_dataset_key")
+            or f"{SUITE_ID}:{item.get('prior_regime')}:{item.get('dataset_id', 0):04d}"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main distributed evaluation loop
 # ---------------------------------------------------------------------------
 
-MAX_IN_FLIGHT = max(1, WORKERS_PER_SHARD * 2)
+MAX_IN_FLIGHT = _env_int("SYNREG_AUTOGLUON_MAX_IN_FLIGHT", WORKERS_PER_SHARD)
+if MAX_IN_FLIGHT < 1:
+    raise RuntimeError(
+        f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} must be >= 1."
+    )
 
 print(
     f"[ag_ray] starting distributed evaluation: "
@@ -431,25 +474,27 @@ while True:
             dataset_payload = _load_dataset_for_item(item)
         except Exception as exc:
             # Dataset load failure → emit failed row without submitting Ray task
-            base = {
-                "suite_id": SUITE_ID,
-                "suite_family": item.get("suite_family", "primary"),
-                "dataset_id": item.get("dataset_id"),
-                "dataset_seed": item.get("dataset_seed"),
-                "split_seed": int(item.get("split_seed", 0)),
-                "prior_regime": item.get("prior_regime"),
-                "method": "AutoGluon",
-                "logical_dataset_key": (
-                    item.get("logical_dataset_key")
-                    or f"{SUITE_ID}:{item.get('prior_regime')}:{item.get('dataset_id', 0):04d}"
-                ),
-            }
+            base = _base_row_for_item(item)
             output_rows.append(_failed_row(base, type(exc).__name__, str(exc)[:500]))
             print(
                 f"[ag_ray] dataset load failed for item "
                 f"dataset_id={item.get('dataset_id')} split_seed={item.get('split_seed')}: {exc}",
                 flush=True,
             )
+            continue
+
+        dataset_bytes = _dataset_payload_nbytes(dataset_payload)
+        if dataset_bytes > MAX_DATASET_BYTES:
+            output_rows.append(
+                _skipped_row(
+                    _base_row_for_item(item),
+                    (
+                        "autogluon_dataset_too_large "
+                        f"(dataset_bytes={dataset_bytes} > {MAX_DATASET_BYTES})"
+                    ),
+                )
+            )
+            del dataset_payload
             continue
 
         payload_ref = ray.put(dataset_payload)

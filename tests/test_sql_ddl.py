@@ -91,6 +91,12 @@ class TestSplitPhaseStoredProcedures:
         assert "BASELINE_CONCURRENT_NODES INTEGER" in sql
         assert "AUTOGLUON_CONCURRENT_NODES INTEGER" in sql
 
+    def test_concurrency_comments_document_single_wave_rejection(self):
+        sql = self._sql()
+        assert "Single-wave execution is enforced" in sql
+        assert "Lower values fail fast" in sql or "Lower values are rejected" in sql
+        assert "AUTOGLUON_CONCURRENT_CLUSTERS must equal AUTOGLUON_CLUSTER_SHARDS" in sql
+
     def test_existing_synthetic_regression_signatures_remain(self):
         sql = self._sql()
         assert (
@@ -117,6 +123,22 @@ class TestSplitPhaseStoredProcedures:
         sql = self._sql()
         assert "CREATE STAGE IF NOT EXISTS EVALUATION_DATASET_STAGE" in sql
         assert "EVALUATION_DATASET_STAGE" in sql
+
+    def test_no_stray_characters_after_string_literals_in_imports(self):
+        """IMPORTS blocks must not contain stray characters immediately after string literals (e.g. trailing 'F')."""
+        import re
+        sql = self._sql()
+        # Extract all IMPORTS blocks: IMPORTS = ( ... )
+        imports_blocks = re.findall(r'IMPORTS\s*=\s*\([^)]*\)', sql, re.DOTALL)
+        assert imports_blocks, "No IMPORTS blocks found in SQL — check DDL structure"
+        for block in imports_blocks:
+            # Flag any string literal immediately followed by a letter (no space/comma/newline between)
+            bad = re.findall(r"'[^'\n]*'([A-Za-z])", block)
+            assert not bad, (
+                f"Stray character(s) after string literal in IMPORTS block: {bad!r}\n"
+                f"Block: {block!r}\n"
+                "A trailing letter (e.g. 'F') causes a SQL syntax error."
+            )
 
 
 class TestSQLEnvVarRenames:
@@ -151,3 +173,56 @@ class TestSQLEnvVarRenames:
         sql = self._sql()
         assert "run_pretrain_pipeline" in sql
         assert "DEEPSET" + "_MODEL_FAMILY" not in sql
+
+    def test_gate_hidden_dim_overload_exists(self):
+        """run_pretrain_pipeline 4-arg overload with GATE_HIDDEN_DIM INTEGER must exist."""
+        sql = self._sql()
+        assert "GATE_HIDDEN_DIM INTEGER" in sql, (
+            "SQL must define the 4-arg run_pretrain_pipeline overload with GATE_HIDDEN_DIM INTEGER"
+        )
+        assert "run_pretrain_pipeline_model_gate" in sql, (
+            "SQL handler must be run_pretrain_pipeline_model_gate"
+        )
+
+    def test_gate_pretrain_runbook_pattern_exists(self):
+        """Runbook section must show three CALL run_pretrain_pipeline(..., <N>); examples."""
+        sql = self._sql()
+        # Each gate dim should appear in a pretrain call
+        for gate_dim in (32, 64, 128):
+            assert f"'inductive_forecasting', {gate_dim}" in sql, (
+                f"Runbook must include CALL run_pretrain_pipeline(..., {gate_dim})"
+            )
+
+    def test_architecture_sweep_enabled_comment(self):
+        """SQL must document that architecture HPO is enabled and describe two-sweep strategy."""
+        sql = self._sql()
+        assert "architecture" in sql, (
+            "SQL must reference architecture sweep mode"
+        )
+        # architecture sweep is now enabled — no 'NotImplementedError' guard should exist
+        assert "NotImplementedError" not in sql, (
+            "SQL must not reference NotImplementedError for architecture sweep "
+            "(architecture sweep is now enabled)"
+        )
+
+    def test_architecture_recommended_as_two_sweep_path(self):
+        """SQL must describe two-sweep HPO (ridge_residual → architecture) as recommended."""
+        sql = self._sql()
+        # Two-sweep HPO is now the recommended path
+        assert "Two-sweep HPO" in sql or "two-sweep" in sql.lower(), (
+            "SQL must describe two-sweep HPO strategy"
+        )
+        assert "architecture" in sql, (
+            "SQL must reference architecture sweep as part of the recommended path"
+        )
+
+    def test_pretrain_pt_not_required_for_hpo(self):
+        """SQL HPO comments must not state pretrain.pt is required (gate-specific files are)."""
+        sql = self._sql()
+        # Find the hpo section comment block
+        hpo_start = sql.find("run_hpo_pipeline() launches")
+        hpo_end = sql.find("CREATE OR REPLACE PROCEDURE run_hpo_pipeline()", hpo_start)
+        hpo_section = sql[hpo_start:hpo_end] if hpo_start != -1 and hpo_end != -1 else ""
+        assert "pretrain.pt" not in hpo_section, (
+            "HPO comment block must not claim pretrain.pt (not gate-specific) is required"
+        )

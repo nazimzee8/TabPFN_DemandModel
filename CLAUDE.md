@@ -48,8 +48,8 @@ results/                Local downloaded evaluation artifacts
 | Pool | Nodes | GPU | Purpose |
 |------|-------|-----|---------|
 | `DEEPSET_GPU_POOL` | MAX=10, GPU_NV_M | 4×A10G/node | Training, HPO, MODEL3-ICL eval shards |
-| `DEEPSET_CPU_POOL` | MAX=3, CPU_X64_M | — | Prep, baseline shards, aggregation |
-| `AUTOGLUON_CPU_POOL` | MAX=30, CPU_X64_M | — | AutoGluon shards |
+| `DEEPSET_CPU_POOL` | MAX=6, CPU_X64_M | — | Prep, baseline shards (6), aggregation |
+| `AUTOGLUON_CPU_POOL` | MAX=6, CPU_X64_M | — | AutoGluon cluster shards (6×4 workers, `ray_work_items` mode) |
 
 **External access:**
 - `TABPFN_PYPI_EAI` — single EAI for all pip installs (CatBoost, AutoGluon, openml)
@@ -64,7 +64,7 @@ results/                Local downloaded evaluation artifacts
 | `@META_DATASET_STAGE` | Benchmark metadata index + prepared `.npz` splits (`benchmark_prepared/`) |
 | `@MODEL_STAGE/scripts/` | All runnable MLJob code from `src/*.py` and `scripts/*.py` (flat, no subdirectories) |
 | `@MODEL_STAGE/hpo/` | `best_config_ridge_residual.json` (sweep 1), `best_config_architecture.json` (sweep 2), `best_config.json` (merged final); `hpo_failure.json` on failure |
-| `@MODEL_STAGE/checkpoints/` | `pretrain.pt`, `best.pt` (v4 format) |
+| `@MODEL_STAGE/checkpoints/` | `pretrain_gate32.pt`, `pretrain_gate64.pt`, `pretrain_gate128.pt` (one per gate candidate), `best.pt` (v4 format) |
 | `@EVALUATION_RESULTS_STAGE` | All evaluation output CSVs, charts, manifests |
 | `@EVALUATION_RESULTS_STAGE/regression/{suite_id}/` | Synthetic regression shard part CSVs (path scoped by `SYNREG_RESULTS_STAGE` env var) |
 | `@EVALUATION_RESULTS_STAGE/ood_parity/` | OOD pilot MODEL3-ICL-only shard part CSVs |
@@ -183,7 +183,7 @@ always filters `WHERE suite_id = SYNREG_SUITE_ID` — controlling which suite ru
 **Gated Ridge Expert (enabled by default):**
 - `use_ridge_expert=True` by default in `ModelConfig`; prediction form: `ridge + gate × neural`
 - `ridge_lambda=1.0` (default); tuned via HPO as `tune.loguniform(1e-3, 1e1)`
-- `gate_hidden_dim=64` (default); fixed during HPO, not tuned
+- `gate_hidden_dim ∈ {32, 64, 128}` — tuned by HPO (`tune.choice`); each candidate requires its own `pretrain_gate<N>.pt`
 - `RidgeExpert` is stateless — zero trainable parameters; no `nn.Parameter` or `nn.Module`
 - Gate sigmoid output in `(0, 1)`; gate MLP trains via gradient descent; ridge path is analytic
 - `best_config.json` always includes `use_ridge_expert`, `ridge_lambda`, `gate_hidden_dim`
@@ -204,7 +204,11 @@ Three-phase pipeline, each submitted as an MLJob:
 ### Phase A — Pretraining (`run_pretrain_job.py` → `src/train.py`)
 
 - Topology: 10 nodes × 4 workers = world size 40
-- Warm-starts are supported; writes `@MODEL_STAGE/checkpoints/pretrain.pt`
+- **Gate-specific pretrains required**: run one job per `gate_hidden_dim` candidate
+  (32, 64, 128). Each writes `@MODEL_STAGE/checkpoints/pretrain_gate<N>.pt`.
+- The 0-arg `run_pretrain_pipeline()` and 3-arg form are kept for backward compat
+  (write `pretrain.pt`) but are not used by the HPO-based production flow.
+- All three gate checkpoints must exist before HPO starts; HPO fails hard if any are missing.
 
 ### Phase B — HPO (`run_hpo_job.py` → `src/hpo.py`)
 
@@ -225,7 +229,11 @@ Three-phase pipeline, each submitted as an MLJob:
 - Topology: 10 nodes × 4 workers = world size 40
 - `EXPECTED_TRAIN_WORLD_SIZE=40`, `STRICT_WORLD_SIZE_CHECK=true`
 - SQL-sharded by DDP rank: `MOD(ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1, world_size) = rank`
-- Warm-starts from `pretrain.pt`; writes `@MODEL_STAGE/checkpoints/best.pt` (v4 format)
+- Warm-starts from the HPO-selected gate checkpoint; writes `@MODEL_STAGE/checkpoints/best.pt` (v4 format)
+- Pretrain checkpoint is resolved strictly (no cold-start, no `pretrain.pt` fallback):
+  1. `best_config._meta.pretrain_checkpoint_stage_path` (written by HPO)
+  2. Fallback: `@MODEL_STAGE/checkpoints/pretrain_gate<gate_hidden_dim>.pt`
+  3. `FileNotFoundError` before `submit_from_stage()` if neither exists
 - Checkpoint loading: always use `load_checkpoint_compat()` with three fallback paths:
   1. `weights_only=True` (preferred, v4 checkpoints)
   2. `safe_globals([ModelConfig]) + weights_only=True` (legacy pickled cfg)
@@ -257,97 +265,62 @@ Prometheus runtime startup failure — do not rewrite model code.
 
 ### HPO sweep strategy for MODEL3-ICL with Ridge Expert
 
-`HPO_SWEEP_MODE` selects between two search spaces (set via `HPO_SWEEP_MODE` env var before job
-submission; default `ridge_residual`):
+**Recommended: two-sweep strategy (`ridge_residual` → `architecture`).**
 
-| Mode | Architecture | Tuned hyperparameters |
-|------|-------------|----------------------|
-| `ridge_residual` (default) | Fixed: `d_phi=128`, `n_sab_feat=1` | `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim`, `use_huber`, `huber_delta`, `lambda_l1` |
-| `architecture` | `d_phi ∈ {64,128,192,256}`, `n_sab_feat ∈ {1,2}` | Frozen from ridge_residual baseline; only `d_phi` and `n_sab_feat` are tuned |
+Sweep-specific outputs: `best_config_ridge_residual.json`, `best_config_architecture.json`.
+Merged final: `best_config.json` (written by architecture sweep).
+`_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture` record both sweep results.
+`HPO_BASELINE_CONFIG_STAGE_PATH` must be set to `@MODEL_STAGE/hpo/best_config_ridge_residual.json` when calling architecture sweep.
+Run `model_ddp_memory_probe` (worst-case `d_phi=256, n_blocks=2`) as a **mandatory gate** before architecture HPO.
 
-**Sweep outputs:**
-- `best_config_ridge_residual.json` — sweep-1-specific best config (optimizer/regularization).
-- `best_config_architecture.json` — sweep-2-specific best config (architecture candidates only).
-- `best_config.json` — final merged config:
-  - After `ridge_residual`: same content as `best_config_ridge_residual.json`.
-  - After `architecture`: merged from both sweeps; `d_phi`/`n_sab_feat` from sweep 2, all
-    other params from sweep 1; `_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture`
-    record provenance.
+| Mode | Architecture | Tuned hyperparameters | Requires |
+|------|-------------|----------------------|----------|
+| `ridge_residual` (default) | Fixed: `d_phi=128`, `n_sab_feat=1` | `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim ∈ {32,64,128}`, `use_huber`, `huber_delta`, `lambda_l1` | Gate-specific pretrain checkpoints |
+| `architecture` | `d_phi ∈ {64,128,192,256}`, `n_sab_feat ∈ {1,2}` | Frozen from ridge_residual baseline via `HPO_BASELINE_CONFIG_STAGE_PATH` | Ridge_residual sweep + memory probe |
 
-**`HPO_BASELINE_CONFIG_STAGE_PATH`:**
-Required when `HPO_SWEEP_MODE=architecture`. Must point to
-`@MODEL_STAGE/hpo/best_config_ridge_residual.json` (written by sweep 1).
-The driver downloads this config before Ray init; Ray workers never open a Snowpark session.
+**Gate-specific pretrain requirement (ridge_residual):**
+HPO samples `gate_hidden_dim ∈ {32, 64, 128}`. Each trial must warm-start from its matching
+`pretrain_gate<N>.pt`. All three checkpoints must exist before HPO starts. Missing any one
+checkpoint causes HPO to fail with `FileNotFoundError` (driver-side, before Ray init).
 
-**`_meta` structure in merged `best_config.json`:**
-```json
-{
-  "_meta": {
-    "sweeps": {
-      "ridge_residual": {
-        "stage_path": "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
-        "best_val_mse": <float>,
-        "pretrain_warm_start_policy": "fail_on_mismatch"
-      },
-      "architecture": {
-        "stage_path": "@MODEL_STAGE/hpo/best_config_architecture.json",
-        "best_val_mse": <float>,
-        "pretrain_warm_start_policy": "allow_cold_start_on_arch_mismatch",
-        "d_phi": <int>,
-        "n_sab_feat": <int>
-      }
-    },
-    "merged_from": [
-      "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
-      "@MODEL_STAGE/hpo/best_config_architecture.json"
-    ],
-    "best_val_mse": <float from architecture sweep>
-  }
-}
-```
-
-**Operational order:**
-1. Run `ridge_residual` first (default). Architecture fixed at known-good size; easiest to
-   reproduce and debug. Writes `best_config_ridge_residual.json`.
-2. Run `model_ddp_memory_probe` at worst-case shape (`d_phi=256, n_blocks=2`) — **mandatory**
-   gate before architecture sweep. Failure here stops the pipeline.
-3. Run `architecture` only after the memory probe passes. Pass
-   `HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_ridge_residual.json`.
-   Writes `best_config_architecture.json` and merged `best_config.json`.
-4. Final training reads merged `best_config.json`.
+**Architecture sweep cold-start policy:**
+Gates checkpoints are optional for architecture sweep. If missing, all trials cold-start
+(`PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch`).
 
 **Pretrain checkpoint mismatch policy** (`PRETRAIN_LOAD_POLICY`):
-- `ridge_residual` → `require_match`: raise on architecture mismatch (set automatically by
-  `run_model_training_job.py` based on `best_config.hpo_sweep_mode`).
-- `architecture` → `allow_cold_start_on_arch_mismatch`: log and cold-start if the pretrain
-  checkpoint's architecture differs from the new best config.
+- `ridge_residual` result → `require_match` (gate checkpoints must exactly match trial architecture)
+- `architecture` result → `allow_cold_start_on_arch_mismatch` (set automatically by `run_model_training_job.py` based on `best_config.hpo_sweep_mode`)
 
-**Fixed across both sweep spaces:**
-- `d_rho=256` — not wired into the active forward pass (uses `H.mean(dim=1)`, not `SetPool`).
-  Change only after wiring `d_rho` into the model.
+**Fixed across all sweep spaces:**
+- `d_rho=256` — not wired into the active forward pass. Change only after wiring `d_rho`.
 - `pool="pna"` — `SetPool` not called in the current ICL forward path.
-- `use_ridge_expert=True` — fixed `True` in both modes.
+- `use_ridge_expert=True` — fixed `True`.
 
-**Ridge Expert statelessness:** coefficients are task-local, closed-form, and non-trainable.
-`gate_hidden_dim` is the only Ridge Expert architectural tunable; it is in both sweep spaces via
-`tune.choice([32, 64, 128])`.
+**Operational order (two-sweep, recommended):**
+1. Run gate pretrains: `CALL run_pretrain_pipeline(..., 32/64/128)`.
+2. Run `CALL run_hpo_pipeline(..., 'ridge_residual', '')`. Writes `best_config_ridge_residual.json`.
+3. Run memory probe: `CALL run_model_ddp_memory_probe('model3', ..., 256, 2, TRUE)`.
+4. Run `CALL run_hpo_pipeline(..., 'architecture', '@MODEL_STAGE/hpo/best_config_ridge_residual.json')`. Writes merged `best_config.json`.
+5. Run `CALL run_model_training()`. Reads `best_config.json`; `PRETRAIN_LOAD_POLICY` set from `hpo_sweep_mode`.
 
 **SQL overloads:**
 ```sql
--- 4-arg: explicit sweep mode (baseline path from env var)
+-- Sweep 1: ridge_residual
 CALL run_hpo_pipeline(
-    'market_exchangeable_icl',
-    'synthetic_regression_combined',
-    'inductive_forecasting',
-    'ridge_residual'   -- or 'architecture'
+    'market_exchangeable_icl', 'synthetic_regression_combined',
+    'inductive_forecasting', 'ridge_residual', ''
 );
 
--- 5-arg: explicit sweep mode + baseline config path (recommended for architecture sweep)
+-- Memory probe (mandatory before architecture sweep):
+CALL run_model_ddp_memory_probe(
+    'model3', 'inductive_forecasting', 'market_exchangeable_icl',
+    200, 128, 128, 256, 2, TRUE
+);
+
+-- Sweep 2: architecture (requires best_config_ridge_residual.json)
 CALL run_hpo_pipeline(
-    'market_exchangeable_icl',
-    'synthetic_regression_combined',
-    'inductive_forecasting',
-    'architecture',
+    'market_exchangeable_icl', 'synthetic_regression_combined',
+    'inductive_forecasting', 'architecture',
     '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
 );
 ```
@@ -356,7 +329,7 @@ CALL run_hpo_pipeline(
 
 ## 8. Benchmark Evaluation Architecture
 
-Orchestrated by `scripts/run_evaluation_test.py`.
+Orchestrated by `scripts/run_evaluation_test.py`. Use skill `evaluation-pipeline` when modifying or validating this pipeline.
 
 ### Phase sequence (phase-gated):
 
@@ -366,8 +339,8 @@ Orchestrated by `scripts/run_evaluation_test.py`.
 | 1+2 | Capacity probes — GPU → CPU → AutoGluon (non-overlapping) |
 | 3 | Prep — 1 CPU job (`prepare_benchmark_datasets.py`) |
 | 4 | MODEL3-ICL GPU shards — 10 shards, `DEEPSET_GPU_POOL` |
-| 5 | Baseline CPU shards — 3 shards, `DEEPSET_CPU_POOL`; `catboost==1.2.10` + EAI |
-| 6 | AutoGluon shards — 30 shards, `AUTOGLUON_CPU_POOL`; `autogluon.tabular==1.3.0` + EAI |
+| 5 | Baseline CPU shards — 6 shards, `DEEPSET_CPU_POOL`; `catboost==1.2.10` + EAI |
+| 6 | AutoGluon shards — 6 cluster shards × 4 workers (`ray_work_items` mode), `AUTOGLUON_CPU_POOL`; `autogluon.tabular==1.3.0` + EAI |
 | 7 | Aggregation — 1 CPU job |
 
 **Shard assignment:** `row_index % num_shards` — order must be deterministic.
@@ -402,7 +375,7 @@ phase: `run_evaluation_prep`, `run_deepset_evaluation`, `run_baseline_evaluation
 
 ## 9. Synthetic Regression Evaluation Architecture
 
-Orchestrated by `scripts/run_synthetic_regression_evaluation.py`.
+Orchestrated by `scripts/run_synthetic_regression_evaluation.py`. Use skill `evaluation-pipeline` when modifying or validating this pipeline.
 
 ### Suite definitions:
 
@@ -424,8 +397,8 @@ Orchestrated by `scripts/run_synthetic_regression_evaluation.py`.
 | 2 | Capacity probes (GPU → CPU → AG, non-overlapping) |
 | 3 | Prep — 1 CPU job (`prepare_synthetic_regression.py`) |
 | 4 | MODEL3-ICL GPU shards (10, `DEEPSET_GPU_POOL`) — `SYNREG_RESULTS_STAGE=@EVALUATION_RESULTS_STAGE/regression/{suite_id}` |
-| 5 | Baseline CPU shards (3, `DEEPSET_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
-| 6 | AutoGluon shards (30, `AUTOGLUON_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
+| 5 | Baseline CPU shards (6, `DEEPSET_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
+| 6 | AutoGluon cluster shards (6×4 workers, `ray_work_items` mode, `AUTOGLUON_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
 | 7 | Aggregation (1 CPU job) — reads from suite-specific prefix; validates `suite_id` in all rows |
 | 8 | OOD pilot runs as separate procedure: `run_synthetic_regression_ood_deepset_pilot` (only MODEL3-ICL, 5 GPU shards, results → `@EVALUATION_RESULTS_STAGE/ood_parity/`) |
 | 9 | OOD full suite runs as separate procedure: `run_synthetic_regression_ood_full_evaluation` (prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 200-dataset OOD suite; aggregation outputs → `SYNREG_OUTPUT_STAGE=@EVALUATION_RESULTS_STAGE/ood_full`) |
@@ -538,6 +511,14 @@ CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311',
 - `evaluate_synthetic_regression_autogluon_ray.py` **fails fast** if Ray cannot initialise across
   `target_instances > 1`. It does not silently fall back to single-node mode (which would write
   duplicate shard files from each instance).
+- **Multi-instance entrypoint allowlist:** `_submit_synreg` enforces an explicit allowlist for
+  `target_instances > 1`. Only two entrypoints are permitted:
+  `evaluate_synthetic_regression_autogluon_ray.py` (production distributed AutoGluon) and
+  `ray_capacity_probe.py` (capacity probing). All other entrypoints — including
+  `evaluate_synthetic_regression.py` and `capacity_probe.py` — are rejected before the
+  Snowflake submit call. Do not weaken this guard.
+- Aggregation does not launch AutoGluon workers. It only consumes completed shard CSVs.
+  One Ray cluster maps to exactly one logical AutoGluon shard.
 - `MODEL_ARCH_VERSION` is **not** a Snowflake SQL/runtime selector. The model default is
   MODEL3/DeepSet ICL. Internal checkpoint metadata may contain `model_arch_version='model3'`
   for compatibility — do not remove that without updating all validation and tests.
@@ -750,7 +731,11 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   all three before aggregation.
 - Runtime probes are serialised (one at a time; wait for each before next).
 - Capacity probes are phase-gated: GPU → CPU → AG (non-overlapping).
-- `target_instances=1` for every MLJob (shard jobs are independent single-node jobs).
+- `target_instances=1` for every MLJob except Ray-coordinated multi-instance entrypoints.
+  Only two entrypoints are permitted with `target_instances > 1`:
+  `evaluate_synthetic_regression_autogluon_ray.py` (production distributed AutoGluon) and
+  `ray_capacity_probe.py` (capacity probing). Any other entrypoint with `target_instances > 1`
+  is rejected by `_submit_synreg` before the Snowflake call.
 - `run_evaluation_pipeline()` is phase-gated; never collapse back into overlapping fan-out
   unless node quota has been raised and verified.
 
@@ -792,10 +777,8 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 - `weights_only=False` can execute arbitrary code — only for internally trusted checkpoints;
   never for third-party checkpoints.
 - Synthetic regression evaluation shards must set `ALLOW_UNSAFE_TORCH_LOAD=true`
-  directly for every `SYNTHETIC_REGRESSION_MODE` of `deepset`, `baselines`, or
-  `autogluon`. Baseline and AutoGluon shards may still touch the TabPFN
-  checkpoint or shared evaluation utilities, so they carry the same temporary
-  trusted-checkpoint exception for internal Snowflake staged checkpoints.
+  directly for `SYNTHETIC_REGRESSION_MODE` of `deepset` and `baselines` only.
+  AutoGluon shards never call `torch.load` and must NOT receive this env var.
 - `TORCH_UNLOAD=true` is only a compatibility alias inside the evaluator;
   orchestration must set `ALLOW_UNSAFE_TORCH_LOAD=true` directly. This exception
   is not a policy for third-party checkpoints.
@@ -821,12 +804,17 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   PUT file://C:/Documents/TabPFN_DemandModel/src/evaluation_metrics.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/evaluate.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation)[.]py';
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/evaluate_synthetic_regression_autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|ray_capacity_probe)[.]py';
   ```
   Use the targeted block above when only the evaluator/helper refactor changed. Use
   the broad `src/*.py` plus `scripts/*.py` PUT block when procedure dependencies or
   multiple shared modules may have changed. `scripts/ood_regression/generate_ood_eval_data.py`
   remains local-only and must not be staged.
+- `evaluate_synthetic_regression_autogluon_ray.py` and `ray_capacity_probe.py` are the two
+  allowlisted multi-instance entrypoints; both must always be staged before running the
+  combined AutoGluon evaluation or capacity probe procedures.
 
 ### OOD path invariants
 

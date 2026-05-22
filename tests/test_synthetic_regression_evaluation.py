@@ -572,3 +572,44 @@ class TestLoadSyntheticRegressionIndexKeyNormalization:
         result = evsr.load_synthetic_regression_index(session=mock_session)
 
         assert result[0]["stage_path"] == expected
+
+
+# ---------------------------------------------------------------------------
+# AutoGluon env var tests
+# ---------------------------------------------------------------------------
+
+class TestAutogluonEnvVars:
+    """Verify env vars built for autogluon shard jobs are correct."""
+
+    def _autogluon_env(self):
+        """Build env vars for a single autogluon shard using _synreg_shard_env."""
+        from run_synthetic_regression_evaluation import _synreg_shard_env
+        return _synreg_shard_env(
+            mode="autogluon",
+            suite_id="linear_poisson_v1_recommended",
+            num_shards=6,
+            shard_index=0,
+            results_stage="@EVALUATION_RESULTS_STAGE/regression",
+            extra_env={},
+        )
+
+    def test_allow_unsafe_torch_load_absent_for_autogluon(self):
+        """AutoGluon jobs must not receive ALLOW_UNSAFE_TORCH_LOAD (no torch.load called)."""
+        env = self._autogluon_env()
+        assert "ALLOW_UNSAFE_TORCH_LOAD" not in env, (
+            "ALLOW_UNSAFE_TORCH_LOAD must not be set for autogluon mode — "
+            "autogluon never calls torch.load"
+        )
+
+    def test_autogluon_env_contains_required_vars(self):
+        """Autogluon shard env must include all required runtime variables."""
+        env = self._autogluon_env()
+        required = [
+            "SYNTHETIC_REGRESSION_SUITE_ID",
+            "SYNTHETIC_REGRESSION_NUM_SHARDS",
+            "SYNTHETIC_REGRESSION_SHARD_INDEX",
+            "SYNTHETIC_REGRESSION_MODE",
+            "SYNREG_RESULTS_STAGE",
+        ]
+        for var in required:
+            assert var in env, f"Missing required env var: {var}"

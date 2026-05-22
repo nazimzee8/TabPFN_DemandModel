@@ -30,6 +30,11 @@ DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_excha
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
+def _get_session():
+    from snowflake.snowpark import Session
+    return Session.builder.getOrCreate()
+
+
 def _wait_done(job, label):
     job.wait()
     if job.status == "DONE":
@@ -193,13 +198,56 @@ def _run_model_training_impl(
 
     _validate_meta_dataset_index(session)
 
-    # Determine pretrain checkpoint load policy from best_config.hpo_sweep_mode
+    # Pretrain load policy: architecture sweep allows cold-start on mismatch
+    # (d_phi/n_sab_feat may differ from pretrain checkpoint); ridge_residual
+    # requires exact match because gate-specific checkpoints are built to match.
     hpo_sweep_mode = best_config.get("hpo_sweep_mode", "ridge_residual")
     pretrain_policy = (
         "allow_cold_start_on_arch_mismatch"
         if hpo_sweep_mode == "architecture"
         else "require_match"
     )
+
+    # Resolve pretrain checkpoint (strict — no cold-start, no legacy pretrain.pt fallback):
+    #   1. best_config._meta.pretrain_checkpoint_stage_path (written by HPO, most accurate)
+    #   2. Fallback: @MODEL_STAGE/checkpoints/pretrain_gate<gate_dim>.pt
+    # FileNotFoundError is raised before submit_from_stage() if no valid checkpoint exists.
+    _meta = best_config.get("_meta", {})
+    _meta_ckpt = str(_meta.get("pretrain_checkpoint_stage_path", "")).strip()
+    gate_dim = int(best_config.get("gate_hidden_dim", 64))
+
+    if _meta_ckpt:
+        _ckpt_filename = _meta_ckpt.rsplit("/", 1)[-1]
+        if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", _ckpt_filename):
+            raise FileNotFoundError(
+                f"[run_model_training] Pretrain checkpoint from best_config._meta not found: "
+                f"{_meta_ckpt!r} (gate_hidden_dim={gate_dim}). "
+                f"Check @MODEL_STAGE/checkpoints/ and rerun the gate-specific pretrain: "
+                f"CALL run_pretrain_pipeline('...', '...', '...', {gate_dim});"
+            )
+        pretrain_checkpoint_path = _meta_ckpt
+        print(
+            f"[run_model_training] Using pretrain checkpoint from _meta: "
+            f"{pretrain_checkpoint_path!r}",
+            flush=True,
+        )
+    else:
+        _gate_ckpt_name = f"pretrain_gate{gate_dim}.pt"
+        _gate_ckpt_path = f"{MODEL_STAGE}/checkpoints/{_gate_ckpt_name}"
+        if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", _gate_ckpt_name):
+            raise FileNotFoundError(
+                f"[run_model_training] No pretrain checkpoint found for "
+                f"gate_hidden_dim={gate_dim}. "
+                f"Expected: {_gate_ckpt_path} in @MODEL_STAGE/checkpoints/. "
+                "Run the gate-specific pretrain first: "
+                f"CALL run_pretrain_pipeline('...', '...', '...', {gate_dim});"
+            )
+        pretrain_checkpoint_path = _gate_ckpt_path
+        print(
+            f"[run_model_training] Using pretrain_gate{gate_dim}.pt "
+            f"(gate_hidden_dim={gate_dim}, no _meta path found)",
+            flush=True,
+        )
 
     env_vars = {
         "BEST_CONFIG":               json.dumps(best_config),
@@ -211,13 +259,9 @@ def _run_model_training_impl(
         "MODEL_FAMILY":               model_family,
         "TRAINING_DATA_FAMILY":       training_data_family,
         "MODEL_DESIGN_PATTERN":      model_design_pattern,
+        "PRETRAIN_CHECKPOINT_PATH":  pretrain_checkpoint_path,
         "PRETRAIN_LOAD_POLICY":      pretrain_policy,
     }
-    if _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", "pretrain.pt"):
-        env_vars["PRETRAIN_CHECKPOINT_PATH"] = f"{MODEL_STAGE}/checkpoints/pretrain.pt"
-        print(f"pretrain.pt found; final training will warm-start from it (policy={pretrain_policy!r}).")
-    else:
-        print("No pretrain.pt found; final training starts from random initialization.")
 
     # Topology preflight: EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES × 4.
     _expected_ws = int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"])
@@ -302,8 +346,9 @@ def _run_model_training_impl(
     )
 
 
-def run_model_training(session) -> str:
+def run_model_training() -> str:
     """Zero-arg entrypoint: uses env-var defaults."""
+    session = _get_session()
     return _run_model_training_impl(
         session,
         DEFAULT_MODEL_FAMILY,
@@ -313,7 +358,6 @@ def run_model_training(session) -> str:
 
 
 def run_model_training_model(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -340,13 +384,13 @@ def run_model_training_model(
         f"model_design_pattern={model_design_pattern!r}",
         flush=True,
     )
+    session = _get_session()
     return _run_model_training_impl(
         session, model_family, training_data_family, model_design_pattern
     )
 
 
 def run_model_ddp_memory_probe(
-    session,
     model_design_pattern: str,
     model_family: str,
     n_context: int,
@@ -450,6 +494,7 @@ def run_model_ddp_memory_probe(
         flush=True,
     )
 
+    session = _get_session()
     probe_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="model_ddp_memory_probe.py",
@@ -473,7 +518,7 @@ def run_model_ddp_memory_probe(
     )
 
 
-def run_training_runtime_probe(session, target_instances: int) -> str:
+def run_training_runtime_probe(target_instances: int) -> str:
     """Submit a minimal runtime probe MLJob to verify Python entrypoint reachability.
 
     Args:
@@ -512,6 +557,7 @@ def run_training_runtime_probe(session, target_instances: int) -> str:
         flush=True,
     )
 
+    session = _get_session()
     probe_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="runtime_probe.py",
