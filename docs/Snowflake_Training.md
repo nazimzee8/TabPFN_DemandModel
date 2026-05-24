@@ -562,12 +562,18 @@ Resource split:
 
 - GPU (`DEEPSET_GPU_POOL`): 5-node HPO, 10-node DDP training, synthetic MODEL3-ICL evaluation, and MODEL3-ICL-MC benchmark (10 single-node GPU shard jobs).
 - CPU_X64_M (`DEEPSET_CPU_POOL`): Kaggle download, 6 single-node synthetic regression baseline dataset shard jobs, and aggregation. Each baseline shard owns a dataset subset and runs all baseline methods inside the dataset-first loop.
-- CPU_X64_M (`AUTOGLUON_CPU_POOL`): Synthetic regression AutoGluon evaluation. Combined suite
-  (`linear_all_v1`) default: 6 logical work-item clusters × 4 target instances = up to 24 concurrent
-  CPU_X64_M nodes. Each cluster runs `evaluate_synthetic_regression_autogluon_ray.py` with Ray
-  distributing independent dataset/seed/condition work items. Main and OOD suites use legacy
-  single-node sharded paths (`evaluate_synthetic_regression.py`), so the pool remains capped at
-  60 nodes to support those strict single-wave runs.
+- CPU_X64_M (`AUTOGLUON_CPU_POOL`): Synthetic regression AutoGluon evaluation. Two modes:
+  - **Ray distributed** (`AUTOGLUON_CLUSTER_SHARDS > 0`, combined suite default): 6 logical
+    work-item clusters × 4 target instances = up to 24 concurrent CPU_X64_M nodes. Each cluster
+    runs `autogluon_ray.py`; Ray distributes independent dataset/seed/condition work items.
+    Each Ray worker loads its own dataset locally — the driver does **not** call `ray.put(dataset)`.
+    `MAX_IN_FLIGHT` bounds concurrent worker-loaded fits (not object-store payload count).
+    `CONCURRENT_CLUSTERS` must equal `CLUSTER_SHARDS` (single-wave enforcement).
+  - **Single-node shards** (`AUTOGLUON_CLUSTER_SHARDS = 0`): N independent single-instance MLJobs
+    (`target_instances=1`), each running `evaluate_synthetic_regression.py` with `mode=autogluon`.
+    No Ray cluster; `CONCURRENT_CLUSTERS` determines the shard count and expected aggregation files.
+  Main and OOD suites use single-node sharded paths, so the pool remains capped at 60 nodes to
+  support those strict single-wave runs.
 
 Evaluation dependency checks are method-aware. The shared prepared-benchmark
 path requires scikit-learn for splitting, preprocessing, and metrics for
@@ -2262,7 +2268,7 @@ This runs 5 phases sequentially:
 5. **Aggregation** — 1 CPU job; outputs to `@EVALUATION_RESULTS_STAGE/ood_full/`
 
 > Note: The combined suite (`linear_all_v1`) uses a different AutoGluon path: 6 distributed
-> work-item clusters × 4 workers via `evaluate_synthetic_regression_autogluon_ray.py`.
+> work-item clusters × 4 workers via `autogluon_ray.py`.
 > See the Combined Suite section below.
 
 ### Step 5 — Verify index
@@ -2305,6 +2311,36 @@ or rewritten; `prepare_combined_suite()` copies rows into `SYNTHETIC_REGRESSION_
 
 **Prerequisites:** both source suites must be indexed before running combined prep.
 
+### Baseline shard count (runtime-configurable)
+
+Baseline shards are runtime-configurable. Default remains 6. 1 baseline shard = 1 single-node
+MLJob = 1 output shard file.
+
+| Parameter / env var | Default | Description |
+|---------------------|---------|-------------|
+| `SYNREG_BASELINE_SHARDS` / `BASELINE_SHARDS` SQL arg | `SYNREG_CPU_SHARDS` = 6 | Number of baseline shard files written; controls MLJob count |
+| `SYNREG_BASELINE_CONCURRENT_NODES` / `BASELINE_CONCURRENT_NODES` SQL arg | 6 | Required single-wave CPU nodes; **must equal `BASELINE_SHARDS`** |
+
+**Guardrails:** `BASELINE_CONCURRENT_NODES` must exactly equal `BASELINE_SHARDS`. Lower values are
+rejected (no silent batching). Higher values are also rejected unless `BASELINE_SHARDS` is raised
+to match. Aggregation must expect `SYNREG_EXPECTED_BASELINE_SHARDS` matching the resolved shard
+count; the all-in-one `run_synthetic_regression_combined_evaluation` wires this automatically.
+
+**To run with 10 baseline shards:**
+
+```sql
+CALL run_synthetic_regression_combined_baseline_capacity_probe(
+  '2.5.0-py311', '2.5.0-py311', 10, 10
+);
+CALL run_synthetic_regression_combined_baseline_evaluation(
+  '2.5.0-py311', '2.5.0-py311', 10, 10
+);
+-- Aggregation must expect 10 baseline shard files:
+CALL run_synthetic_regression_combined_aggregation(
+  '2.5.0-py311', '2.5.0-py311', 6, 10, 10
+);
+```
+
 ### AutoGluon distributed work-item architecture
 
 The combined suite uses a distributed AutoGluon evaluation path instead of the legacy 60-shard
@@ -2320,20 +2356,26 @@ single-node path used by the main and OOD suites.
 | `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Required single-wave MLJob clusters; must equal cluster shards |
 | `SYNREG_AUTOGLUON_MAX_IN_FLIGHT` | 4 | Max Ray work items submitted before collecting results |
 | `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES` | 5368709120 | Per-task `/tmp` free-space guard before fitting |
-| `BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES` | 2147483648 | Driver-side raw dataset payload guard before `ray.put` |
+| `BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES` | 2147483648 | Per-worker dataset size guard (worker-local load) |
 | `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` | 512 | Per-task processed feature cap |
 | `BENCHMARK_CPU_MAX_MATRIX_BYTES` | 2147483648 | Per-task train+holdout matrix byte cap |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
-| `SYNREG_AUTOGLUON_ENTRYPOINT` | `evaluate_synthetic_regression_autogluon_ray.py` | Entrypoint |
+| `SYNREG_WORKER_DATA_ACCESS_MODE` | `scoped_file_url` | Driver-derived scoped URL; workers do not create Snowpark sessions |
+| `SYNREG_MAX_WORK_ITEM_BYTES` | 8192 | Compact Ray item metadata size guard |
 
-Each MLJob cluster runs the Ray entrypoint. The entrypoint calls `ray.init(address="auto")`
-to attach to the Snowflake-provisioned multi-node Ray cluster and fails before writing a
-CSV if fewer than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` Ray nodes are alive. The driver process:
+Each MLJob cluster runs `autogluon_ray.py` (derived internally — not a runtime argument). The
+entrypoint calls `ray.init(address="auto")` to attach to the Snowflake-provisioned multi-node
+Ray cluster and fails before writing a CSV if fewer than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD`
+Ray nodes are alive. The driver process:
 1. Loads `SYNTHETIC_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
 2. Expands rows to explicit `(dataset, split_seed, condition)` work items
 3. Assigns this cluster's shard using `assign_synthetic_regression_shard(items, shard_index, num_shards)`
-4. Distributes work items across Ray tasks on the cluster's `target_instances` nodes
-5. Writes exactly one file: `AutoGluon_shard{shard_index}_of_{num_shards}_detailed.csv`
+4. Builds compact JSON item dicts and derives `dataset_access.scoped_url` with `BUILD_SCOPED_FILE_URL`
+5. Distributes only compact item dicts across Ray tasks; each worker loads its own dataset with `SnowflakeFile.open(scoped_url)` (no `ray.put`, no worker Snowpark session)
+6. Writes exactly one file: `AutoGluon_shard{shard_index}_of_{num_shards}_detailed.csv`
+
+Workers never query `SYNTHETIC_REGRESSION_DATASET_INDEX` and do not create Snowpark sessions.
+The only worker data access surface is the scoped URL in the item dict produced by the driver.
 
 Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CLUSTER_SHARDS`).
 
@@ -2341,15 +2383,25 @@ Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CL
 
 ```sql
 -- Prerequisites: linear_poisson_v1_recommended and ood_linear_full_v1 must be indexed.
+-- Required operational sequence:
+--   1. runtime probes
+--   2. combined AutoGluon capacity probe
+--   3. combined AutoGluon worker-access probe
+--   4. combined AutoGluon evaluation
+--   5. aggregation
 
 -- Step 0: Stage updated scripts (SnowSQL only)
 -- PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
--- PUT file://scripts/evaluate_synthetic_regression_autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/autogluon_worker_access_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://src/evaluate_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- Verify:
--- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|evaluate_synthetic_regression_autogluon_ray|capacity_probe|ray_capacity_probe)[.]py';
+-- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|autogluon_ray|capacity_probe|ray_capacity_probe|autogluon_worker_access_probe)[.]py';
+
+-- Step 0a: Runtime probes
+CALL run_synthetic_regression_runtime_probes('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
 
 -- Step 1: Capacity probes (verify node envelope before evaluation)
 CALL run_synthetic_regression_combined_baseline_capacity_probe(
@@ -2358,6 +2410,11 @@ CALL run_synthetic_regression_combined_baseline_capacity_probe(
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
 
 CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+  '2.5.0-py311', '2.5.0-py311', 6, 4, 6
+);
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+
+CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
   '2.5.0-py311', '2.5.0-py311', 6, 4, 6
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
@@ -2387,8 +2444,7 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(
   1,     -- AUTOGLUON_TASK_CPUS
   6,     -- AUTOGLUON_CONCURRENT_CLUSTERS
   300,   -- AUTOGLUON_TIME_LIMIT_SECONDS
-  'best_quality',
-  'evaluate_synthetic_regression_autogluon_ray.py'
+  'best_quality'
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 

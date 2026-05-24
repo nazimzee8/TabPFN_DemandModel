@@ -51,13 +51,16 @@ CREATE STAGE IF NOT EXISTS EPOCH_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 -- supports legacy single-wave AutoGluon (60 single-node shards). The combined
 -- suite default uses only 24 of those nodes: 6 logical AutoGluon work-item
 -- clusters with 4 target instances per cluster.
--- Each combined cluster runs evaluate_synthetic_regression_autogluon_ray.py
+-- Each combined cluster runs autogluon_ray.py
 -- with Ray for distributed independent work items.
 -- Single-wave execution is enforced. Lower concurrency arguments are rejected;
 -- they are not used as multi-wave throttles. For combined AutoGluon, reduce
 -- SYNREG_AUTOGLUON_CLUSTER_SHARDS explicitly if fewer output shard files are
 -- desired, or request quota for cluster_shards * workers_per_shard nodes.
 -- Run run_synthetic_regression_combined_autogluon_capacity_probe before evaluation.
+-- Run run_synthetic_regression_combined_autogluon_worker_access_probe after the
+-- capacity probe to validate driver-to-worker item metadata transfer and worker
+-- dataset access before full AutoGluon evaluation.
 -- SPCS does not support ALTER COMPUTE POOL to change INSTANCE_FAMILY; drop and recreate.
 DROP COMPUTE POOL IF EXISTS DEEPSET_GPU_POOL;
 CREATE COMPUTE POOL DEEPSET_GPU_POOL
@@ -357,6 +360,8 @@ LIMIT 20;
 -- PUT file://C:/Documents/TabPFN_DemandModel/src/prepare_benchmark_datasets.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- Evaluation runtime preflight uses runtime_probe.py (covered by src/*.py wildcard above).
 -- PUT file://C:/Documents/TabPFN_DemandModel/src/runtime_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- Distributed AutoGluon uses autogluon_ray.py, ray_capacity_probe.py, and
+-- autogluon_worker_access_probe.py (covered by scripts/*.py wildcard above).
 --
 -- Verify:
 -- LIST @MODEL_STAGE/scripts/;
@@ -365,6 +370,8 @@ LIMIT 20;
 -- train_epoch_error.json.
 -- Before epoch calibration, verify the shared modules and entrypoints:
 -- LIST @MODEL_STAGE/scripts/ PATTERN='.*(hpo|hpo_epoch_test|train_epoch_test|train|model|snowflake_io)[.]py';
+-- Before synthetic regression evaluation, verify the orchestration and Ray entrypoints:
+-- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe)[.]py';
 
 -- Step 4: Create and call the orchestrator stored procedure
 -- download_kaggle_to_stage() is a separate setup job. Run it after scripts are
@@ -915,8 +922,9 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_capacity_probe(
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_capacity_probe';
 
--- Baseline capacity probe: BASELINE_CONCURRENT_NODES must equal SYNREG_CPU_SHARDS
--- (6 by default). Lower values are rejected; request quota or change shard count.
+-- Baseline capacity probe: BASELINE_CONCURRENT_NODES must equal BASELINE_SHARDS
+-- (default SYNREG_CPU_SHARDS=6). Lower values are rejected; request quota or
+-- increase BASELINE_SHARDS through SYNREG_BASELINE_SHARDS or the BASELINE_SHARDS arg.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_capacity_probe(
   PREP_RUNTIME_ENVIRONMENT STRING,
   BENCHMARK_RUNTIME_ENVIRONMENT STRING,
@@ -1013,6 +1021,26 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_evaluation(
     '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
   )
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_evaluation';
+
+-- Baseline evaluation with explicit shard count: BASELINE_SHARDS controls the number
+-- of shard files written and BASELINE_CONCURRENT_NODES must equal BASELINE_SHARDS.
+-- Use this overload to run more than 6 baseline shards (e.g. BASELINE_SHARDS=10).
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_baseline_evaluation(
+  PREP_RUNTIME_ENVIRONMENT STRING,
+  BENCHMARK_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_SHARDS INTEGER,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_baseline_evaluation_with_shards';
 
 -- Legacy AutoGluon evaluation is single-wave: AUTOGLUON_CONCURRENT_NODES must
 -- equal SYNREG_AUTOGLUON_SHARDS (60 by default). Lower values are rejected.
@@ -1201,6 +1229,21 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_baseline_evaluatio
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_baseline_evaluation';
 
+-- OOD full baseline with explicit shard count: BASELINE_SHARDS and BASELINE_CONCURRENT_NODES
+-- must match. Use to write more than 6 OOD baseline shard files.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_SHARDS INTEGER,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_baseline_evaluation_with_shards';
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_autogluon_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -1351,6 +1394,23 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluatio
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_evaluation';
 
+-- Combined baseline evaluation with explicit shard count: BASELINE_SHARDS controls the
+-- number of shard files written; BASELINE_CONCURRENT_NODES must equal BASELINE_SHARDS.
+-- 1 baseline shard = 1 single-node MLJob = 1 output shard file.
+-- Increasing BASELINE_SHARDS increases required concurrent CPU nodes and output file count.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_SHARDS INTEGER,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_evaluation_with_shards';
+
 -- Combined AutoGluon evaluation — two-argument form uses all defaults from env:
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
@@ -1363,18 +1423,28 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_evaluation_default';
 
--- Combined AutoGluon evaluation — full dynamic form:
--- AUTOGLUON_CLUSTER_SHARDS:      number of logical shard files to write (default 6)
--- AUTOGLUON_WORKERS_PER_SHARD:   target_instances per MLJob cluster   (default 4)
--- AUTOGLUON_TASK_CPUS:           CPUs per individual AutoGluon fit     (default 1)
--- AUTOGLUON_CONCURRENT_CLUSTERS: required single-wave MLJob clusters; must equal
---                                AUTOGLUON_CLUSTER_SHARDS (default 6)
--- AUTOGLUON_TIME_LIMIT_SECONDS:  per-fit time limit in seconds         (default 300)
--- AUTOGLUON_PRESETS:             AutoGluon presets string              (default best_quality)
--- AUTOGLUON_ENTRYPOINT:          Ray entrypoint filename               (default evaluate_synthetic_regression_autogluon_ray.py)
--- Lower AUTOGLUON_CONCURRENT_CLUSTERS values are rejected. To reduce quota,
--- explicitly reduce AUTOGLUON_CLUSTER_SHARDS and pass the same expected shard
--- count to aggregation.
+-- Combined AutoGluon evaluation — full dynamic form.
+-- Supports two execution modes controlled by AUTOGLUON_CLUSTER_SHARDS:
+--
+-- Ray distributed cluster-shard mode (AUTOGLUON_CLUSTER_SHARDS > 0):
+--   AUTOGLUON_CLUSTER_SHARDS:      number of Ray cluster shards / output shard files (e.g. 6)
+--   AUTOGLUON_WORKERS_PER_SHARD:   target_instances per MLJob cluster (e.g. 4)
+--   AUTOGLUON_TASK_CPUS:           CPUs per individual AutoGluon fit  (default 1)
+--   AUTOGLUON_CONCURRENT_CLUSTERS: must equal AUTOGLUON_CLUSTER_SHARDS; lower values fail fast
+--   AUTOGLUON_TIME_LIMIT_SECONDS:  per-fit time limit in seconds      (default 300)
+--   AUTOGLUON_PRESETS:             AutoGluon presets string           (default best_quality)
+--   entrypoint:                    always autogluon_ray.py (derived internally)
+--   total containers = AUTOGLUON_CLUSTER_SHARDS x AUTOGLUON_WORKERS_PER_SHARD
+--   aggregation expects N = AUTOGLUON_CLUSTER_SHARDS output shard files
+--
+-- Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):
+--   AUTOGLUON_CLUSTER_SHARDS:      0 (selects single-node mode)
+--   AUTOGLUON_WORKERS_PER_SHARD:   must be 1 (single-node; no multi-instance MLJob)
+--   AUTOGLUON_CONCURRENT_CLUSTERS: concurrent single-node shard jobs (e.g. 30)
+--   entrypoint:                    always evaluate_synthetic_regression.py (derived internally)
+--   total containers = AUTOGLUON_CONCURRENT_CLUSTERS
+--   aggregation expects N = AUTOGLUON_CONCURRENT_CLUSTERS output shard files
+--   no Ray, no Ray object store, no ray_capacity_probe needed
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
@@ -1383,8 +1453,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
   AUTOGLUON_TASK_CPUS INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
   AUTOGLUON_TIME_LIMIT_SECONDS INTEGER,
-  AUTOGLUON_PRESETS STRING,
-  AUTOGLUON_ENTRYPOINT STRING
+  AUTOGLUON_PRESETS STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -1436,7 +1505,9 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_aggregation';
 
 -- Combined baseline capacity probe: verify DEEPSET_CPU_POOL can scale to all
--- SYNREG_CPU_SHARDS in one wave. Lower BASELINE_CONCURRENT_NODES values fail fast.
+-- BASELINE_SHARDS (default SYNREG_CPU_SHARDS=6) in one wave. Single-wave execution
+-- is enforced. Lower BASELINE_CONCURRENT_NODES values fail fast. Increase BASELINE_SHARDS
+-- through SYNREG_BASELINE_SHARDS env var or the explicit BASELINE_SHARDS SQL arg.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_probe(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -1460,11 +1531,37 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_capacity_probe';
 
--- Combined AutoGluon capacity probe — verify AUTOGLUON_CPU_POOL can satisfy the distributed
--- envelope (concurrent_clusters * workers_per_shard nodes) before evaluation:
--- AUTOGLUON_CONCURRENT_CLUSTERS must equal AUTOGLUON_CLUSTER_SHARDS; lower values fail fast.
--- Uses ray_capacity_probe.py to verify ray.init(address="auto") can attach to all
--- target_instances before the full AutoGluon evaluation runs.
+-- Combined baseline capacity probe with explicit shard count: BASELINE_SHARDS sets the
+-- number of probes submitted; BASELINE_CONCURRENT_NODES must equal BASELINE_SHARDS.
+-- Use when intentionally running with a non-default baseline shard count.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_SHARDS INTEGER,
+  BASELINE_CONCURRENT_NODES INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_baseline_capacity_probe_with_shards';
+
+-- Combined AutoGluon capacity probe — verify AUTOGLUON_CPU_POOL node availability
+-- before evaluation. Mirrors the two execution modes of the evaluation procedure:
+--
+-- Ray distributed mode (AUTOGLUON_CLUSTER_SHARDS > 0):
+--   Submits one ray_capacity_probe.py job per cluster shard, each with
+--   target_instances=AUTOGLUON_WORKERS_PER_SHARD. Verifies the pool can satisfy
+--   AUTOGLUON_CLUSTER_SHARDS * AUTOGLUON_WORKERS_PER_SHARD nodes simultaneously.
+--   AUTOGLUON_CONCURRENT_CLUSTERS must equal AUTOGLUON_CLUSTER_SHARDS.
+--
+-- Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):
+--   Submits AUTOGLUON_CONCURRENT_CLUSTERS single-node capacity_probe.py jobs
+--   (target_instances=1). No Ray. AUTOGLUON_WORKERS_PER_SHARD must be 1.
+-- This probe verifies infrastructure startup/resource visibility only; it does not
+-- validate the worker dataset-access descriptor. Run the worker-access probe below
+-- after this succeeds and before distributed AutoGluon evaluation.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity_probe(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -1490,11 +1587,135 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_capacity_probe';
 
--- Combined split-phase execution with distributed AutoGluon (single-wave):
+-- Combined AutoGluon worker-access probe — verify the worker data-access path
+-- after the capacity probe and before full AutoGluon evaluation. Uses the same
+-- runtime topology parameters as the capacity probe.
+--
+-- Ray distributed mode (AUTOGLUON_CLUSTER_SHARDS > 0):
+--   Submits one autogluon_worker_access_probe.py job per cluster shard, each with
+--   target_instances=AUTOGLUON_WORKERS_PER_SHARD. The Ray driver loads metadata
+--   from SYNTHETIC_REGRESSION_DATASET_INDEX, builds compact item dicts with
+--   dataset_access.mode='scoped_file_url', and sends only those dicts to workers
+--   as Ray task arguments. The driver derives dataset_access.scoped_url with
+--   BUILD_SCOPED_FILE_URL. Workers use SnowflakeFile.open(scoped_url) and do not
+--   create Snowpark sessions or query SYNTHETIC_REGRESSION_DATASET_INDEX.
+--   No AutoGluon training and no full-suite dataset fan-out.
+--
+-- Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):
+--   Submits AUTOGLUON_CONCURRENT_CLUSTERS single-node access probes
+--   (target_instances=1). No Ray. AUTOGLUON_WORKERS_PER_SHARD must be 1.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_worker_access_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_worker_access_probe_default';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_worker_access_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_worker_access_probe';
+
+-- Combined all-in-one evaluation with explicit baseline shard count.
+-- BASELINE_SHARDS: number of baseline shard files to write (default 6); must equal BASELINE_CONCURRENT_NODES.
+-- BASELINE_CONCURRENT_NODES: required single-wave CPU nodes; must equal BASELINE_SHARDS.
+-- Aggregation automatically uses the resolved AutoGluon execution plan output_shards.
+-- 1 baseline shard = 1 single-node MLJob = 1 output shard file.
+-- AutoGluon mode is selected by AUTOGLUON_CLUSTER_SHARDS (see evaluation procedure above).
+-- Set AUTOGLUON_CLUSTER_SHARDS=0 to use single-node shard mode for AutoGluon.
+-- Entrypoints are derived internally from the mode and are not accepted as arguments.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  BASELINE_SHARDS INTEGER,
+  BASELINE_CONCURRENT_NODES INTEGER,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_TASK_CPUS INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  AUTOGLUON_TIME_LIMIT_SECONDS INTEGER,
+  AUTOGLUON_PRESETS STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_evaluation_with_baseline_shards';
+
+-- ===========================================================================
+-- AutoGluon execution mode examples
+-- ===========================================================================
+-- Required operational sequence:
+--   1. run_synthetic_regression_runtime_probes
+--   2. run_synthetic_regression_combined_autogluon_capacity_probe
+--   3. run_synthetic_regression_combined_autogluon_worker_access_probe
+--   4. run_synthetic_regression_combined_autogluon_evaluation
+--   5. run_synthetic_regression_combined_aggregation
+
+-- A. Ray distributed cluster-shard mode (AUTOGLUON_CLUSTER_SHARDS > 0):
+--    6 clusters x 4 workers = 24 containers; 6 AutoGluon shard files.
+--    Use when Ray memory is sufficient and dynamic work-item scheduling is desired.
+--
+-- Capacity probe (verifies 24 CPU_X64_M nodes across 6 Ray clusters):
+-- CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+--   '2.5.0-py311', '2.5.0-py311',
+--   6, 4, 6
+-- );
+-- Worker-access probe (verifies compact item dict transfer and scoped_file_url access):
+-- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
+--   '2.5.0-py311', '2.5.0-py311',
+--   6, 4, 6
+-- );
+-- Evaluation (6 cluster shards x 4 workers each; aggregation expects N=6):
+-- CALL run_synthetic_regression_combined_autogluon_evaluation(
+--   '2.5.0-py311', '2.5.0-py311',
+--   6, 4, 1, 6, 300, 'best_quality'
+-- );
+
+-- B. Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):
+--    30 containers; 30 AutoGluon shard files. No Ray.
+--    Use when memory is constrained or Ray/object-store issues are unreliable.
+--    AUTOGLUON_WORKERS_PER_SHARD must be 1.
+--    AUTOGLUON_CONCURRENT_CLUSTERS is the concurrent single-node shard count.
+--
+-- Capacity probe (verifies 30 single-node CPU_X64_M containers):
+-- CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+--   '2.5.0-py311', '2.5.0-py311',
+--   0, 1, 30
+-- );
+-- Worker-access probe (verifies single-node metadata/dataset access path):
+-- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
+--   '2.5.0-py311', '2.5.0-py311',
+--   0, 1, 30
+-- );
+-- Evaluation (30 single-node shards; aggregation expects N=30):
+-- CALL run_synthetic_regression_combined_autogluon_evaluation(
+--   '2.5.0-py311', '2.5.0-py311',
+--   0, 1, 1, 30, 300, 'best_quality'
+-- );
+
+-- ===========================================================================
+-- Combined split-phase execution — Ray distributed AutoGluon (default):
+-- ===========================================================================
 -- Step 0: Verify node quota before committing to the evaluation runs.
 -- CALL run_synthetic_regression_combined_baseline_capacity_probe('2.5.0-py311', '2.5.0-py311', 6);
 -- ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
 -- CALL run_synthetic_regression_combined_autogluon_capacity_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
+-- CALL run_synthetic_regression_combined_autogluon_worker_access_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
 -- ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 -- Step 1: Run combined split phases.
 CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
@@ -1502,27 +1723,29 @@ CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
 CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
--- Recommended: 6 clusters x 4 workers = 24 concurrent CPU_X64_M nodes, 1 CPU per fit task
+-- Ray mode: 6 clusters x 4 workers = 24 concurrent CPU_X64_M nodes, 1 CPU per fit task
 CALL run_synthetic_regression_combined_autogluon_evaluation(
-  '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality',
-  'evaluate_synthetic_regression_autogluon_ray.py'
+  '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality'
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 -- Aggregation expects 6 AutoGluon shard files (N=6 matches cluster_shards above)
 CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
 
--- Recommended capacity probe calls for reference:
--- CALL run_synthetic_regression_combined_baseline_capacity_probe(
---   '2.5.0-py311', '2.5.0-py311', 6
--- );
+-- ===========================================================================
+-- Combined split-phase execution — single-node AutoGluon (memory-constrained):
+-- ===========================================================================
+-- Step 0: Capacity probe (30 single-node containers, no Ray):
 -- CALL run_synthetic_regression_combined_autogluon_capacity_probe(
---   '2.5.0-py311', '2.5.0-py311', 6, 4, 6
+--   '2.5.0-py311', '2.5.0-py311', 0, 1, 30
 -- );
+-- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
+--   '2.5.0-py311', '2.5.0-py311', 0, 1, 30
+-- );
+-- Step 1: Single-node AutoGluon evaluation (30 shards; aggregation expects N=30):
 -- CALL run_synthetic_regression_combined_autogluon_evaluation(
---   '2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality',
---   'evaluate_synthetic_regression_autogluon_ray.py'
+--   '2.5.0-py311', '2.5.0-py311', 0, 1, 1, 30, 300, 'best_quality'
 -- );
--- CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+-- CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 30);
 -- Final training with explicit runtime lineage variables:
 -- CALL run_model_training(
 --   'market_exchangeable_icl', 'synthetic_regression_combined', 'inductive_forecasting'

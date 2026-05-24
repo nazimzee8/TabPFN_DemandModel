@@ -81,6 +81,7 @@ class TestSplitPhaseStoredProcedures:
         "run_synthetic_regression_combined_deepset_evaluation",
         "run_synthetic_regression_combined_baseline_evaluation",
         "run_synthetic_regression_combined_autogluon_evaluation",
+        "run_synthetic_regression_combined_autogluon_worker_access_probe",
         "run_synthetic_regression_combined_aggregation",
     ])
     def test_combined_phase_procedure_exists(self, name):
@@ -90,6 +91,55 @@ class TestSplitPhaseStoredProcedures:
         sql = self._sql()
         assert "BASELINE_CONCURRENT_NODES INTEGER" in sql
         assert "AUTOGLUON_CONCURRENT_NODES INTEGER" in sql
+
+    def test_baseline_shards_overload_argument_exists(self):
+        """BASELINE_SHARDS INTEGER must appear in the SQL for the new overloads."""
+        assert "BASELINE_SHARDS INTEGER" in self._sql()
+
+    def test_combined_baseline_capacity_probe_4arg_overload_exists(self):
+        """4-arg combined baseline capacity probe overload (BASELINE_SHARDS, BASELINE_CONCURRENT_NODES) must exist."""
+        sql = self._sql()
+        assert "run_synthetic_regression_combined_baseline_capacity_probe_with_shards" in sql
+
+    def test_combined_baseline_evaluation_4arg_overload_exists(self):
+        """4-arg combined baseline evaluation overload (BASELINE_SHARDS, BASELINE_CONCURRENT_NODES) must exist."""
+        sql = self._sql()
+        assert "run_synthetic_regression_combined_baseline_evaluation_with_shards" in sql
+
+    def test_combined_evaluation_with_baseline_shards_overload_exists(self):
+        """Full combined evaluation overload with BASELINE_SHARDS must exist."""
+        sql = self._sql()
+        assert "run_synthetic_regression_combined_evaluation_with_baseline_shards" in sql
+
+    def test_old_combined_baseline_capacity_probe_2arg_still_exists(self):
+        """Backward-compatible 2-arg combined baseline capacity probe must remain."""
+        sql = self._sql()
+        assert "run_synthetic_regression_combined_baseline_capacity_probe_default" in sql
+
+    def test_old_combined_baseline_evaluation_2arg_still_exists(self):
+        """Backward-compatible 2-arg combined baseline evaluation must remain."""
+        sql = self._sql()
+        assert "run_synthetic_regression_combined_baseline_evaluation_default" in sql
+
+    def test_combined_autogluon_worker_access_probe_handlers_exist(self):
+        sql = self._sql()
+        assert (
+            "run_synthetic_regression_evaluation."
+            "run_synthetic_regression_combined_autogluon_worker_access_probe_default"
+        ) in sql
+        assert (
+            "run_synthetic_regression_evaluation."
+            "run_synthetic_regression_combined_autogluon_worker_access_probe"
+        ) in sql
+
+    def test_combined_autogluon_runbook_orders_capacity_worker_access_then_eval(self):
+        sql = self._sql()
+        capacity_pos = sql.index("CALL run_synthetic_regression_combined_autogluon_capacity_probe")
+        worker_access_pos = sql.index(
+            "CALL run_synthetic_regression_combined_autogluon_worker_access_probe"
+        )
+        evaluation_pos = sql.index("CALL run_synthetic_regression_combined_autogluon_evaluation")
+        assert capacity_pos < worker_access_pos < evaluation_pos
 
     def test_concurrency_comments_document_single_wave_rejection(self):
         sql = self._sql()

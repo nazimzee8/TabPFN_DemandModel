@@ -1,4 +1,4 @@
-"""evaluate_synthetic_regression_autogluon_ray.py
+"""autogluon_ray.py
 
 Distributed AutoGluon evaluation entrypoint for Snowflake MLJob multi-instance clusters.
 
@@ -8,15 +8,22 @@ Strategy: Ray work-item distribution (SYNREG_AUTOGLUON_DISTRIBUTED_MODE=ray_work
   - This file is the entrypoint for each MLJob. It starts Ray, then the driver process
     assigns itself one shard index (SYNTHETIC_REGRESSION_SHARD_INDEX) and distributes
     its work items across Ray tasks.
+  - Each Ray task receives a compact metadata/item dict plus an explicit
+    dataset_access descriptor. The driver does NOT put dataset payloads into the Ray object store. This eliminates driver-side
+    object-store memory pressure and reduces per-task object-store pinning. Each worker
+    trades extra local I/O for lower Ray object-store and driver memory pressure.
   - Each Ray task runs one bounded local AutoGluon fit.
   - The DRIVER is the only process that writes the output CSV. Worker tasks return
-    canonical row dicts; they never open Snowpark sessions or write stage files.
+    canonical row dicts; they never query SYNTHETIC_REGRESSION_DATASET_INDEX or write
+    stage files. Current worker dataset access mode is scoped_file_url:
+    the driver derives scoped URLs and workers use SnowflakeFile without sessions.
   - Fallback to single-node mode is DISABLED to prevent duplicate shard file writes.
 
 Invariants:
   - One output file per MLJob: AutoGluon_shard{i}_of_{N}_detailed.csv
   - SYNREG_AUTOGLUON_DISTRIBUTED_MODE must equal "ray_work_items"
   - If Ray init fails, the entrypoint aborts with a clear RuntimeError before writing CSV.
+  - MAX_IN_FLIGHT bounds the number of concurrently executing worker-loaded AutoGluon fits.
 """
 
 import gc
@@ -75,14 +82,19 @@ PRESETS = os.getenv("AUTOGLUON_PRESETS", "best_quality")
 MIN_TMP_FREE_BYTES = _env_int("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", 5368709120)
 MAX_DATASET_BYTES = _env_int("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", 2147483648)
 LOCAL_CACHE = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
-CPU_MAX_FEATURES = _env_int("BENCHMARK_CPU_MAX_PROCESSED_FEATURES", 512)
-CPU_MAX_MATRIX_BYTES = _env_int("BENCHMARK_CPU_MAX_MATRIX_BYTES", 2147483648)
+WORKER_DATA_ACCESS_MODE = os.getenv(
+    "SYNREG_WORKER_DATA_ACCESS_MODE",
+    "scoped_file_url",
+)
+MAX_WORK_ITEM_BYTES = _env_int("SYNREG_MAX_WORK_ITEM_BYTES", 8192)
 
 print(
     f"[ag_ray] resolved env: suite_id={SUITE_ID} shard={SHARD_INDEX}/{NUM_SHARDS} "
     f"cluster_shards={CLUSTER_SHARDS} workers_per_shard={WORKERS_PER_SHARD} "
     f"task_cpus={TASK_CPUS} time_limit={TIME_LIMIT} presets={PRESETS!r} "
-    f"distributed_mode={DISTRIBUTED_MODE!r} results_stage={RESULTS_STAGE!r}",
+    f"distributed_mode={DISTRIBUTED_MODE!r} results_stage={RESULTS_STAGE!r} "
+    f"worker_data_access_mode={WORKER_DATA_ACCESS_MODE!r} "
+    f"max_work_item_bytes={MAX_WORK_ITEM_BYTES}",
     flush=True,
 )
 
@@ -132,18 +144,24 @@ from evaluate_synthetic_regression import (
     load_synthetic_regression_index,
     assign_synthetic_regression_shard,
     expand_synreg_work_items,
-    load_prepared_synthetic_dataset,
+    build_compact_synreg_work_item,
+    compact_work_items_serialized_bytes,
     build_split_for_seed,
     preprocess_train_only,
     compute_regression_metrics,
     write_part_csv_to_stage,
     memory_guard_matrix,
+    _base_autogluon_row,
     _empty_row,
     _skipped_row,
     _failed_row,
     _check_tmp_free_bytes,
 )
-from autogluon_models import get_tabular_predictor_class, predict_autogluon_timed
+from autogluon_models import (
+    get_tabular_predictor_class,
+    make_unique_autogluon_model_dir,
+    predict_autogluon_timed,
+)
 
 print("[ag_ray] imports complete", flush=True)
 
@@ -197,6 +215,11 @@ except Exception as exc:
     ) from exc
 
 print(f"[ag_ray] driver owns shard {SHARD_INDEX}/{NUM_SHARDS}", flush=True)
+print(
+    "[ag_ray] dataset loading mode=scoped_file_url "
+    "driver_metadata_only=true no_driver_ray_put=true",
+    flush=True,
+)
 
 # ---------------------------------------------------------------------------
 # Snowpark session (driver only)
@@ -213,12 +236,27 @@ session = Session.builder.getOrCreate()
 print(f"[ag_ray] loading index suite_id={SUITE_ID!r} …", flush=True)
 all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
 all_work_items = expand_synreg_work_items(all_rows_index, train_size_grid=None)
-my_work_items = assign_synthetic_regression_shard(all_work_items, SHARD_INDEX, NUM_SHARDS)
+assigned_work_items = assign_synthetic_regression_shard(all_work_items, SHARD_INDEX, NUM_SHARDS)
+scoped_url_cache: dict[str, str] = {}
+my_work_items = [
+    build_compact_synreg_work_item(
+        row,
+        session=session,
+        access_mode=WORKER_DATA_ACCESS_MODE,
+        max_item_bytes=MAX_WORK_ITEM_BYTES,
+        scoped_url_cache=scoped_url_cache,
+    )
+    for row in assigned_work_items
+]
+items_total_bytes, items_max_bytes = compact_work_items_serialized_bytes(my_work_items)
 
 print(
     f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS}: "
     f"{len(all_rows_index)} index rows → {len(all_work_items)} work items → "
-    f"{len(my_work_items)} assigned to this shard",
+    f"{len(my_work_items)} compact items assigned to this shard "
+    f"unique_dataset_access_urls={len(scoped_url_cache)} "
+    f"serialized_total_bytes={items_total_bytes} "
+    f"serialized_max_item_bytes={items_max_bytes}",
     flush=True,
 )
 
@@ -231,21 +269,21 @@ if not my_work_items:
 # Pre-fetch AutoGluon predictor class to trigger import errors early.
 get_tabular_predictor_class()
 
+
 # ---------------------------------------------------------------------------
 # Ray remote task
 # ---------------------------------------------------------------------------
 
 @ray.remote(num_cpus=TASK_CPUS)
-def _autogluon_work_item(item_meta: dict, dataset_payload: dict) -> dict:
+def _autogluon_work_item(item_meta: dict) -> dict:
     """Execute one AutoGluon fit+predict for a single (dataset, seed, condition) triple.
 
     Parameters
     ----------
     item_meta : dict
         Work-item metadata (suite_id, dataset_id, split_seed, etc.).
-    dataset_payload : dict
-        Pre-loaded dataset dict with keys X, y, betaX, n_total, etc.
-        Passed through Ray object store; driver downloads each dataset once.
+        The worker loads its own dataset from staged metadata — no dataset payload
+        is passed through the Ray object store.
 
     Returns
     -------
@@ -255,15 +293,20 @@ def _autogluon_work_item(item_meta: dict, dataset_payload: dict) -> dict:
     import gc
     import os
     import shutil
-    import tempfile
 
     import numpy as np
-    from autogluon_models import get_tabular_predictor_class, predict_autogluon_timed
+    from autogluon_models import (
+        get_tabular_predictor_class,
+        make_unique_autogluon_model_dir,
+        predict_autogluon_timed,
+    )
     from evaluate_synthetic_regression import (
+        load_prepared_synthetic_dataset_from_access,
         build_split_for_seed,
         preprocess_train_only,
         compute_regression_metrics,
         memory_guard_matrix,
+        _base_autogluon_row,
         _empty_row,
         _skipped_row,
         _failed_row,
@@ -271,97 +314,92 @@ def _autogluon_work_item(item_meta: dict, dataset_payload: dict) -> dict:
         SYNREG_AG_MIN_TMP_FREE_BYTES,
     )
 
-    suite_id    = item_meta["suite_id"]
+    suite_id     = item_meta["suite_id"]
     suite_family = item_meta.get("suite_family", "primary")
-    dataset_id  = item_meta.get("dataset_id")
+    dataset_id   = item_meta.get("dataset_id")
     dataset_seed = item_meta.get("dataset_seed")
     prior_regime = item_meta.get("prior_regime")
-    split_seed  = int(item_meta["split_seed"])
+    split_seed   = int(item_meta["split_seed"])
     n_train_override = item_meta.get("n_train_override")
 
-    task_cpus   = int(os.getenv("AUTOGLUON_TASK_CPUS", "1"))
-    time_limit  = int(os.getenv("AUTOGLUON_TIME_LIMIT", "300"))
-    presets     = os.getenv("AUTOGLUON_PRESETS", "best_quality")
-    min_tmp     = int(os.getenv("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", "5368709120"))
-    cpu_max_feat = int(os.getenv("BENCHMARK_CPU_MAX_PROCESSED_FEATURES", "512"))
-    cpu_max_mat  = int(os.getenv("BENCHMARK_CPU_MAX_MATRIX_BYTES", "2147483648"))
+    task_cpus        = int(os.getenv("AUTOGLUON_TASK_CPUS", "1"))
+    time_limit       = int(os.getenv("AUTOGLUON_TIME_LIMIT", "300"))
+    presets          = os.getenv("AUTOGLUON_PRESETS", "best_quality")
+    max_dataset_bytes = int(os.getenv("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", "2147483648"))
+    local_cache      = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
 
-    data = dataset_payload
+    # Partial base row — data-derived fields appended after successful load
+    base = _base_autogluon_row(item_meta)
 
-    n_total = int(data["n_total"])
-    p_signal = int(data.get("p_signal", data["X"].shape[1]))
-    p_noise  = int(data.get("p_noise", 0))
-    p_total  = int(data.get("p_total", data["X"].shape[1]))
-    feature_noise_level  = int(data.get("feature_noise_level", 0))
-    target_noise_scale   = float(data.get("target_noise_scale", 1.0))
-    is_anchor = bool(data.get("training_size_anchor", False))
-
-    base = {
-        "suite_id": suite_id,
-        "suite_family": suite_family,
-        "dataset_id": dataset_id,
-        "dataset_seed": dataset_seed,
-        "split_seed": split_seed,
-        "prior_regime": prior_regime,
-        "method": "AutoGluon",
-        "logical_dataset_key": (
-            item_meta.get("logical_dataset_key")
-            or f"{suite_id}:{prior_regime}:{dataset_id:04d}"
-        ),
-        "n_total": n_total,
-        "n_holdout": int(data.get("n_holdout_default", n_total // 5)),
-        "p_signal": p_signal,
-        "p_noise": p_noise,
-        "p_total": p_total,
-        "feature_noise_level": feature_noise_level,
-        "target_noise_scale": target_noise_scale,
-        "training_size_anchor": (
-            n_train_override == item_meta.get("_anchor_n") if n_train_override is not None
-            else is_anchor
-        ),
-    }
-
-    # Guard: /tmp free space
+    # Guard: /tmp free space (before loading dataset)
     free_bytes = _check_tmp_free_bytes()
-    if free_bytes < min_tmp:
+    if free_bytes < SYNREG_AG_MIN_TMP_FREE_BYTES:
         return _skipped_row(
             base,
-            f"insufficient_tmp_space (free={free_bytes} < {min_tmp})",
+            f"insufficient_tmp_space (free={free_bytes} < {SYNREG_AG_MIN_TMP_FREE_BYTES})",
         )
 
     ag_path = None
+    data = None
+    X_train = y_train = X_holdout = betaX_holdout = y_holdout = None
+    X_train_p = X_holdout_p = None
     try:
+        data = load_prepared_synthetic_dataset_from_access(item_meta, local_cache)
+
+        # Guard: dataset payload size (computed locally, no ray.put)
+        dataset_bytes = sum(int(getattr(v, "nbytes", 0)) for v in data.values())
+        if dataset_bytes > max_dataset_bytes:
+            return _skipped_row(
+                base,
+                (
+                    "autogluon_dataset_too_large "
+                    f"(dataset_bytes={dataset_bytes} > {max_dataset_bytes})"
+                ),
+            )
+
+        n_total = int(data["n_total"])
+        p_signal = int(data.get("p_signal", data["X"].shape[1]))
+        p_noise  = int(data.get("p_noise", 0))
+        p_total  = int(data.get("p_total", data["X"].shape[1]))
+        feature_noise_level = int(data.get("feature_noise_level", 0))
+        target_noise_scale  = float(data.get("target_noise_scale", 1.0))
+        is_anchor = bool(data.get("training_size_anchor", False))
+
+        base.update({
+            "n_total": n_total,
+            "n_holdout": int(data.get("n_holdout_default", n_total // 5)),
+            "p_signal": p_signal,
+            "p_noise": p_noise,
+            "p_total": p_total,
+            "feature_noise_level": feature_noise_level,
+            "target_noise_scale": target_noise_scale,
+            "training_size_anchor": bool(item_meta.get("training_size_anchor", is_anchor)),
+        })
+
         split = build_split_for_seed(data, split_seed, n_train_override)
         X_train, y_train = split["X_train"], split["y_train"]
-        X_holdout = split["X_holdout"]
+        X_holdout    = split["X_holdout"]
         betaX_holdout = split["betaX_holdout"]
-        y_holdout = split["y_holdout"]
-        n_train   = split["n_train"]
-        n_holdout = split["n_holdout"]
+        y_holdout    = split["y_holdout"]
+        n_train      = split["n_train"]
+        n_holdout    = split["n_holdout"]
         base["n_train"]   = n_train
         base["n_holdout"] = n_holdout
 
         X_train_p, X_holdout_p = preprocess_train_only(X_train, X_holdout)
 
-        # Guard: CPU matrix size
-        n_feat = X_train_p.shape[1]
-        matrix_bytes = X_train_p.nbytes + X_holdout_p.nbytes
-        if n_feat > cpu_max_feat:
-            return _skipped_row(
-                base,
-                f"cpu_matrix_too_large (features={n_feat} > {cpu_max_feat})",
-            )
-        if matrix_bytes > cpu_max_mat:
-            return _skipped_row(
-                base,
-                f"cpu_matrix_too_large (matrix_bytes={matrix_bytes} > {cpu_max_mat})",
-            )
+        skip_reason = memory_guard_matrix(X_train_p, X_holdout_p)
+        if skip_reason:
+            return _skipped_row(base, skip_reason)
 
         get_tabular_predictor_class()
 
-        ag_path = os.path.join(
-            tempfile.gettempdir(),
-            f"ag_ray_{dataset_id}_{split_seed}_{n_train_override or 'def'}"
+        ag_path = make_unique_autogluon_model_dir(
+            {
+                **item_meta,
+                "shard_index": os.getenv("SYNTHETIC_REGRESSION_SHARD_INDEX", "na"),
+            },
+            prefix="ag_ray",
         )
         y_pred, fit_time, predict_time = predict_autogluon_timed(
             X_train_p,
@@ -401,41 +439,24 @@ def _autogluon_work_item(item_meta: dict, dataset_payload: dict) -> dict:
                     shutil.rmtree(ag_path, ignore_errors=True)
             except Exception:
                 pass
+        # Explicitly release large objects to reduce worker memory pressure
+        try: del data
+        except NameError: pass
+        try: del X_train
+        except NameError: pass
+        try: del y_train
+        except NameError: pass
+        try: del X_holdout
+        except NameError: pass
+        try: del betaX_holdout
+        except NameError: pass
+        try: del y_holdout
+        except NameError: pass
+        try: del X_train_p
+        except NameError: pass
+        try: del X_holdout_p
+        except NameError: pass
         gc.collect()
-
-
-# ---------------------------------------------------------------------------
-# Dataset loading helpers (driver only, bounded in-flight)
-# ---------------------------------------------------------------------------
-
-def _load_dataset_for_item(item: dict) -> dict:
-    """Download and return the dataset for a work item (driver-side)."""
-    return load_prepared_synthetic_dataset(item, LOCAL_CACHE)
-
-
-def _dataset_payload_nbytes(payload: dict) -> int:
-    total = 0
-    for value in payload.values():
-        nbytes = getattr(value, "nbytes", None)
-        if nbytes is not None:
-            total += int(nbytes)
-    return total
-
-
-def _base_row_for_item(item: dict) -> dict:
-    return {
-        "suite_id": SUITE_ID,
-        "suite_family": item.get("suite_family", "primary"),
-        "dataset_id": item.get("dataset_id"),
-        "dataset_seed": item.get("dataset_seed"),
-        "split_seed": int(item.get("split_seed", 0)),
-        "prior_regime": item.get("prior_regime"),
-        "method": "AutoGluon",
-        "logical_dataset_key": (
-            item.get("logical_dataset_key")
-            or f"{SUITE_ID}:{item.get('prior_regime')}:{item.get('dataset_id', 0):04d}"
-        ),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -455,8 +476,10 @@ print(
     flush=True,
 )
 
+expected_work_items = len(my_work_items)
 output_rows: list[dict] = []
-pending: list[tuple[ray.ObjectRef, dict]] = []  # (future, item_meta)
+pending: list[ray.ObjectRef] = []  # futures only; workers load datasets independently
+future_to_item: dict[ray.ObjectRef, dict] = {}
 item_iter = iter(my_work_items)
 items_exhausted = False
 submitted = 0
@@ -469,59 +492,37 @@ while True:
         if item is None:
             items_exhausted = True
             break
-        # Driver downloads dataset; passed to worker via Ray object store
-        try:
-            dataset_payload = _load_dataset_for_item(item)
-        except Exception as exc:
-            # Dataset load failure → emit failed row without submitting Ray task
-            base = _base_row_for_item(item)
-            output_rows.append(_failed_row(base, type(exc).__name__, str(exc)[:500]))
-            print(
-                f"[ag_ray] dataset load failed for item "
-                f"dataset_id={item.get('dataset_id')} split_seed={item.get('split_seed')}: {exc}",
-                flush=True,
-            )
-            continue
-
-        dataset_bytes = _dataset_payload_nbytes(dataset_payload)
-        if dataset_bytes > MAX_DATASET_BYTES:
-            output_rows.append(
-                _skipped_row(
-                    _base_row_for_item(item),
-                    (
-                        "autogluon_dataset_too_large "
-                        f"(dataset_bytes={dataset_bytes} > {MAX_DATASET_BYTES})"
-                    ),
-                )
-            )
-            del dataset_payload
-            continue
-
-        payload_ref = ray.put(dataset_payload)
-        future = _autogluon_work_item.remote(item, payload_ref)
-        pending.append((future, item))
+        # Workers load their own datasets; driver passes only small item metadata
+        future = _autogluon_work_item.remote(item)
+        pending.append(future)
+        future_to_item[future] = item
         submitted += 1
-        del dataset_payload  # release local reference; worker gets it via object store
 
     if not pending:
         break  # all work done
 
     # Collect one completed result (blocking)
-    done_futures, remaining_futures = ray.wait(
-        [f for f, _ in pending],
-        num_returns=1,
-        timeout=None,
-    )
+    done_futures, _ = ray.wait(pending, num_returns=1, timeout=None)
     if done_futures:
         done_future = done_futures[0]
-        pending = [(f, m) for f, m in pending if f != done_future]
+        pending.remove(done_future)
+        item_meta = future_to_item.pop(done_future)
         try:
             row = ray.get(done_future)
             output_rows.append(row)
         except Exception as exc:
-            # Ray task raised unexpectedly (not caught inside the task)
-            print(f"[ag_ray] unexpected Ray task error: {exc}", flush=True)
+            # Ray task raised unexpectedly outside the worker's handled path.
+            print(f"[ag_ray] unexpected Ray task error; emitting failed row: {exc}", flush=True)
+            output_rows.append(
+                _failed_row(
+                    _base_autogluon_row(item_meta),
+                    type(exc).__name__,
+                    str(exc)[:500],
+                )
+            )
+        del done_future
         completed += 1
+        gc.collect()
         if completed % 10 == 0:
             print(
                 f"[ag_ray] progress: submitted={submitted} completed={completed} "
@@ -546,6 +547,17 @@ if not output_rows:
         "Check that the combined suite index is populated and all datasets are accessible."
     )
 
+if (
+    submitted != expected_work_items
+    or completed != expected_work_items
+    or len(output_rows) != expected_work_items
+):
+    raise RuntimeError(
+        f"[ag_ray] Incomplete Ray work item accounting for shard {SHARD_INDEX}/{NUM_SHARDS}: "
+        f"expected={expected_work_items} submitted={submitted} completed={completed} "
+        f"output_rows={len(output_rows)}. Refusing to write a partial shard CSV."
+    )
+
 ok_count = sum(1 for r in output_rows if r.get("status") == "ok")
 skip_count = sum(1 for r in output_rows if r.get("status") == "skipped")
 fail_count = sum(1 for r in output_rows if r.get("status") == "failed")
@@ -559,9 +571,8 @@ print(
 # Write output — driver only, exactly one file
 # ---------------------------------------------------------------------------
 
-# Override SYNREG_RESULTS_STAGE so write_part_csv_to_stage uses the correct stage path.
-os.environ["SYNREG_RESULTS_STAGE"] = RESULTS_STAGE
-
+# SYNREG_RESULTS_STAGE was captured at module import time from the required
+# SYNREG_RESULTS_STAGE env var; write_part_csv_to_stage uses that constant directly.
 write_part_csv_to_stage(
     session,
     output_rows,

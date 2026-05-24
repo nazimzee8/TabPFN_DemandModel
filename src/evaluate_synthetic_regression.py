@@ -40,7 +40,11 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from snowflake.snowpark import Session
 
-from autogluon_models import get_tabular_predictor_class, predict_autogluon_timed
+from autogluon_models import (
+    get_tabular_predictor_class,
+    make_unique_autogluon_model_dir,
+    predict_autogluon_timed,
+)
 from baseline_models import make_baseline_model, validate_baseline_dependencies
 from deepset_inference import (
     deepset_gpu_memory_skip_reason,
@@ -69,6 +73,11 @@ SYNREG_RESULTS_STAGE = os.getenv(
 )
 SYNREG_OUTPUT_STAGE = os.getenv("SYNREG_OUTPUT_STAGE", "@EVALUATION_RESULTS_STAGE")
 SYNREG_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
+SYNREG_WORKER_DATA_ACCESS_MODE = os.getenv(
+    "SYNREG_WORKER_DATA_ACCESS_MODE",
+    "scoped_file_url",
+)
+SYNREG_MAX_WORK_ITEM_BYTES = int(os.getenv("SYNREG_MAX_WORK_ITEM_BYTES", "8192"))
 CHECKPOINT_STAGE_PATH = "@MODEL_STAGE/checkpoints/best.pt"
 SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH = os.getenv(
     "SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH",
@@ -506,6 +515,110 @@ def expand_synreg_work_items(
     return items
 
 
+SYNREG_COMPACT_WORK_ITEM_KEYS = (
+    "suite_id",
+    "suite_family",
+    "logical_dataset_key",
+    "dataset_id",
+    "dataset_seed",
+    "prior_regime",
+    "split_seed",
+    "n_train_override",
+    "n_train_default",
+    "n_holdout_default",
+    "n_total",
+    "p_signal",
+    "p_noise",
+    "p_total",
+    "feature_noise_level",
+    "target_noise_scale",
+    "training_size_anchor",
+    "stage_path",
+)
+
+
+def _json_scalar(value):
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def build_compact_synreg_work_item(
+    row: dict,
+    *,
+    session=None,
+    access_mode: str | None = None,
+    max_item_bytes: int | None = None,
+    scoped_url_cache: dict[str, str] | None = None,
+) -> dict:
+    """Build the compact Ray task argument for one synthetic-regression work item.
+
+    The dict intentionally contains metadata only. Full dataset arrays are loaded
+    by the worker from the explicit dataset_access descriptor.
+    """
+    access_mode = access_mode or SYNREG_WORKER_DATA_ACCESS_MODE
+    max_item_bytes = SYNREG_MAX_WORK_ITEM_BYTES if max_item_bytes is None else int(max_item_bytes)
+    stage_path = row.get("stage_path")
+    if not stage_path:
+        raise RuntimeError("Cannot build compact work item without row['stage_path'].")
+
+    item = {}
+    for key in SYNREG_COMPACT_WORK_ITEM_KEYS:
+        if key == "training_size_anchor":
+            value = row.get("is_anchor", row.get("training_size_anchor", False))
+        else:
+            value = row.get(key)
+        item[key] = _json_scalar(value)
+
+    item["dataset_access"] = {
+        "mode": access_mode,
+        "stage_path": _json_scalar(stage_path),
+    }
+    if access_mode == "scoped_file_url":
+        if session is None:
+            raise RuntimeError(
+                "build_compact_synreg_work_item requires a driver Snowpark session "
+                "to derive dataset_access.scoped_url for access_mode='scoped_file_url'."
+            )
+        if scoped_url_cache is not None and stage_path in scoped_url_cache:
+            scoped_url = scoped_url_cache[stage_path]
+        else:
+            scoped_url = build_scoped_dataset_file_url(session, stage_path)
+            if scoped_url_cache is not None:
+                scoped_url_cache[stage_path] = scoped_url
+        item["dataset_access"]["scoped_url"] = scoped_url
+    else:
+        raise RuntimeError(
+            f"Unsupported synthetic regression worker dataset access mode {access_mode!r}. "
+            "Supported mode: 'scoped_file_url'."
+        )
+
+    encoded = json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+    if len(encoded) > max_item_bytes:
+        raise RuntimeError(
+            f"Compact synthetic regression work item is {len(encoded)} bytes, "
+            f"exceeding SYNREG_MAX_WORK_ITEM_BYTES={max_item_bytes}. "
+            "Refusing to submit unexpected large metadata through Ray."
+        )
+    return item
+
+
+def compact_work_items_serialized_bytes(items: list[dict]) -> tuple[int, int]:
+    """Return (total_bytes, max_item_bytes) for compact work-item logging."""
+    if not items:
+        return 0, 0
+    sizes = [
+        len(json.dumps(item, sort_keys=True, default=str).encode("utf-8"))
+        for item in items
+    ]
+    return sum(sizes), max(sizes)
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -542,6 +655,41 @@ def _stage_path_to_local_name(stage_path: str) -> str:
     return clean.replace("/", "__")
 
 
+def _split_stage_path(stage_path: str) -> tuple[str, str]:
+    if not stage_path or not str(stage_path).startswith("@"):
+        raise RuntimeError(f"Expected Snowflake stage path beginning with '@'; got {stage_path!r}.")
+    raw = str(stage_path)
+    if "/" not in raw:
+        raise RuntimeError(f"Stage path {stage_path!r} does not include a relative file path.")
+    stage_name, relative_path = raw.split("/", 1)
+    if not relative_path:
+        raise RuntimeError(f"Stage path {stage_path!r} does not include a relative file path.")
+    return stage_name, relative_path
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def build_scoped_dataset_file_url(session, stage_path: str) -> str:
+    """Driver-only helper that derives a session-free worker file descriptor."""
+    stage_name, relative_path = _split_stage_path(stage_path)
+    rows = session.sql(
+        f"SELECT BUILD_SCOPED_FILE_URL({stage_name}, {_sql_string_literal(relative_path)}) AS SCOPED_URL"
+    ).collect()
+    if not rows:
+        raise RuntimeError(f"BUILD_SCOPED_FILE_URL returned no rows for {stage_path!r}.")
+    row = rows[0]
+    if hasattr(row, "as_dict"):
+        d = {str(k).lower(): v for k, v in row.as_dict().items()}
+        scoped_url = d.get("scoped_url")
+    else:
+        scoped_url = row[0]
+    if not scoped_url:
+        raise RuntimeError(f"BUILD_SCOPED_FILE_URL returned an empty URL for {stage_path!r}.")
+    return str(scoped_url)
+
+
 def _validate_dataset_metadata(payload: dict, row: dict) -> None:
     """Raise RuntimeError if payload metadata disagrees with index row."""
     checks = [
@@ -570,12 +718,14 @@ def _validate_dataset_metadata(payload: dict, row: dict) -> None:
         )
 
 
-def load_prepared_synthetic_dataset(row: dict, local_cache_dir: str = SYNREG_LOCAL_CACHE) -> dict:
-    """Download dataset from row['stage_path'] and return as dict."""
-    session = Session.builder.getOrCreate()
-
+def _load_prepared_synthetic_dataset_from_stage(
+    row: dict,
+    *,
+    stage_path: str,
+    local_cache_dir: str,
+    session,
+) -> dict:
     os.makedirs(local_cache_dir, exist_ok=True)
-    stage_path = row["stage_path"]
     safe_name = _stage_path_to_local_name(stage_path)
     local_path = os.path.join(local_cache_dir, safe_name)
 
@@ -584,6 +734,10 @@ def load_prepared_synthetic_dataset(row: dict, local_cache_dir: str = SYNREG_LOC
             session.file.get(stage_path, _tmp)
             shutil.move(os.path.join(_tmp, Path(stage_path).name), local_path)
 
+    return _read_dataset_local_file(row, local_path)
+
+
+def _read_dataset_local_file(row: dict, local_path: str) -> dict:
     if local_path.endswith(".parquet"):
         result = _load_parquet_dataset(local_path)
     else:
@@ -613,6 +767,87 @@ def load_prepared_synthetic_dataset(row: dict, local_cache_dir: str = SYNREG_LOC
     result["dataset_id"] = row.get("dataset_id")
     result["dataset_seed"] = row.get("dataset_seed")
     return result
+
+
+def load_prepared_synthetic_dataset(row: dict, local_cache_dir: str = SYNREG_LOCAL_CACHE) -> dict:
+    """Download dataset from row['stage_path'] using a local Snowpark session."""
+    session = Session.builder.getOrCreate()
+    return _load_prepared_synthetic_dataset_from_stage(
+        row,
+        stage_path=row["stage_path"],
+        local_cache_dir=local_cache_dir,
+        session=session,
+    )
+
+
+def load_prepared_synthetic_dataset_from_access(
+    item_meta: dict,
+    local_cache_dir: str = SYNREG_LOCAL_CACHE,
+) -> dict:
+    """Load a worker dataset through the explicit dataset_access descriptor.
+
+    Current production mode is ``scoped_file_url``: the driver derives a scoped
+    URL from the stage path, and Ray workers open the URL with SnowflakeFile
+    without creating Snowpark sessions. Workers must not query
+    SYNTHETIC_REGRESSION_DATASET_INDEX.
+    """
+    dataset_access = item_meta.get("dataset_access") or {}
+    access_mode = dataset_access.get("mode", SYNREG_WORKER_DATA_ACCESS_MODE)
+    stage_path = dataset_access.get("stage_path") or item_meta.get("stage_path")
+    scoped_url = dataset_access.get("scoped_url")
+    if not stage_path:
+        raise RuntimeError("dataset_access.stage_path is required for worker dataset loading.")
+    if access_mode != "scoped_file_url":
+        raise RuntimeError(
+            f"Unsupported synthetic regression worker dataset access mode {access_mode!r}. "
+            "Supported mode: 'scoped_file_url'."
+        )
+    if not scoped_url:
+        raise RuntimeError("dataset_access.scoped_url is required for access_mode='scoped_file_url'.")
+
+    os.makedirs(local_cache_dir, exist_ok=True)
+    dataset_key = _stage_path_to_local_name(stage_path)
+    local_path = os.path.join(local_cache_dir, dataset_key)
+
+    if not os.path.exists(local_path):
+        try:
+            from snowflake.snowpark.files import SnowflakeFile
+        except ImportError as exc:
+            raise RuntimeError(
+                "snowflake.snowpark.files.SnowflakeFile is required for "
+                "session-free scoped_file_url worker dataset access."
+            ) from exc
+        tmp_path = os.path.join(local_cache_dir, f".{dataset_key}.{os.getpid()}.tmp")
+        try:
+            with open(tmp_path, "wb") as dst:
+                with SnowflakeFile.open(scoped_url, "rb", require_scoped_url=True) as src:
+                    shutil.copyfileobj(src, dst)
+            os.replace(tmp_path, local_path)
+            tmp_path = None  # published; do not delete in except
+        except Exception:
+            try:
+                if tmp_path is not None and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            if not os.path.exists(local_path):
+                raise
+            # Another worker published first; proceed to read their complete file
+
+    # Pre-read validation
+    if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+        raise RuntimeError(
+            f"Dataset cache file missing or empty for {stage_path!r}: {local_path}"
+        )
+    if local_path.endswith(".parquet"):
+        try:
+            pq.read_schema(local_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Dataset cache file is not valid Parquet for {stage_path!r}: {exc}"
+            ) from exc
+
+    return _read_dataset_local_file(item_meta, local_path)
 
 
 def build_split_for_seed(data: dict, split_seed: int, n_train_override: int | None = None) -> dict:
@@ -818,6 +1053,25 @@ def _failed_row(base: dict, error_type: str, error_message: str) -> dict:
     row["mse_betaX"] = float("nan")
     row["rmse_betaX"] = float("nan")
     return row
+
+
+def _base_autogluon_row(item_meta: dict) -> dict:
+    dataset_id = item_meta.get("dataset_id")
+    prior_regime = item_meta.get("prior_regime")
+    suite_id = item_meta.get("suite_id")
+    logical_dataset_key = item_meta.get("logical_dataset_key")
+    if not logical_dataset_key and dataset_id is not None:
+        logical_dataset_key = f"{suite_id}:{prior_regime}:{int(dataset_id):04d}"
+    return {
+        "suite_id": suite_id,
+        "suite_family": item_meta.get("suite_family", "primary"),
+        "dataset_id": dataset_id,
+        "dataset_seed": item_meta.get("dataset_seed"),
+        "split_seed": int(item_meta.get("split_seed", 0)),
+        "prior_regime": prior_regime,
+        "method": "AutoGluon",
+        "logical_dataset_key": logical_dataset_key,
+    }
 
 
 def write_part_csv_to_stage(
@@ -1411,9 +1665,9 @@ def run_autogluon_synthetic_regression() -> None:
                         output_rows.append(_skipped_row(base, skip_reason))
                         continue
 
-                    ag_path = os.path.join(
-                        tempfile.gettempdir(),
-                        f"ag_synreg_{dataset_id}_{split_seed}_{n_train_override or 'def'}"
+                    ag_path = make_unique_autogluon_model_dir(
+                        {"dataset_id": dataset_id, "split_seed": split_seed, "prior_regime": prior_regime},
+                        prefix="ag_synreg",
                     )
                     y_pred, fit_time, predict_time = predict_autogluon_timed(
                         X_train_p,

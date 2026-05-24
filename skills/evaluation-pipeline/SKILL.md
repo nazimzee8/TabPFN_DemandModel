@@ -3,7 +3,7 @@ name: evaluation-pipeline
 description: >
   Reference for the synthetic-regression evaluation pipeline. Use when
   modifying any of: run_synthetic_regression_evaluation.py,
-  evaluate_synthetic_regression.py, evaluate_synthetic_regression_autogluon_ray.py,
+  evaluate_synthetic_regression.py, autogluon_ray.py,
   prepare_synthetic_regression.py, or when adding a new evaluation suite or model.
   Covers sharding, env vars, compute topology, checkpoint contract, and the
   reproducibility checklist for new suites.
@@ -26,7 +26,7 @@ description: >
 | `deepset` | 10 | GPU | none | none | `evaluate_synthetic_regression.py` |
 | `baselines` | 6 | CPU | `catboost==1.2.10` | `TABPFN_PYPI_EAI` | `evaluate_synthetic_regression.py` |
 | `autogluon` (single-node) | 60 | `AUTOGLUON_CPU_POOL` | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` | `evaluate_synthetic_regression.py` |
-| `autogluon` (ray_work_items) | 6 clusters × 4 workers | `AUTOGLUON_CPU_POOL` | `autogluon.tabular==1.3.0` | `TABPFN_PYPI_EAI` | `evaluate_synthetic_regression_autogluon_ray.py` |
+| `autogluon` (ray_work_items) | 6 clusters × 4 workers | `AUTOGLUON_CPU_POOL` | `autogluon.tabular==1.3.0` + `ray` | `TABPFN_PYPI_EAI` | `autogluon_ray.py` |
 | `aggregate` | 1 | CPU | none | none | `evaluate_synthetic_regression.py` |
 
 **Shard assignment:** `enumerate_idx % SYNREG_NUM_SHARDS == SYNREG_SHARD_INDEX` (deterministic, always `ORDER BY suite_id, suite_family, prior_regime, dataset_id, ...`).
@@ -62,7 +62,7 @@ Same pattern for all three full suites (main / OOD full / combined):
 | 2 | Capacity probes (GPU→CPU→AG, non-overlapping) | all 3 |
 | 3 | Prep — `prepare_synthetic_regression.py` | `DEEPSET_CPU_POOL` |
 | 4 | DeepSet — 10 GPU shards | `DEEPSET_GPU_POOL` |
-| 5 | Baselines — 6 CPU shards (concurrency-limited waves) | `DEEPSET_CPU_POOL` |
+| 5 | Baselines — `BASELINE_SHARDS` CPU shards (default 6); 1 shard = 1 MLJob = 1 shard file | `DEEPSET_CPU_POOL` |
 | 6 | AutoGluon — 6 cluster shards × 4 workers | `AUTOGLUON_CPU_POOL` |
 | 7 | Aggregation — 1 CPU job | `DEEPSET_CPU_POOL` |
 
@@ -135,6 +135,15 @@ Requirements for a valid checkpoint in this pipeline:
 **10 models** (run sequentially per shard, same split):
 `FixedRidgeLambda1`, `LinearRegression`, `Ridge`, `RandomForest`, `XGBoost`, `LightGBM`, `CatBoost`, `KNN`, `SVR`, `MLP`
 
+**Runtime-configurable shard count:**
+
+| Variable / SQL arg | Default | Description |
+|--------------------|---------|-------------|
+| `SYNREG_BASELINE_SHARDS` / `BASELINE_SHARDS` | `SYNREG_CPU_SHARDS` = 6 | Number of baseline shard files written; 1 shard = 1 MLJob = 1 output file |
+| `SYNREG_BASELINE_CONCURRENT_NODES` / `BASELINE_CONCURRENT_NODES` | 6 | Required single-wave CPU nodes; must equal `BASELINE_SHARDS` |
+
+`BASELINE_CONCURRENT_NODES` must **equal** `BASELINE_SHARDS`. Lower values are rejected (no multi-wave batching). Aggregation must expect the same resolved shard count.
+
 **Memory guards:**
 
 | Variable | Default | Purpose |
@@ -148,23 +157,43 @@ For `training_size` suite family: each index row expands across `SYNTHETIC_REGRE
 
 ---
 
-## 9. AutoGluon ray_work_items Mode
+## 9. AutoGluon Execution Modes
+
+Two execution modes are supported for the combined suite (`linear_all_v1`). The mode is selected
+by the `AUTOGLUON_CLUSTER_SHARDS` SQL argument / `SYNREG_AUTOGLUON_CLUSTER_SHARDS` env var.
+
+### 9A. Ray distributed cluster-shard mode (`CLUSTER_SHARDS > 0`)
 
 **Topology:** N cluster shards submitted as MLJobs with `target_instances=WORKERS_PER_SHARD`.
 
 Each MLJob:
 1. Starts Ray cluster (`ray.init()`; abort if fails)
-2. Driver loads index → expands work items → assigns shard via modulo
-3. Driver downloads datasets, calls `ray.put(payload)`
-4. Submits `_autogluon_work_item.remote(item, payload_ref)` tasks
-5. Bounded in-flight pool (size = `MAX_IN_FLIGHT`)
-6. Driver collects results, writes **one CSV per cluster shard** (workers never write)
+2. Driver opens Snowpark session and loads metadata only from `SYNTHETIC_REGRESSION_DATASET_INDEX`
+3. Driver expands work items, assigns shard via modulo, and builds small item dicts
+4. Driver enriches each item dict with `dataset_access.mode='scoped_file_url'` and
+   `dataset_access.scoped_url` derived from the stage path with `BUILD_SCOPED_FILE_URL`
+5. Driver submits `_autogluon_work_item.remote(item)` and passes **only the small item dict**
+6. Each worker receives the small item dict as a Ray task argument and loads its own dataset
+   with `SnowflakeFile.open(scoped_url)` without creating a Snowpark session
+7. Workers apply dataset-size, feature, and matrix guards, then run AutoGluon fit/predict
+8. Bounded in-flight pool (size = `MAX_IN_FLIGHT`) bounds active worker-loaded fits
+9. Driver collects small result rows, writes **one CSV per cluster shard** (workers never write)
+
+**Worker-local dataset loading:** The driver does **not** download full datasets and does
+**not** call `ray.put(dataset)`. Full dataset payloads must not flow through the Ray
+driver or Ray object store. The Ray task argument is a small serializable item dict,
+not the dataset bytes. Session-free worker loading is required: the driver generates
+the scoped file URL while it has a Snowpark session, and the worker opens that scoped
+URL with `snowflake.snowpark.files.SnowflakeFile`. Workers must not call
+`Session.builder.getOrCreate()` and must never query `SYNTHETIC_REGRESSION_DATASET_INDEX`.
+If scoped URLs fail in the Snowflake MLJob environment, fail clearly; do not silently
+return to driver-side dataset downloads or worker-created Snowpark sessions.
 
 **Key env vars:**
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | 6 | Logical cluster shards |
+| `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | 6 | Logical cluster shards (> 0 → Ray mode) |
 | `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` | 4 | `target_instances` per MLJob |
 | `AUTOGLUON_TASK_CPUS` | 1 | CPUs per Ray task |
 | `AUTOGLUON_TIME_LIMIT` | 300 | Per-fit seconds |
@@ -172,10 +201,14 @@ Each MLJob:
 | `SYNREG_AUTOGLUON_MAX_IN_FLIGHT` | `WORKERS_PER_SHARD` | Pending Ray task pool size |
 | `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES` | 5368709120 (~5 GB) | /tmp guard |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution mode |
-| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Max simultaneous cluster MLJobs |
+| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Must equal `CLUSTER_SHARDS` (single-wave) |
+| `SYNREG_WORKER_DATA_ACCESS_MODE` | `scoped_file_url` | Driver-derived scoped URL; workers do not create Snowpark sessions |
+| `SYNREG_MAX_WORK_ITEM_BYTES` | 8192 | Compact Ray item metadata size guard |
 | `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` | 512 | Skip work item if number of features exceeds threshold (note: baseline mode default is 2000) |
 | `BENCHMARK_CPU_MAX_MATRIX_BYTES` | 2,147,483,648 | Skip work item if feature matrix bytes exceed threshold (note: baseline mode default is 536,870,912) |
-| `SYNREG_AUTOGLUON_ENTRYPOINT` | `evaluate_synthetic_regression_autogluon_ray.py` | Ray entrypoint filename; override for testing |
+
+**Derived entrypoint:** Ray mode derives `autogluon_ray.py` internally. Do not expose
+or accept an arbitrary runtime entrypoint for normal distributed AutoGluon execution.
 
 **Startup validation sequence (fail-before-CSV guarantee):**
 - `DISTRIBUTED_MODE != "ray_work_items"` → `RuntimeError` immediately
@@ -183,16 +216,102 @@ Each MLJob:
 - `ray.init()` fails → `RuntimeError` (abort before any work item is processed)
 - CPU count check (`psutil.cpu_count() < MIN_CPUS`) → `RuntimeError`
 
+**SQL example (Ray mode):**
+```sql
+CALL run_synthetic_regression_combined_autogluon_capacity_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
+CALL run_synthetic_regression_combined_autogluon_worker_access_probe('2.5.0-py311', '2.5.0-py311', 6, 4, 6);
+CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality');
+```
+
+### 9B. Single-node shard mode (`CLUSTER_SHARDS = 0`)
+
+**Topology:** N single-instance MLJobs (`target_instances=1`), each running
+`evaluate_synthetic_regression.py` with `mode=autogluon`. No Ray cluster is formed.
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `SYNREG_AUTOGLUON_CLUSTER_SHARDS` | **0** | Selects single-node mode |
+| `SYNREG_AUTOGLUON_WORKERS_PER_SHARD` | 1 | Must be 1; each shard is one container |
+| `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | N | Number of shards = `output_shards` |
+
+**Derived entrypoint:** Single-node mode derives `evaluate_synthetic_regression.py`
+internally. Do not expose or accept an arbitrary runtime entrypoint for normal
+single-node AutoGluon execution.
+
+- Output files: `AutoGluon_shard{i}_of_{N}_detailed.csv` where `N = CONCURRENT_CLUSTERS`.
+- Aggregation `SYNREG_EXPECTED_AG_SHARDS` = `CONCURRENT_CLUSTERS` (not `CLUSTER_SHARDS`).
+  `run_synthetic_regression_combined_evaluation` wires this automatically via `ag_plan.output_shards`.
+- Capacity probes use `capacity_probe.py` with `target_instances=1`.
+- `WORKERS_PER_SHARD > 1` is rejected by `_resolve_combined_autogluon_execution_plan`.
+- The `autogluon_ray.py` entrypoint is forbidden in this mode (rejected at plan resolution).
+
+**SQL example (single-node mode):**
+```sql
+CALL run_synthetic_regression_combined_autogluon_capacity_probe('2.5.0-py311', '2.5.0-py311', 0, 1, 30);
+CALL run_synthetic_regression_combined_autogluon_worker_access_probe('2.5.0-py311', '2.5.0-py311', 0, 1, 30);
+CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311', 0, 1, 1, 30, 300, 'best_quality');
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 30);
+```
+
+### 9C. Capacity and worker-access probes
+
+**Capacity probe:** `run_synthetic_regression_combined_autogluon_capacity_probe`
+validates the execution envelope without running AutoGluon training.
+
+Signature:
+```sql
+CALL run_synthetic_regression_combined_autogluon_capacity_probe(
+  '<image_repo>', '<image_tag>',
+  <AUTOGLUON_CLUSTER_SHARDS>, <AUTOGLUON_WORKERS_PER_SHARD>, <AUTOGLUON_CONCURRENT_CLUSTERS>
+);
+```
+
+- Ray mode (`CLUSTER_SHARDS > 0`): submits one MLJob per cluster shard, each with
+  `target_instances=WORKERS_PER_SHARD`, and runs `ray_capacity_probe.py`.
+  Uses the same Ray dependency contract as distributed evaluation
+  (`SYNREG_AG_RAY_PIP`).
+- Single-node mode (`CLUSTER_SHARDS = 0`): submits `CONCURRENT_CLUSTERS`
+  single-instance probes and runs `capacity_probe.py`.
+- The probe verifies container/Ray startup and resource visibility only. It does not
+  download full datasets and does not run AutoGluon.
+
+**Worker-access probe:** `run_synthetic_regression_combined_autogluon_worker_access_probe`
+validates that the deployed worker data-access path works with the same runtime
+parameters as the capacity probe.
+
+Signature:
+```sql
+CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
+  '<image_repo>', '<image_tag>',
+  <AUTOGLUON_CLUSTER_SHARDS>, <AUTOGLUON_WORKERS_PER_SHARD>, <AUTOGLUON_CONCURRENT_CLUSTERS>
+);
+```
+
+- Ray mode uses the same one-cluster-per-shard and `target_instances=WORKERS_PER_SHARD`
+  topology as the capacity probe and distributed evaluation.
+- The Ray driver loads one or more metadata rows from `SYNTHETIC_REGRESSION_DATASET_INDEX`,
+  builds small item dicts, and passes those dicts to Ray workers as task arguments.
+- Workers verify they can receive the dict and resolve the same `scoped_file_url`
+  access mechanism used by production evaluation. The probe must remain lightweight: no AutoGluon training, no full-suite
+  dataset fan-out, and no driver `ray.put(dataset)`.
+- Single-node mode uses the same single-instance topology as the single-node capacity
+  probe. It verifies the single-node metadata/dataset access path without Ray.
+- Failure messages should distinguish scheduling/startup failures from metadata,
+  URL/access-descriptor, or local download failures.
+
+### 9D. Common guardrails (both modes)
+
 **Ephemeral AutoGluon artifacts:**
 - `TabularPredictor.fit(..., path=tmp_dir)` uses `cleanup=True`; all `.pkl` and model artifacts are deleted after inference. No AutoGluon model artifacts are uploaded to Snowflake stages. Only the results CSV is uploaded.
 
 **Multi-instance entrypoint allowlist (`_submit_synreg` guard):**
-- `target_instances > 1` is only permitted for Ray-coordinated entrypoints. The allowlist (`_MULTI_INSTANCE_SYNREG_ENTRYPOINTS`) contains exactly two entries:
-  - `evaluate_synthetic_regression_autogluon_ray.py` — production distributed AutoGluon; calls `ray.init(address="auto")`; driver writes exactly one shard CSV; workers execute work items only.
+- `target_instances > 1` is only permitted for Ray-coordinated entrypoints. The allowlist (`_MULTI_INSTANCE_SYNREG_ENTRYPOINTS`) contains exactly these entries:
+  - `autogluon_ray.py` — production distributed AutoGluon Ray entrypoint; calls `ray.init(address="auto")`; driver writes exactly one shard CSV; workers execute work items only.
   - `ray_capacity_probe.py` — lightweight Ray capacity probe; calls `ray.init(address="auto")`; verifies `EXPECTED_RAY_NODES` and `EXPECTED_RAY_CPUS_MIN`; writes no shard outputs.
+  - `autogluon_worker_access_probe.py` — lightweight worker-access probe; calls `ray.init(address="auto")`; verifies that small item dicts can move from driver to worker and that the configured worker dataset access descriptor can be resolved; writes no shard outputs.
 - All other entrypoints (`evaluate_synthetic_regression.py`, `capacity_probe.py`, etc.) must remain single-instance. Submitting them with `target_instances > 1` raises `RuntimeError` before the Snowflake call.
 - Aggregation does not launch AutoGluon workers. It only consumes completed shard CSVs. One Ray cluster maps to exactly one logical AutoGluon shard.
-- Both allowlisted entrypoints must be staged to `@MODEL_STAGE/scripts/` before running combined AutoGluon evaluation or capacity probe procedures.
+- All allowlisted entrypoints must be staged to `@MODEL_STAGE/scripts/` before running combined AutoGluon evaluation, capacity probe, or worker-access probe procedures.
 
 ---
 

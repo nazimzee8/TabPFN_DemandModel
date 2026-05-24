@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 
 import pandas as pd
 
@@ -125,6 +126,26 @@ def predict_autogluon_timed(
     finally:
         if cleanup:
             shutil.rmtree(model_dir, ignore_errors=True)
+
+
+def make_unique_autogluon_model_dir(item_meta=None, *, base_dir=None, prefix="ag_ray"):
+    """Create a unique temporary model directory with human-readable context."""
+    item_meta = item_meta or {}
+    base_dir = base_dir or tempfile.gettempdir()
+    parts = [
+        prefix,
+        f"shard{item_meta.get('shard_index', 'na')}",
+        str(item_meta.get("prior_regime", "regime_na")),
+        f"d{item_meta.get('dataset_id', 'na')}",
+        f"s{item_meta.get('split_seed', 'na')}",
+        f"pid{os.getpid()}",
+        uuid.uuid4().hex[:12],
+    ]
+    safe_prefix = "_".join(
+        "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in part)
+        for part in parts
+    )
+    return tempfile.mkdtemp(prefix=f"{safe_prefix}_", dir=base_dir)
 
 
 def tmp_free_bytes(tmp_dir="/tmp"):
