@@ -102,16 +102,16 @@ def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) 
 
 
 def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> list[dict]:
-    from snowflake.snowpark import Session
     from evaluate_synthetic_regression import (
         assign_synthetic_regression_shard,
         build_compact_synreg_work_item,
         compact_work_items_serialized_bytes,
+        create_snowpark_session,
         expand_synreg_work_items,
         load_synthetic_regression_index,
     )
 
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
     rows = load_synthetic_regression_index(suite_family=None, session=session)
     if not rows:
         suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "<unset>")
@@ -244,7 +244,21 @@ def _run_ray() -> None:
             "ray mode requires the Snowflake Ray runtime."
         ) from exc
 
-    ray.init(address="auto", ignore_reinit_error=True, log_to_driver=True, include_dashboard=False)
+    ray_address_mode = os.getenv("SYNREG_RAY_ADDRESS_MODE", "auto")
+    if ray_address_mode == "explicit":
+        ray_address = _require_env(
+            "RAY_HEAD_ADDRESS",
+            "SYNREG_RAY_ADDRESS_MODE=explicit requires a Ray head address.",
+        )
+    elif ray_address_mode == "auto":
+        ray_address = "auto"
+    else:
+        raise RuntimeError(
+            f"Unsupported SYNREG_RAY_ADDRESS_MODE={ray_address_mode!r}; "
+            "expected 'auto' or 'explicit'."
+        )
+
+    ray.init(address=ray_address, ignore_reinit_error=True, log_to_driver=True, include_dashboard=False)
     live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
         ray,
         expected_nodes=expected_nodes,

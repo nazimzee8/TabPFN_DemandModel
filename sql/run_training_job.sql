@@ -1686,9 +1686,10 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_worker_a
 --   autogluon_import_complete.import_seconds measures pure import overhead after
 --   the environment is ready.
 --
--- Preinstalled mode (WITH_PIP=FALSE):
---   No pip install at startup; expected to fail import unless AutoGluon is already
---   available in the runtime image. Provides a no-pip scheduling + startup baseline.
+-- No-pip baseline mode (WITH_PIP=FALSE):
+--   No pip install at startup and no AutoGluon/Ray import is attempted. The probe
+--   should succeed even when AutoGluon is not installed, giving a clean scheduling
+--   + image startup baseline.
 --   Compare pip vs no-pip probe waves to estimate bootstrap overhead under concurrency.
 --
 -- PROBE_COUNT: number of independent single-instance MLJobs to submit concurrently.
@@ -1714,6 +1715,105 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_import_timing_probe';
+
+-- ===========================================================================
+-- SPCS custom-image AutoGluon backend procedures
+-- ===========================================================================
+-- AUTOGLUON_IMAGE_REPOSITORY: Snowflake Image Repository for the custom AutoGluon SPCS image.
+-- See sql/create_autogluon_spcs_image_repository.sql for setup commands.
+-- No runtime_environment or pip_requirements are used by SPCS procedures.
+-- AutoGluon, Ray, and all dependencies are preinstalled in the custom OCI image.
+-- Self-managed Ray: head + workers start in SPCS containers; driver connects explicitly.
+
+-- Stage scripts before calling SPCS procedures:
+--   PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   PUT file://scripts/spcs_snowpark_session_probe.py         @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   PUT file://scripts/spcs_ray_head.py                       @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   PUT file://scripts/spcs_ray_worker.py                     @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   PUT file://scripts/autogluon_ray.py                       @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   PUT file://scripts/autogluon_import_timing_probe.py       @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+
+-- SPCS preflight runbook (must be run in order before full evaluation):
+--   Step 1. Import probe — verify image starts and AutoGluon/Ray imports succeed.
+--   Step 2. Session probe — verify Snowflake OAuth token injection (snowflakeService.enabled=true).
+--   Step 3. Capacity probe — verify compute pool can host the requested Ray cluster topology.
+--   Step 4. Worker-access probe — verify presigned-URL dataset loading from workers.
+--   Step 5. One-shard mini evaluation — verify end-to-end with 1 shard before full run.
+--   Step 6. Full distributed evaluation.
+--   Step 7. Aggregation.
+-- Set SYNREG_AUTOGLUON_SPCS_IMAGE in the session before calling:
+--   ALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE = '<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0';
+-- For multi-shard Ray mode, also set SPCS_RAY_HEAD_DNS_SUFFIX:
+--   ALTER SESSION SET SPCS_RAY_HEAD_DNS_SUFFIX = '<schema_lower>.<db_lower>.snowflakecomputing.internal';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_import_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  PROBE_COUNT INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_import_probe';
+
+-- SPCS Snowpark session probe: validates OAuth token injection (snowflakeService.enabled=true)
+-- and Snowpark session creation inside SPCS containers.
+-- The SPCS job spec builder (run_synthetic_regression_evaluation._build_spcs_job_spec) sets
+-- snowflakeService.enabled=true so the container receives the OAuth token at /snowflake/session/token.
+-- Must be run after the import probe and before the capacity probe.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_session_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  PROBE_COUNT INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_session_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_TASK_CPUS INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  AUTOGLUON_TIME_LIMIT INTEGER,
+  AUTOGLUON_PRESETS STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_evaluation';
 
 -- Combined all-in-one evaluation with explicit baseline shard count.
 -- BASELINE_SHARDS: number of baseline shard files to write (default 6); must equal BASELINE_CONCURRENT_NODES.

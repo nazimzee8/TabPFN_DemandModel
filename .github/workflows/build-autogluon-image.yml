@@ -6,8 +6,20 @@ on:
       - main
     paths:
       - "docker/autogluon/**"
-      - "scripts/**"
-      - "src/**"
+      - "scripts/autogluon_import_timing_probe.py"
+      - "scripts/autogluon_ray.py"
+      - "scripts/autogluon_worker_access_probe.py"
+      - "scripts/ray_capacity_probe.py"
+      - "scripts/spcs_ray_head.py"
+      - "scripts/spcs_ray_worker.py"
+      - "scripts/spcs_snowpark_session_probe.py"
+      - "src/autogluon_models.py"
+      - "src/baseline_models.py"
+      - "src/deepset_inference.py"
+      - "src/evaluate_synthetic_regression.py"
+      - "src/model.py"
+      - "src/sanity_checks.py"
+      - ".dockerignore"
       - ".github/workflows/build-autogluon-image.yml"
   workflow_dispatch:
 
@@ -37,13 +49,16 @@ jobs:
           echo "version_tag=${SNOWFLAKE_IMAGE_REPOSITORY}/${IMAGE_NAME}:${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
           echo "sha_tag=${SNOWFLAKE_IMAGE_REPOSITORY}/${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
-      - name: Build image
+      - name: Build image for smoke test
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/autogluon/Dockerfile
           platforms: linux/amd64
+          push: false
           load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ${{ steps.tags.outputs.version_tag }}
             ${{ steps.tags.outputs.sha_tag }}
@@ -60,7 +75,15 @@ jobs:
           username: ${{ secrets.SNOWFLAKE_REGISTRY_USERNAME }}
           password: ${{ secrets.SNOWFLAKE_REGISTRY_PASSWORD }}
 
-      - name: Push image tags
-        run: |
-          docker push "${{ steps.tags.outputs.version_tag }}"
-          docker push "${{ steps.tags.outputs.sha_tag }}"
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/autogluon/Dockerfile
+          platforms: linux/amd64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ steps.tags.outputs.version_tag }}
+            ${{ steps.tags.outputs.sha_tag }}

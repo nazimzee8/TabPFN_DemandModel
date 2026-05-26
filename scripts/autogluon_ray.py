@@ -104,6 +104,11 @@ RAY_READY_POLL_SECONDS = _env_positive_int(
     "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
     10,
 )
+RAY_ADDRESS_MODE = os.getenv("SYNREG_RAY_ADDRESS_MODE", "auto")
+RAY_HEAD_ADDRESS = os.getenv("RAY_HEAD_ADDRESS", "auto")
+# Cluster identity (Finding 6): set by orchestrator to verify driver joined the right shard's head
+SPCS_RAY_RUN_ID = os.getenv("SPCS_RAY_RUN_ID", "")
+SPCS_RAY_SHARD_INDEX = os.getenv("SPCS_RAY_SHARD_INDEX", "")
 
 print(
     f"[ag_ray] resolved env: suite_id={SUITE_ID} shard={SHARD_INDEX}/{NUM_SHARDS} "
@@ -159,6 +164,7 @@ import numpy as np
 
 # Shared helpers from evaluate_synthetic_regression.py (co-located in @MODEL_STAGE/scripts/)
 from evaluate_synthetic_regression import (
+    create_snowpark_session,
     load_synthetic_regression_index,
     assign_synthetic_regression_shard,
     expand_synreg_work_items,
@@ -233,27 +239,76 @@ def _wait_for_ray_capacity(*, expected_nodes: int, expected_cpus_min: int) -> tu
         time.sleep(RAY_READY_POLL_SECONDS)
 
 
-print("[ag_ray] ray init starting", flush=True)
+# Resolve Ray address based on mode
+if RAY_ADDRESS_MODE == "explicit":
+    _ray_address = RAY_HEAD_ADDRESS
+    if not _ray_address or _ray_address == "auto":
+        raise RuntimeError(
+            "[ag_ray] SYNREG_RAY_ADDRESS_MODE=explicit requires RAY_HEAD_ADDRESS "
+            "to be set to the head node address (e.g. 'host:6379'). "
+            "In SPCS, this is the SPCS service DNS name of the Ray head container."
+        )
+elif RAY_ADDRESS_MODE == "auto":
+    _ray_address = "auto"
+else:
+    raise RuntimeError(
+        f"[ag_ray] SYNREG_RAY_ADDRESS_MODE={RAY_ADDRESS_MODE!r} is not supported. "
+        "Supported modes: 'auto' (Snowflake MLJob), 'explicit' (SPCS self-managed Ray)."
+    )
+
+print(
+    f"[ag_ray] ray init starting: address_mode={RAY_ADDRESS_MODE!r} address={_ray_address!r}",
+    flush=True,
+)
 try:
     ray.init(
-        address="auto",
+        address=_ray_address,
         ignore_reinit_error=True,
         log_to_driver=True,
         include_dashboard=False,
     )
-    expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD)
+    # Finding 5: In SPCS (explicit) mode, the Ray head starts with --num-cpus=0, so the
+    # head is a live node that contributes zero CPUs. Expected topology:
+    #   live_nodes  = workers_per_shard + 1  (head + workers)
+    #   available_cpus = workers_per_shard * TASK_CPUS  (only workers have CPUs)
+    # In MLJob (auto) mode, Snowflake manages Ray and the head is not separately counted,
+    # so expected_nodes = WORKERS_PER_SHARD and expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD).
+    if RAY_ADDRESS_MODE == "explicit":
+        expected_nodes = WORKERS_PER_SHARD + 1
+        expected_cpus_min = WORKERS_PER_SHARD * TASK_CPUS
+    else:
+        expected_nodes = WORKERS_PER_SHARD
+        expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD)
     live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
-        expected_nodes=WORKERS_PER_SHARD,
+        expected_nodes=expected_nodes,
         expected_cpus_min=expected_cpus_min,
     )
     print(
         f"[ag_ray] ray ready  cluster_cpus={available_cpus} "
-        f"live_nodes={live_node_count} cluster_resources={dict(cluster_resources)}",
+        f"live_nodes={live_node_count} cluster_resources={dict(cluster_resources)} "
+        f"address_mode={RAY_ADDRESS_MODE!r} expected_nodes={expected_nodes} "
+        f"expected_cpus_min={expected_cpus_min}",
         flush=True,
     )
+    # Finding 6: Cluster identity check — verify this driver connected to its own shard's head.
+    # The head injects a custom resource "spcs_cluster_id_<run_id>_<shard_index>": 1 at startup.
+    if RAY_ADDRESS_MODE == "explicit" and SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX != "":
+        cluster_id_key = f"spcs_cluster_id_{SPCS_RAY_RUN_ID}_{SPCS_RAY_SHARD_INDEX}"
+        if cluster_id_key not in cluster_resources:
+            raise RuntimeError(
+                f"[ag_ray] Cluster identity check FAILED: expected custom resource "
+                f"{cluster_id_key!r} not found in cluster resources {dict(cluster_resources)}. "
+                f"Driver (shard={SHARD_INDEX}) may be connected to the wrong Ray head. "
+                "Check SPCS_RAY_HEAD_DNS_SUFFIX configuration and confirm each shard's "
+                "head container started successfully."
+            )
+        print(
+            f"[ag_ray] cluster identity verified: {cluster_id_key!r} present in cluster resources.",
+            flush=True,
+        )
 except Exception as exc:
     raise RuntimeError(
-        "AutoGluon distributed work-item mode requires a Ray-backed Snowflake MLJob cluster. "
+        "AutoGluon distributed work-item mode requires a Ray-backed cluster. "
         "Ray initialization failed before any output CSV was written. "
         "Falling back to single-node mode is disabled for this entrypoint because it can "
         "create duplicate shard files."
@@ -270,9 +325,7 @@ print(
 # Snowpark session (driver only)
 # ---------------------------------------------------------------------------
 
-from snowflake.snowpark import Session
-
-session = Session.builder.getOrCreate()
+session = create_snowpark_session()
 
 # ---------------------------------------------------------------------------
 # Work-item assignment
@@ -310,6 +363,29 @@ if not my_work_items:
         f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} has zero work items. "
         f"Check that SYNTHETIC_REGRESSION_DATASET_INDEX has rows for suite_id={SUITE_ID!r}."
     )
+
+# Finding 7: Presigned URL expiry validation.
+# Warn if presigned URLs may expire before all work items in this shard complete.
+if WORKER_DATA_ACCESS_MODE == "driver_presigned_url":
+    _expiry_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400"))
+    # Conservative upper bound: all items run sequentially at max time_limit.
+    _estimated_max_shard_seconds = len(my_work_items) * TIME_LIMIT
+    _buffer_seconds = 3600  # 1-hour safety margin
+    if _expiry_seconds < _estimated_max_shard_seconds + _buffer_seconds:
+        print(
+            f"[ag_ray] WARNING presigned URL expiry={_expiry_seconds}s may be insufficient: "
+            f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
+            f"({len(my_work_items)} items × {TIME_LIMIT}s) + buffer={_buffer_seconds}s. "
+            "Consider increasing SYNREG_PRESIGNED_URL_EXPIRY_SECONDS to avoid "
+            "HTTP 403 errors on late-running workers.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[ag_ray] presigned URL expiry ok: expiry={_expiry_seconds}s "
+            f">= estimated_max={_estimated_max_shard_seconds}s + buffer={_buffer_seconds}s.",
+            flush=True,
+        )
 
 # Pre-fetch AutoGluon predictor class to trigger import errors early.
 get_tabular_predictor_class()

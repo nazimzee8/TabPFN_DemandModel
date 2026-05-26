@@ -312,3 +312,83 @@ class TestAutogluonImportTimingProbeSQLDDL:
     def test_staging_instructions_include_probe_script(self):
         sql = self._sql()
         assert "autogluon_import_timing_probe.py" in sql
+
+
+class TestSPCSSQLDDL:
+    """Tests that run_training_job.sql and related SQL files contain SPCS DDL."""
+
+    def _sql(self) -> str:
+        return (ROOT / "sql" / "run_training_job.sql").read_text()
+
+    def _repo_sql(self) -> str:
+        return (ROOT / "sql" / "create_autogluon_spcs_image_repository.sql").read_text()
+
+    def test_image_repository_ddl_exists(self):
+        assert "AUTOGLUON_IMAGE_REPOSITORY" in self._repo_sql()
+
+    def test_image_repository_create_statement(self):
+        assert "CREATE IMAGE REPOSITORY" in self._repo_sql()
+
+    def test_image_repository_show_command(self):
+        assert "SHOW IMAGE REPOSITORIES" in self._repo_sql()
+
+    def test_spcs_import_probe_procedure_exists(self):
+        assert "run_synthetic_regression_autogluon_spcs_import_probe" in self._sql()
+
+    def test_spcs_session_probe_procedure_exists(self):
+        """run_synthetic_regression_autogluon_spcs_session_probe must be defined in SQL."""
+        assert "run_synthetic_regression_autogluon_spcs_session_probe" in self._sql()
+
+    def test_spcs_session_probe_handler_correct(self):
+        assert (
+            "run_synthetic_regression_evaluation."
+            "run_synthetic_regression_autogluon_spcs_session_probe"
+        ) in self._sql()
+
+    def test_spcs_spec_snowflake_service_documented_in_sql(self):
+        """SQL runbook or SPCS comments must reference snowflakeService token injection."""
+        sql = self._sql()
+        # Either in a comment or in the procedure DDL context
+        assert "snowflakeService" in sql or "session/token" in sql or "OAuth" in sql
+
+    def test_spcs_capacity_probe_procedure_exists(self):
+        assert "run_synthetic_regression_combined_autogluon_spcs_capacity_probe" in self._sql()
+
+    def test_spcs_worker_access_probe_procedure_exists(self):
+        assert "run_synthetic_regression_combined_autogluon_spcs_worker_access_probe" in self._sql()
+
+    def test_spcs_evaluation_procedure_exists(self):
+        assert "run_synthetic_regression_combined_autogluon_spcs_evaluation" in self._sql()
+
+    def test_spcs_procedures_have_correct_handlers(self):
+        sql = self._sql()
+        assert "run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_import_probe" in sql
+        assert "run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe" in sql
+        assert "run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe" in sql
+        assert "run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_evaluation" in sql
+
+    def test_spcs_procedures_no_pip_requirements(self):
+        sql = self._sql()
+        # Find SPCS procedure sections and verify they don't mention pip_requirements
+        import re
+        spcs_blocks = re.findall(
+            r'CREATE OR REPLACE PROCEDURE run_synthetic_regression_(?:combined_autogluon_spcs|autogluon_spcs)[^\n]*.*?HANDLER\s*=\s*[^\n]+',
+            sql, re.DOTALL
+        )
+        assert spcs_blocks, "No SPCS procedure blocks found"
+        for block in spcs_blocks:
+            assert "pip_requirements" not in block.lower()
+
+    def test_docs_mention_autogluon_image_repository(self):
+        training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
+        assert "AUTOGLUON_IMAGE_REPOSITORY" in training_md
+
+    def test_docs_mention_no_mljob_runtime_for_spcs(self):
+        training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
+        # Docs must explain that SPCS path does not use MLJob runtime_environment
+        assert "runtime_environment" in training_md
+        assert "spcs" in training_md.lower() or "SPCS" in training_md
+
+    def test_docs_mention_self_managed_ray(self):
+        training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
+        assert "self-managed" in training_md.lower() or "self managed" in training_md.lower()

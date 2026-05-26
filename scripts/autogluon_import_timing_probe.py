@@ -9,8 +9,11 @@ Interpretation:
   image pull + pip install (when SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE="pip").
 - autogluon_import_complete.import_seconds measures pure import overhead after
   the environment is ready.
-- Compare pip vs preinstalled probe waves to estimate dependency bootstrap
-  overhead under concurrency.
+- Compare pip vs no_pip_baseline probe waves to estimate dependency bootstrap
+  overhead under concurrency. no_pip_baseline intentionally skips AutoGluon/Ray
+  imports so it measures startup-to-entrypoint without requiring dependencies.
+- preinstalled mode validates a custom image by importing AutoGluon/Ray without
+  pip installation.
 
 Does not connect to Snowflake, call ray cluster init, query data, or write files.
 """
@@ -43,6 +46,8 @@ def _elapsed() -> float:
 deps_mode = os.getenv("SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE", "pip")
 probe_label = os.getenv("SYNREG_AG_IMPORT_PROBE_LABEL", "autogluon_import_timing_probe")
 runtime_environment = os.getenv("EVAL_RUNTIME_ENVIRONMENT")
+_BASELINE_MODES = {"baseline", "no_pip", "no_pip_baseline", "startup_baseline"}
+import_dependencies = deps_mode not in _BASELINE_MODES
 
 # ---------------------------------------------------------------------------
 # Event 1: python_entrypoint_started — emitted immediately.
@@ -57,59 +62,73 @@ _log(
 )
 
 # ---------------------------------------------------------------------------
-# Event 2: autogluon_import_complete (or import_failed).
+# Event 2: autogluon_import_complete, autogluon_import_skipped, or import_failed.
 # ---------------------------------------------------------------------------
-_t0 = time.perf_counter()
-try:
-    import autogluon.tabular  # noqa: F401
-    _ag_import_s = time.perf_counter() - _t0
+if import_dependencies:
+    _t0 = time.perf_counter()
     try:
-        import autogluon.version  # type: ignore[import]
-        _ag_version = autogluon.version.__version__
-    except Exception:
+        import autogluon.tabular  # noqa: F401
+        _ag_import_s = time.perf_counter() - _t0
         try:
-            _ag_version = autogluon.tabular.__version__  # type: ignore[attr-defined]
+            import autogluon.version  # type: ignore[import]
+            _ag_version = autogluon.version.__version__
         except Exception:
-            _ag_version = None
+            try:
+                _ag_version = autogluon.tabular.__version__  # type: ignore[attr-defined]
+            except Exception:
+                _ag_version = None
+        _log(
+            "autogluon_import_complete",
+            import_seconds=round(_ag_import_s, 4),
+            elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
+            autogluon_version=_ag_version,
+        )
+    except Exception as exc:
+        _log(
+            "import_failed",
+            module="autogluon.tabular",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
+        )
+        raise
+else:
     _log(
-        "autogluon_import_complete",
-        import_seconds=round(_ag_import_s, 4),
-        elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
-        autogluon_version=_ag_version,
-    )
-except Exception as exc:
-    _log(
-        "import_failed",
-        module="autogluon.tabular",
-        error_type=type(exc).__name__,
-        error_message=str(exc),
+        "autogluon_import_skipped",
+        reason="no_pip_baseline",
         elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
     )
-    raise
 
 # ---------------------------------------------------------------------------
-# Event 3: ray_import_complete (or import_failed).
+# Event 3: ray_import_complete, ray_import_skipped, or import_failed.
 # ---------------------------------------------------------------------------
-_t0 = time.perf_counter()
-try:
-    import ray  # noqa: F401
-    _ray_import_s = time.perf_counter() - _t0
+if import_dependencies:
+    _t0 = time.perf_counter()
     try:
-        _ray_version = ray.__version__
-    except Exception:
-        _ray_version = None
+        import ray  # noqa: F401
+        _ray_import_s = time.perf_counter() - _t0
+        try:
+            _ray_version = ray.__version__
+        except Exception:
+            _ray_version = None
+        _log(
+            "ray_import_complete",
+            import_seconds=round(_ray_import_s, 4),
+            elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
+            ray_version=_ray_version,
+        )
+    except Exception as exc:
+        _log(
+            "import_failed",
+            module="ray",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
+        )
+        raise
+else:
     _log(
-        "ray_import_complete",
-        import_seconds=round(_ray_import_s, 4),
-        elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
-        ray_version=_ray_version,
-    )
-except Exception as exc:
-    _log(
-        "import_failed",
-        module="ray",
-        error_type=type(exc).__name__,
-        error_message=str(exc),
+        "ray_import_skipped",
+        reason="no_pip_baseline",
         elapsed_since_entrypoint_seconds=round(_elapsed(), 4),
     )
-    raise

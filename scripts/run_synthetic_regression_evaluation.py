@@ -125,6 +125,40 @@ SYNREG_RAY_PIP = ["ray"]
 SYNREG_AG_RAY_PIP = SYNREG_AG_PIP + SYNREG_RAY_PIP
 SYNREG_PYPI_EAI = ["TABPFN_PYPI_EAI"]
 
+# ---------------------------------------------------------------------------
+# SPCS custom-image backend configuration
+# ---------------------------------------------------------------------------
+
+SYNREG_AUTOGLUON_EXECUTION_BACKEND = os.getenv(
+    "SYNREG_AUTOGLUON_EXECUTION_BACKEND",
+    "mljob",
+)
+"""AutoGluon execution backend. Values: 'mljob' (default), 'spcs_job'."""
+
+SYNREG_AUTOGLUON_SPCS_IMAGE = os.getenv(
+    "SYNREG_AUTOGLUON_SPCS_IMAGE",
+    "",
+)
+"""Full OCI image reference for SPCS AutoGluon containers.
+Example: <account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0
+Required when SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job.
+"""
+
+SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT = int(
+    os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT", "6379")
+)
+SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT = int(
+    os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT", "8265")
+)
+SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS = int(
+    os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", "600")
+)
+SYNREG_AUTOGLUON_SPCS_RAY_POLL_SECONDS = int(
+    os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_POLL_SECONDS", "10")
+)
+
+_VALID_AUTOGLUON_EXECUTION_BACKENDS = {"mljob", "spcs_job"}
+
 SYNREG_CHECKPOINT_LOADING_MODES = {"deepset", "baselines"}
 SYNREG_DEEPSET_CKPT_STAGE = os.getenv(
     "SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH",
@@ -147,6 +181,69 @@ _AG_PROBE_IMPORTS = [
     "matplotlib", "snowflake.snowpark", "ray",
 ]
 _PREP_PROBE_IMPORTS = ["torch", "numpy", "scipy", "pyarrow", "snowflake.snowpark"]
+
+# ---------------------------------------------------------------------------
+# Backend validation helper
+# ---------------------------------------------------------------------------
+
+
+def _validate_autogluon_backend(backend: str, image: str, procedure_name: str) -> None:
+    if backend not in _VALID_AUTOGLUON_EXECUTION_BACKENDS:
+        raise ValueError(
+            f"{procedure_name}: SYNREG_AUTOGLUON_EXECUTION_BACKEND={backend!r} is not valid. "
+            f"Supported values: {sorted(_VALID_AUTOGLUON_EXECUTION_BACKENDS)!r}."
+        )
+    if backend == "spcs_job" and not image:
+        raise ValueError(
+            f"{procedure_name}: SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job requires "
+            "SYNREG_AUTOGLUON_SPCS_IMAGE to be set to the full OCI image reference."
+        )
+
+
+def _verify_spcs_image_in_repository(session, image: str) -> None:
+    """Operational verification: confirm the image reference exists in a Snowflake image repository.
+
+    Queries ``SHOW IMAGE REPOSITORIES`` and checks whether any known repository URL is a
+    substring of the supplied image reference. Issues a warning (not a fatal error) if the
+    query fails or no repository matches — SHOW IMAGE REPOSITORIES may require privileges
+    that the stored-procedure role does not have.
+
+    Call this at the start of each SPCS orchestration function so that a missing push is
+    surfaced before containers are submitted, not after a long wait.
+    """
+    try:
+        rows = session.sql("SHOW IMAGE REPOSITORIES").collect()
+        repo_urls: list[str] = []
+        for row in rows:
+            url = None
+            if hasattr(row, "as_dict"):
+                d = {str(k).lower(): v for k, v in row.as_dict().items()}
+                url = d.get("repository_url") or d.get("name")
+            if url is None and len(row) > 0:
+                url = str(row[0])
+            if url:
+                repo_urls.append(str(url).rstrip("/"))
+        matched = any(image.startswith(r) or r in image for r in repo_urls if r)
+        if matched:
+            print(
+                f"[INFO] SPCS image repository verified: {image!r} matches a known repository.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[WARN] Image {image!r} was not matched in Snowflake image repositories "
+                f"({repo_urls}). Ensure the image has been pushed with "
+                "'docker push <repository_url>/tabpfn-autogluon-ray:<tag>' before running.",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[WARN] Could not query image repositories (may lack privilege): {exc}. "
+            "Proceeding without image verification — run SHOW IMAGE REPOSITORIES manually "
+            "to confirm the image is present.",
+            flush=True,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers (mirror run_evaluation_test.py)
@@ -769,6 +866,252 @@ def _submit_and_wait_capacity_phase(
                 ) from e
             raise
     _wait_job_group(jobs, session)
+
+
+# ---------------------------------------------------------------------------
+# SPCS job service helpers
+# ---------------------------------------------------------------------------
+
+def _quote_spcs_env_value(value: str) -> str:
+    """Escape a value for inclusion in a SPCS YAML env block (double-quoted string)."""
+    # Escape backslash and double-quote; wrap in double quotes.
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _build_spcs_job_spec(
+    *,
+    image: str,
+    args: list,
+    env_vars: dict,
+    cpu: str = "4",
+    memory: str = "16Gi",
+    enable_snowflake_service_token: bool = True,
+) -> str:
+    """Build a SPCS job service YAML spec string.
+
+    Args:
+        image:    Full OCI image reference.
+        args:     Arguments passed to the ENTRYPOINT (python). First element is the script path.
+        env_vars: Dict of environment variable name -> value (all coerced to str).
+        cpu:      CPU request/limit string (e.g. "4").
+        memory:   Memory request/limit string (e.g. "16Gi").
+        enable_snowflake_service_token: When True (default), adds
+            ``snowflakeService: {enabled: true}`` so SPCS mounts the OAuth token
+            at ``/snowflake/session/token``. Required for any container that creates
+            a Snowpark session via ``create_snowpark_session()`` / ``spcs_snowpark_session_probe.py``.
+
+    Returns:
+        YAML spec string suitable for use in EXECUTE JOB SERVICE FROM SPECIFICATION $$.
+    """
+    # Build env block
+    env_lines = []
+    for k, v in sorted(env_vars.items()):
+        env_lines.append(f"        {k}: {_quote_spcs_env_value(v)}")
+    env_block = "\n".join(env_lines)
+
+    # Build args block
+    args_block = "\n".join(f'        - "{a}"' for a in args)
+
+    spec = (
+        "spec:\n"
+        "  containers:\n"
+        "    - name: main\n"
+        f"      image: {image}\n"
+        "      args:\n"
+        f"{args_block}\n"
+    )
+    if env_lines:
+        spec += "      env:\n" + env_block + "\n"
+    spec += (
+        "      resources:\n"
+        "        requests:\n"
+        f'          cpu: "{cpu}"\n'
+        f'          memory: "{memory}"\n'
+        "        limits:\n"
+        f'          cpu: "{cpu}"\n'
+        f'          memory: "{memory}"\n'
+    )
+    if enable_snowflake_service_token:
+        # Enables OAuth token injection at /snowflake/session/token.
+        # Required for any container that calls create_snowpark_session() inside SPCS.
+        spec += "  snowflakeService:\n    enabled: true\n"
+    return spec
+
+
+def _execute_spcs_job_service(
+    session,
+    *,
+    label: str,
+    compute_pool: str,
+    spec: str,
+) -> str:
+    """Submit a SPCS job service via EXECUTE JOB SERVICE and return the job service name.
+
+    Returns the job service name (label) for use in status polling.
+    The label is normalized to uppercase and non-alphanumeric chars replaced with underscores
+    to satisfy Snowflake identifier constraints.
+    """
+    # Snowflake job service names must be valid identifiers
+    safe_label = "".join(c if c.isalnum() else "_" for c in label).upper()
+    sql = (
+        f"EXECUTE JOB SERVICE\n"
+        f"  IN COMPUTE POOL {compute_pool}\n"
+        f"  NAME = {safe_label}\n"
+        f"  ASYNC = TRUE\n"
+        f"  FROM SPECIFICATION $$\n"
+        f"{spec}\n"
+        f"$$"
+    )
+    print(f"[INFO] Submitting SPCS job service '{safe_label}' on pool '{compute_pool}'", flush=True)
+    try:
+        session.sql(sql).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to submit SPCS job service '{safe_label}': {exc}"
+        ) from exc
+    print(f"[INFO] SPCS job service '{safe_label}' submitted.", flush=True)
+    return safe_label
+
+
+def _cancel_spcs_job_service(session, job_name: str) -> None:
+    """Cancel a running SPCS job service, ignoring already-finished jobs."""
+    try:
+        session.sql(f"SELECT {job_name}!SPCS_CANCEL_JOB()").collect()
+        print(f"[INFO] SPCS job service '{job_name}' canceled.", flush=True)
+    except Exception as exc:
+        print(
+            f"[WARN] Could not cancel SPCS job service '{job_name}': {exc}",
+            flush=True,
+        )
+
+
+def _cancel_spcs_job_group(labeled_jobs: list, session) -> None:
+    for _label, job_name in labeled_jobs:
+        _cancel_spcs_job_service(session, job_name)
+
+
+def _spcs_run_id() -> str:
+    """Generate a short unique identifier for a SPCS orchestration run.
+
+    Embedding this in all job service labels prevents 'service name already exists'
+    errors when the same orchestration function is called more than once (e.g., on
+    retry or rerun), since Snowflake requires service names to be unique within a
+    schema until the service is dropped.
+    """
+    import uuid
+    return uuid.uuid4().hex[:8]
+
+
+def _wait_spcs_job(session, job_name: str, poll_seconds: int = 10, timeout_seconds: int = 7200) -> None:
+    """Poll SHOW JOB SERVICES until the named job service reaches DONE or FAILED."""
+    deadline = time.monotonic() + timeout_seconds
+    last_status = None
+    while True:
+        rows = session.sql(f"SHOW SERVICES LIKE '{job_name}'").collect()
+        if rows:
+            row = rows[0]
+            # Status is typically in column index 5 or named STATUS
+            status = None
+            if hasattr(row, "as_dict"):
+                d = {str(k).upper(): v for k, v in row.as_dict().items()}
+                status = d.get("STATUS") or d.get("STATE")
+            if status is None and len(row) > 5:
+                status = str(row[5])
+            status = str(status).upper() if status else "UNKNOWN"
+        else:
+            status = "NOT_FOUND"
+
+        if status != last_status:
+            print(f"[INFO] SPCS job service '{job_name}': status={status}", flush=True)
+            last_status = status
+
+        if status in ("DONE", "SUCCEEDED"):
+            return
+        if status in ("FAILED", "INTERNAL_ERROR", "NOT_FOUND"):
+            try:
+                log_rows = session.sql(
+                    f"CALL SYSTEM$GET_SERVICE_LOGS('{job_name}', '0', 1000)"
+                ).collect()
+                logs = str(log_rows[0][0]) if log_rows else "<logs unavailable>"
+            except Exception:
+                logs = "<logs unavailable>"
+            raise RuntimeError(
+                f"[FATAL] SPCS job service '{job_name}' failed with status={status}.\n"
+                f"Logs:\n{logs}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"[TIMEOUT] SPCS job service '{job_name}' did not complete within "
+                f"{timeout_seconds}s. Last status: {status}."
+            )
+        time.sleep(poll_seconds)
+
+
+def _wait_spcs_job_group(labeled_jobs: list, session) -> None:
+    """Wait for all (label, job_name) SPCS job services to complete."""
+    for label, job_name in labeled_jobs:
+        _wait_spcs_job(session, job_name)
+
+
+def _spcs_session_context_env(session) -> dict[str, str]:
+    """Propagate the caller's Snowflake context into SPCS OAuth sessions."""
+    try:
+        rows = session.sql(
+            "SELECT CURRENT_DATABASE(), CURRENT_SCHEMA(), CURRENT_ROLE(), CURRENT_WAREHOUSE()"
+        ).collect()
+        if not rows:
+            return {}
+        row = rows[0]
+        values = [row[i] for i in range(4)]
+    except Exception:
+        return {}
+    keys = [
+        "SNOWFLAKE_DATABASE",
+        "SNOWFLAKE_SCHEMA",
+        "SNOWFLAKE_ROLE",
+        "SNOWFLAKE_WAREHOUSE",
+    ]
+    return {
+        key: str(value)
+        for key, value in zip(keys, values)
+        if value is not None and str(value).strip()
+    }
+
+
+def _submit_spcs_synreg(
+    session,
+    label: str,
+    compute_pool: str,
+    env_vars: dict,
+    image: str,
+    entrypoint_path: str,
+    cpu: str = "4",
+    memory: str = "16Gi",
+) -> str:
+    """Submit a single-container SPCS job service for synthetic regression.
+
+    No runtime_environment, no pip_requirements, no external_access_integrations.
+    AutoGluon, Ray, and all dependencies are preinstalled in the image.
+
+    Returns the job service name for status polling.
+    """
+    full_env = {"HOME": "/tmp"}
+    full_env.update(_spcs_session_context_env(session))
+    full_env.update(env_vars)
+    spec = _build_spcs_job_spec(
+        image=image,
+        args=[entrypoint_path],
+        env_vars=full_env,
+        cpu=cpu,
+        memory=memory,
+    )
+    return _execute_spcs_job_service(
+        session,
+        label=label,
+        compute_pool=compute_pool,
+        spec=spec,
+    )
 
 
 def _submit_runtime_probe(
@@ -2744,15 +3087,16 @@ def run_synthetic_regression_autogluon_import_timing_probe(
         Time from MLJob submission to this event approximates scheduling + image
         startup + pip install (with_pip=True) or just scheduling + image startup
         (with_pip=False).
-      - autogluon_import_complete: time spent importing autogluon.tabular.
-      - ray_import_complete: time spent importing ray.
+      - autogluon_import_complete: time spent importing autogluon.tabular in pip/preinstalled mode.
+      - ray_import_complete: time spent importing ray in pip/preinstalled mode.
+      - *_import_skipped: emitted in no_pip_baseline mode; the job should still succeed.
       - import_failed: emitted (then exception re-raised) if an import fails.
 
     with_pip=True  — pip_requirements=SYNREG_AG_PIP, external_access_integrations=SYNREG_PYPI_EAI.
                      Measures the full bootstrap overhead under production conditions.
-    with_pip=False — no pip install; expected to fail import unless autogluon is
-                     already preinstalled in the runtime image. Provides a no-pip
-                     scheduling + startup baseline.
+    with_pip=False — no pip install and no AutoGluon/Ray import. Provides a no-pip
+                     scheduling + startup baseline that should succeed even when
+                     AutoGluon is not preinstalled.
     """
     proc = "run_synthetic_regression_autogluon_import_timing_probe"
     if probe_count < 1:
@@ -2760,7 +3104,7 @@ def run_synthetic_regression_autogluon_import_timing_probe(
 
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
 
-    deps_mode = "pip" if with_pip else "preinstalled"
+    deps_mode = "pip" if with_pip else "no_pip_baseline"
     pip_reqs = SYNREG_AG_PIP if with_pip else None
     eai = SYNREG_PYPI_EAI if with_pip else None
 
@@ -2804,6 +3148,551 @@ def run_synthetic_regression_autogluon_import_timing_probe_default(
     """Default single-probe pip-mode import timing probe."""
     return run_synthetic_regression_autogluon_import_timing_probe(
         session, ag_rt=ag_rt, with_pip=True, probe_count=1
+    )
+
+
+# ---------------------------------------------------------------------------
+# SPCS AutoGluon evaluation and probe functions
+# ---------------------------------------------------------------------------
+
+def run_synthetic_regression_combined_autogluon_spcs_evaluation(
+    session,
+    ag_rt: str = "spcs_job",
+    autogluon_cluster_shards=None,
+    autogluon_workers_per_shard=None,
+    autogluon_task_cpus=None,
+    autogluon_concurrent_clusters=None,
+    autogluon_time_limit=None,
+    autogluon_presets=None,
+) -> str:
+    """AutoGluon evaluation using SPCS custom image backend.
+
+    This is the SPCS equivalent of run_synthetic_regression_combined_autogluon_evaluation
+    with SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job. No runtime_environment or
+    pip_requirements are used — AutoGluon, Ray, and all dependencies are preinstalled
+    in the custom OCI image (SYNREG_AUTOGLUON_SPCS_IMAGE).
+
+    Single-node mode (AUTOGLUON_CLUSTER_SHARDS == 0):
+        One SPCS job service per shard. No Ray.
+        Entrypoint: /app/src/evaluate_synthetic_regression.py
+
+    Ray distributed mode (AUTOGLUON_CLUSTER_SHARDS > 0):
+        Per cluster shard: one head SPCS service + N worker SPCS services + one driver job.
+        Self-managed Ray: driver connects with RAY_HEAD_ADDRESS (explicit mode).
+        Entrypoint: /app/scripts/autogluon_ray.py (with SYNREG_RAY_ADDRESS_MODE=explicit)
+    """
+    proc = "run_synthetic_regression_combined_autogluon_spcs_evaluation"
+
+    backend = SYNREG_AUTOGLUON_EXECUTION_BACKEND
+    image = SYNREG_AUTOGLUON_SPCS_IMAGE
+    _validate_autogluon_backend("spcs_job", image, proc)
+
+    plan = _resolve_combined_autogluon_execution_plan(
+        procedure_name=proc,
+        cluster_shards_arg=autogluon_cluster_shards,
+        workers_per_shard_arg=autogluon_workers_per_shard,
+        concurrent_clusters_arg=autogluon_concurrent_clusters,
+    )
+    task_cpus = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_TASK_CPUS",
+        sql_arg=autogluon_task_cpus, env_var="AUTOGLUON_TASK_CPUS",
+        default=SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT,
+    )
+    time_limit = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="AUTOGLUON_TIME_LIMIT",
+        sql_arg=autogluon_time_limit, env_var="AUTOGLUON_TIME_LIMIT",
+        default=300,
+    )
+    presets = _resolve_runtime_string_param(
+        procedure_name=proc, name="AUTOGLUON_PRESETS",
+        sql_arg=autogluon_presets, env_var="AUTOGLUON_PRESETS",
+        default="best_quality",
+    )
+
+    ag_min_tmp = os.getenv("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", str(SYNREG_AUTOGLUON_MIN_TMP_FREE_BYTES_DEFAULT))
+    ag_max_features = os.getenv("BENCHMARK_CPU_MAX_PROCESSED_FEATURES", str(SYNREG_AUTOGLUON_MAX_FEATURES_DEFAULT))
+    ag_max_matrix_bytes = os.getenv("BENCHMARK_CPU_MAX_MATRIX_BYTES", str(SYNREG_AUTOGLUON_MAX_MATRIX_BYTES_DEFAULT))
+    ag_max_dataset_bytes = os.getenv("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", str(SYNREG_AUTOGLUON_MAX_DATASET_BYTES_DEFAULT))
+    worker_access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
+    max_work_item_bytes = os.getenv("SYNREG_MAX_WORK_ITEM_BYTES", "8192")
+
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    _verify_spcs_image_in_repository(session, image)
+    run_id = _spcs_run_id()
+
+    if plan.mode == "single_node_shards":
+        output_shards = plan.output_shards
+        print(
+            f"[INFO] {proc}: suite_id={COMBINED_SUITE_ID} backend=spcs_job "
+            f"mode=single_node_shards output_shards={output_shards} "
+            f"task_cpus={task_cpus} time_limit={time_limit} presets={presets!r}",
+            flush=True,
+        )
+        jobs = []
+        for shard_index in range(output_shards):
+            lbl = f"spcs_ag_shard_{run_id}_{shard_index}"
+            env = _synreg_shard_env(
+                mode="autogluon",
+                suite_id=COMBINED_SUITE_ID,
+                num_shards=output_shards,
+                shard_index=shard_index,
+                results_stage=COMBINED_PARTS_PREFIX,
+                extra_env={
+                    "AUTOGLUON_TIME_LIMIT": str(time_limit),
+                    "AUTOGLUON_PRESETS": presets,
+                    "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                    "SYNREG_EXPECTED_AG_SHARDS": str(output_shards),
+                    "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES": ag_min_tmp,
+                    "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
+                    "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
+                    "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
+                },
+            )
+            job_name = _submit_spcs_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars=env,
+                image=image,
+                entrypoint_path="/app/src/evaluate_synthetic_regression.py",
+            )
+            jobs.append((lbl, job_name))
+        _wait_spcs_job_group(jobs, session)
+        return (
+            f"{proc}: ok backend=spcs_job suite_id={COMBINED_SUITE_ID} "
+            f"mode=single_node_shards output_shards={output_shards} "
+            f"task_cpus={task_cpus} time_limit={time_limit} presets={presets!r}"
+        )
+    else:
+        # Ray distributed mode
+        cluster_shards = plan.output_shards
+        workers_per_shard = plan.workers_per_shard
+        head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
+        print(
+            f"[INFO] {proc}: suite_id={COMBINED_SUITE_ID} backend=spcs_job "
+            f"mode=ray_clusters cluster_shards={cluster_shards} "
+            f"workers_per_shard={workers_per_shard} "
+            f"task_cpus={task_cpus} time_limit={time_limit} presets={presets!r}",
+            flush=True,
+        )
+        support_jobs: list = []
+        driver_jobs: list = []
+        # SPCS_RAY_HEAD_DNS_SUFFIX: domain suffix appended to the service name for per-shard DNS.
+        # Format: "<schema_name_lower>.<db_name_lower>.snowflakecomputing.internal"
+        # Example: "tabpfn_schema.tabpfn_db.snowflakecomputing.internal"
+        # When set, each head's address is derived as "<service_name_lower>.<dns_suffix>:<port>".
+        # When unset, the uppercase service name is used directly (requires SPCS internal DNS
+        # to resolve plain service names, which works in some Snowflake account configurations).
+        # SPCS_RAY_HEAD_DNS_OVERRIDE is retained for single-shard backward compatibility only;
+        # multi-shard runs MUST use SPCS_RAY_HEAD_DNS_SUFFIX to get per-shard isolation.
+        dns_suffix = os.getenv("SPCS_RAY_HEAD_DNS_SUFFIX", "")
+        for shard_index in range(cluster_shards):
+            head_label = f"spcs_ray_head_{run_id}_{shard_index}"
+            safe_head_label = "".join(c if c.isalnum() else "_" for c in head_label).upper()
+            # Derive a per-shard head address from the service name (never reuse a single
+            # global override across shards, which would collapse all shards into one cluster).
+            if dns_suffix:
+                head_hostname = f"{safe_head_label.lower()}.{dns_suffix}"
+            else:
+                head_hostname = safe_head_label
+            head_address = f"{head_hostname}:{head_port}"
+            print(
+                f"[INFO] {proc}: shard={shard_index} head_label={head_label!r} "
+                f"head_address={head_address!r}",
+                flush=True,
+            )
+
+            head_env = {
+                "HOME": "/tmp",
+                "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(head_port),
+                "SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT": str(SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT),
+                # Finding 6: cluster identity — driver verifies it joined the correct shard's cluster
+                "SPCS_RAY_RUN_ID": run_id,
+                "SPCS_RAY_SHARD_INDEX": str(shard_index),
+            }
+            head_job = _submit_spcs_synreg(
+                session=session,
+                label=head_label,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars=head_env,
+                image=image,
+                entrypoint_path="/app/scripts/spcs_ray_head.py",
+            )
+            support_jobs.append((head_label, head_job))
+
+            worker_env_base = {
+                "HOME": "/tmp",
+                "RAY_HEAD_ADDRESS": head_address,
+                "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+            }
+            for w in range(workers_per_shard):
+                w_label = f"spcs_ray_worker_{run_id}_{shard_index}_{w}"
+                w_job = _submit_spcs_synreg(
+                    session=session,
+                    label=w_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars=worker_env_base,
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                )
+                support_jobs.append((w_label, w_job))
+
+            # Driver
+            driver_label = f"spcs_ray_driver_{run_id}_{shard_index}"
+            driver_env = _synreg_shard_env(
+                mode="autogluon",
+                suite_id=COMBINED_SUITE_ID,
+                num_shards=cluster_shards,
+                shard_index=shard_index,
+                results_stage=COMBINED_PARTS_PREFIX,
+                extra_env={
+                    "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
+                    "SYNREG_AUTOGLUON_CLUSTER_SHARDS": str(cluster_shards),
+                    "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(workers_per_shard),
+                    "SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS": str(cluster_shards),
+                    "SYNREG_RAY_ADDRESS_MODE": "explicit",
+                    "RAY_HEAD_ADDRESS": head_address,
+                    # Cluster identity (Finding 6): driver verifies it joined the right shard's cluster
+                    "SPCS_RAY_RUN_ID": run_id,
+                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                    "AUTOGLUON_TIME_LIMIT": str(time_limit),
+                    "AUTOGLUON_PRESETS": presets,
+                    "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                    "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
+                    "SYNREG_MAX_WORK_ITEM_BYTES": max_work_item_bytes,
+                    "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES": ag_min_tmp,
+                    "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
+                    "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
+                    "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
+                },
+            )
+            driver_job = _submit_spcs_synreg(
+                session=session,
+                label=driver_label,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars=driver_env,
+                image=image,
+                entrypoint_path="/app/scripts/autogluon_ray.py",
+            )
+            driver_jobs.append((driver_label, driver_job))
+
+        try:
+            _wait_spcs_job_group(driver_jobs, session)
+        finally:
+            _cancel_spcs_job_group(support_jobs, session)
+        return (
+            f"{proc}: ok backend=spcs_job suite_id={COMBINED_SUITE_ID} "
+            f"mode=ray_clusters cluster_shards={cluster_shards} "
+            f"workers_per_shard={workers_per_shard} "
+            f"task_cpus={task_cpus} time_limit={time_limit} presets={presets!r}"
+        )
+
+
+def run_synthetic_regression_autogluon_spcs_import_probe(
+    session,
+    ag_rt: str = "spcs_job",
+    probe_count: int = 1,
+) -> str:
+    """SPCS backend import timing probe.
+
+    Submits probe_count SPCS job services each running autogluon_import_timing_probe.py.
+    Unlike the MLJob version, no pip install occurs — dependencies are preinstalled in
+    the custom image. This measures pure scheduling + container startup latency.
+    """
+    proc = "run_synthetic_regression_autogluon_spcs_import_probe"
+    image = SYNREG_AUTOGLUON_SPCS_IMAGE
+    _validate_autogluon_backend("spcs_job", image, proc)
+    if probe_count < 1:
+        raise ValueError(f"{proc}: probe_count must be >= 1; got {probe_count!r}.")
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    jobs = []
+    for i in range(probe_count):
+        lbl = f"spcs_ag_import_probe_{i}"
+        job_name = _submit_spcs_synreg(
+            session=session,
+            label=lbl,
+            compute_pool=AUTOGLUON_CPU_POOL,
+            env_vars={
+                "SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE": "preinstalled",
+                "SYNREG_AG_IMPORT_PROBE_LABEL": f"spcs_ag_import_probe_{i}_of_{probe_count}",
+            },
+            image=image,
+            entrypoint_path="/app/scripts/autogluon_import_timing_probe.py",
+        )
+        jobs.append((lbl, job_name))
+    _wait_spcs_job_group(jobs, session)
+    return (
+        f"{proc}: ok probe_count={probe_count} backend=spcs_job "
+        f"deps_mode=preinstalled pool={AUTOGLUON_CPU_POOL}"
+    )
+
+
+def run_synthetic_regression_autogluon_spcs_session_probe(
+    session,
+    ag_rt: str = "spcs_job",
+    probe_count: int = 1,
+) -> str:
+    """SPCS Snowpark OAuth session probe — step 2 in the SPCS preflight runbook.
+
+    Submits probe_count SPCS job services each running spcs_snowpark_session_probe.py.
+    Validates that:
+    - The SPCS spec's ``snowflakeService.enabled=true`` causes the OAuth token to be
+      injected at ``/snowflake/session/token``.
+    - The container can open a Snowpark session with the correct database/schema/role
+      context propagated via SNOWFLAKE_DATABASE / SNOWFLAKE_SCHEMA / SNOWFLAKE_ROLE.
+
+    Run this after the import probe and before the capacity probe.
+    A successful run confirms that the AutoGluon driver containers can create Snowpark
+    sessions inside SPCS — required for querying SYNTHETIC_REGRESSION_DATASET_INDEX and
+    calling GET_PRESIGNED_URL().
+    """
+    proc = "run_synthetic_regression_autogluon_spcs_session_probe"
+    image = SYNREG_AUTOGLUON_SPCS_IMAGE
+    _validate_autogluon_backend("spcs_job", image, proc)
+    if probe_count < 1:
+        raise ValueError(f"{proc}: probe_count must be >= 1; got {probe_count!r}.")
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    _verify_spcs_image_in_repository(session, image)
+    run_id = _spcs_run_id()
+    jobs = []
+    for i in range(probe_count):
+        lbl = f"spcs_session_probe_{run_id}_{i}"
+        job_name = _submit_spcs_synreg(
+            session=session,
+            label=lbl,
+            compute_pool=AUTOGLUON_CPU_POOL,
+            env_vars={},
+            image=image,
+            entrypoint_path="/app/scripts/spcs_snowpark_session_probe.py",
+        )
+        jobs.append((lbl, job_name))
+    _wait_spcs_job_group(jobs, session)
+    return f"{proc}: ok backend=spcs_job probe_count={probe_count}"
+
+
+def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+    session,
+    ag_rt: str = "spcs_job",
+    cluster_shards=None,
+    workers_per_shard=None,
+    concurrent_clusters=None,
+) -> str:
+    """SPCS backend capacity probe: verify that custom-image containers start and Ray imports.
+
+    Submits SPCS job services that run ray_capacity_probe.py. Validates that the
+    custom image can start on the compute pool, Ray is importable, and the cluster
+    reaches the expected node count.
+    """
+    proc = "run_synthetic_regression_combined_autogluon_spcs_capacity_probe"
+    image = SYNREG_AUTOGLUON_SPCS_IMAGE
+    _validate_autogluon_backend("spcs_job", image, proc)
+
+    plan = _resolve_combined_autogluon_execution_plan(
+        procedure_name=proc,
+        cluster_shards_arg=cluster_shards,
+        workers_per_shard_arg=workers_per_shard,
+        concurrent_clusters_arg=concurrent_clusters,
+    )
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    run_id = _spcs_run_id()
+
+    probe_count = plan.concurrent_units
+    print(
+        f"[INFO] {proc}: backend=spcs_job probe_count={probe_count} "
+        f"mode={plan.mode}",
+        flush=True,
+    )
+
+    if not plan.uses_ray:
+        jobs = []
+        for i in range(probe_count):
+            lbl = f"spcs_cap_probe_{run_id}_{i}"
+            job_name = _submit_spcs_synreg(
+                session=session,
+                label=lbl,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE": "preinstalled",
+                    "SYNREG_AG_IMPORT_PROBE_LABEL": f"{lbl}_of_{probe_count}",
+                },
+                image=image,
+                entrypoint_path="/app/scripts/autogluon_import_timing_probe.py",
+            )
+            jobs.append((lbl, job_name))
+        _wait_spcs_job_group(jobs, session)
+    else:
+        support_jobs = []
+        driver_jobs = []
+        head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
+        dns_suffix = os.getenv("SPCS_RAY_HEAD_DNS_SUFFIX", "")
+        for shard_index in range(plan.output_shards):
+            head_label = f"spcs_cap_ray_head_{run_id}_{shard_index}"
+            safe_head_label = "".join(c if c.isalnum() else "_" for c in head_label).upper()
+            head_hostname = f"{safe_head_label.lower()}.{dns_suffix}" if dns_suffix else safe_head_label
+            head_address = f"{head_hostname}:{head_port}"
+            head_job = _submit_spcs_synreg(
+                session=session,
+                label=head_label,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(head_port),
+                    "SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT": str(SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT),
+                    "SPCS_RAY_RUN_ID": run_id,
+                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                },
+                image=image,
+                entrypoint_path="/app/scripts/spcs_ray_head.py",
+            )
+            support_jobs.append((head_label, head_job))
+            for worker_index in range(plan.workers_per_shard):
+                worker_label = f"spcs_cap_ray_worker_{run_id}_{shard_index}_{worker_index}"
+                worker_job = _submit_spcs_synreg(
+                    session=session,
+                    label=worker_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars={
+                        "RAY_HEAD_ADDRESS": head_address,
+                        "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+                    },
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                )
+                support_jobs.append((worker_label, worker_job))
+            probe_label = f"spcs_cap_ray_probe_{run_id}_{shard_index}"
+            # Finding 5: head starts with --num-cpus=0, so expected_nodes = workers+1,
+            # expected_cpus_min = workers_per_shard (workers contribute CPUs, head does not).
+            probe_job = _submit_spcs_synreg(
+                session=session,
+                label=probe_label,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "CAPACITY_PROBE_LABEL": probe_label,
+                    "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
+                    "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
+                    "CAPACITY_PROBE_SLEEP_SECONDS": "10",
+                    "SYNREG_RAY_ADDRESS_MODE": "explicit",
+                    "RAY_HEAD_ADDRESS": head_address,
+                },
+                image=image,
+                entrypoint_path="/app/scripts/ray_capacity_probe.py",
+            )
+            driver_jobs.append((probe_label, probe_job))
+        try:
+            _wait_spcs_job_group(driver_jobs, session)
+        finally:
+            _cancel_spcs_job_group(support_jobs, session)
+    return f"{proc}: ok backend=spcs_job probe_count={probe_count} mode={plan.mode}"
+
+
+def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+    session,
+    ag_rt: str = "spcs_job",
+    cluster_shards=None,
+    workers_per_shard=None,
+    concurrent_clusters=None,
+) -> str:
+    """SPCS backend worker dataset-access probe.
+
+    Driver queries SYNTHETIC_REGRESSION_DATASET_INDEX and builds compact item dicts.
+    Workers validate dataset access using the same production path.
+    No AutoGluon training.
+    """
+    proc = "run_synthetic_regression_combined_autogluon_spcs_worker_access_probe"
+    image = SYNREG_AUTOGLUON_SPCS_IMAGE
+    _validate_autogluon_backend("spcs_job", image, proc)
+
+    plan = _resolve_combined_autogluon_execution_plan(
+        procedure_name=proc,
+        cluster_shards_arg=cluster_shards,
+        workers_per_shard_arg=workers_per_shard,
+        concurrent_clusters_arg=concurrent_clusters,
+    )
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+    run_id = _spcs_run_id()
+    worker_access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
+    print(
+        f"[INFO] {proc}: backend=spcs_job mode={plan.mode} "
+        f"concurrent_units={plan.concurrent_units} "
+        f"workers_per_shard={plan.workers_per_shard} "
+        f"access_mode={worker_access_mode!r}",
+        flush=True,
+    )
+
+    jobs = []
+    support_jobs = []
+    driver_jobs = []
+    shard_count = plan.output_shards if plan.uses_ray else plan.concurrent_units
+    for shard_index in range(shard_count):
+        lbl = f"spcs_ag_worker_probe_{run_id}_{shard_index}"
+        env = {
+            "SYNTHETIC_REGRESSION_SUITE_ID": os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", COMBINED_SUITE_ID),
+            "SYNTHETIC_REGRESSION_NUM_SHARDS": str(shard_count),
+            "SYNTHETIC_REGRESSION_SHARD_INDEX": str(shard_index),
+            "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
+            "SYNREG_WORKER_ACCESS_PROBE_USE_RAY": "true" if plan.uses_ray else "false",
+            # Finding 5: head starts with --num-cpus=0, so total live nodes = workers+1
+            "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1) if plan.uses_ray else str(plan.workers_per_shard),
+            "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
+            "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(plan.workers_per_shard),
+        }
+        if plan.uses_ray:
+            head_label = f"spcs_worker_probe_ray_head_{run_id}_{shard_index}"
+            safe_head_label = "".join(c if c.isalnum() else "_" for c in head_label).upper()
+            dns_suffix_wp = os.getenv("SPCS_RAY_HEAD_DNS_SUFFIX", "")
+            head_hostname_wp = f"{safe_head_label.lower()}.{dns_suffix_wp}" if dns_suffix_wp else safe_head_label
+            head_address = f"{head_hostname_wp}:{SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT}"
+            head_job = _submit_spcs_synreg(
+                session=session,
+                label=head_label,
+                compute_pool=AUTOGLUON_CPU_POOL,
+                env_vars={
+                    "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT),
+                    "SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT": str(SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT),
+                    "SPCS_RAY_RUN_ID": run_id,
+                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                },
+                image=image,
+                entrypoint_path="/app/scripts/spcs_ray_head.py",
+            )
+            support_jobs.append((head_label, head_job))
+            for worker_index in range(plan.workers_per_shard):
+                worker_label = f"spcs_worker_probe_ray_worker_{run_id}_{shard_index}_{worker_index}"
+                worker_job = _submit_spcs_synreg(
+                    session=session,
+                    label=worker_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars={
+                        "RAY_HEAD_ADDRESS": head_address,
+                        "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+                    },
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                )
+                support_jobs.append((worker_label, worker_job))
+            env["SYNREG_RAY_ADDRESS_MODE"] = "explicit"
+            env["RAY_HEAD_ADDRESS"] = head_address
+        job_name = _submit_spcs_synreg(
+            session=session,
+            label=lbl,
+            compute_pool=AUTOGLUON_CPU_POOL,
+            env_vars=env,
+            image=image,
+            entrypoint_path="/app/scripts/autogluon_worker_access_probe.py",
+        )
+        if plan.uses_ray:
+            driver_jobs.append((lbl, job_name))
+        else:
+            jobs.append((lbl, job_name))
+    if plan.uses_ray:
+        try:
+            _wait_spcs_job_group(driver_jobs, session)
+        finally:
+            _cancel_spcs_job_group(support_jobs, session)
+    else:
+        _wait_spcs_job_group(jobs, session)
+    return (
+        f"{proc}: ok backend=spcs_job mode={plan.mode} "
+        f"concurrent_units={plan.concurrent_units} access_mode={worker_access_mode!r}"
     )
 
 

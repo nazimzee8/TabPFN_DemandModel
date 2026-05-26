@@ -231,10 +231,10 @@ CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311');
 -- 8 concurrent pip-mode probes (simulates full evaluation wave concurrency):
 CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', TRUE, 8);
 
--- 8 concurrent no-pip probes (scheduling + image startup baseline):
+-- 8 concurrent no-pip probes (scheduling + image startup baseline; skips AutoGluon/Ray imports):
 CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', FALSE, 8);
 ```
-Interpretation: time from MLJob submission to `python_entrypoint_started` ≈ scheduling + image pull + pip install. `autogluon_import_complete.import_seconds` is pure import overhead. Compare pip vs no-pip waves to isolate bootstrap cost. Stage with:
+Interpretation: time from MLJob submission to `python_entrypoint_started` ≈ scheduling + image pull + pip install in pip mode. In no-pip baseline mode, the probe emits `autogluon_import_skipped` / `ray_import_skipped` and should succeed even when AutoGluon is absent. `autogluon_import_complete.import_seconds` is pure import overhead in pip/preinstalled validation modes. Compare pip vs no-pip waves to isolate bootstrap cost. Stage with:
 ```sql
 PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```

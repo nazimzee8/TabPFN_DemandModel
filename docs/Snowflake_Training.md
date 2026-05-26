@@ -2432,7 +2432,8 @@ ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 -- Optional: AutoGluon import timing probe — measures dependency bootstrap latency.
 -- Time from MLJob submission to python_entrypoint_started approximates scheduling +
 -- image startup + pip install (pip mode) or just scheduling + image startup (no-pip).
--- autogluon_import_complete.import_seconds measures import overhead only.
+-- No-pip mode skips AutoGluon/Ray imports and emits *_import_skipped events.
+-- autogluon_import_complete.import_seconds measures import overhead only in pip/preinstalled modes.
 -- Compare pip vs no-pip waves to estimate bootstrap overhead under concurrency.
 --
 -- Single pip-mode probe (default):
@@ -2441,7 +2442,7 @@ CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311');
 -- 8 concurrent pip-mode probes (simulates full evaluation wave concurrency):
 -- CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', TRUE, 8);
 --
--- 8 concurrent no-pip probes (scheduling + image startup baseline, no AutoGluon install):
+-- 8 concurrent no-pip probes (scheduling + image startup baseline; skips AutoGluon/Ray imports):
 -- CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', FALSE, 8);
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 
@@ -2606,3 +2607,237 @@ raises `RuntimeError` if `MODEL_PROBE_STRICT_MEMORY_GUARD=true` (default).
 | `MODEL_PROBE_MEMORY_SAFETY_FACTOR` | `1.5` | Overhead multiplier for reserved estimate |
 | `MODEL_PROBE_STRICT_MEMORY_GUARD` | `true` | Raise if guard triggers |
 | `MODEL_PROBE_OUTPUT_STAGE` | `@MODEL_STAGE/diagnostics/` | Upload destination |
+
+## AutoGluon SPCS Custom Image Backend
+
+### Migration rationale
+
+The default MLJob backend installs AutoGluon via `pip_requirements` at every container startup.
+On a 6-shard × 4-worker deployment this means 24 concurrent pip installs of `autogluon.tabular==1.3.0`,
+each taking 3–8 minutes. The SPCS custom-image backend eliminates this overhead by preinstalling
+AutoGluon, Ray, and all dependencies into a Docker image at build time.
+
+Key differences from the MLJob backend:
+
+| Property | MLJob (`mljob`) | SPCS (`spcs_job`) |
+|---|---|---|
+| `runtime_environment` | Required (e.g. `2.5.0-py311`) | **Not used** |
+| `pip_requirements` | `autogluon.tabular==1.3.0`, `ray` | **Not used** |
+| AutoGluon source | pip install at startup | Preinstalled in OCI image |
+| Ray topology | Snowflake-managed multi-instance | **Self-managed** head + workers |
+| Ray address mode | `auto` | `explicit` (RAY_HEAD_ADDRESS) |
+| SPCS image required | No | Yes (`SYNREG_AUTOGLUON_SPCS_IMAGE`) |
+
+### Architecture (text diagram)
+
+```
+SPCS Job Services per shard (Ray distributed mode):
+
+  [SPCS head container]    spcs_ray_head.py
+         (--num-cpus=0, --resources={"spcs_cluster_id_<run_id>_<shard>": 1})
+          |
+          | <-- RAY_HEAD_ADDRESS (<service_name_lower>.<SPCS_RAY_HEAD_DNS_SUFFIX>:<port>)
+          |
+  [SPCS worker 0]          spcs_ray_worker.py
+  [SPCS worker 1]          spcs_ray_worker.py
+  ...
+          |
+  [SPCS driver container]  autogluon_ray.py
+         (SYNREG_RAY_ADDRESS_MODE=explicit)
+         (RAY_HEAD_ADDRESS=<head_dns>:<port>)
+         (expected_nodes = WORKERS_PER_SHARD + 1, expected_cpus = WORKERS_PER_SHARD * TASK_CPUS)
+         (verifies spcs_cluster_id_<run_id>_<shard> resource before submitting work)
+```
+
+Single-node mode (AUTOGLUON_CLUSTER_SHARDS=0): one SPCS container per shard running
+`evaluate_synthetic_regression.py`. No Ray, no head/worker containers.
+
+### Step 0 — Create the image repository (once)
+
+```sql
+-- See sql/create_autogluon_spcs_image_repository.sql
+CREATE IMAGE REPOSITORY IF NOT EXISTS AUTOGLUON_IMAGE_REPOSITORY;
+SHOW IMAGE REPOSITORIES;  -- note repository_url
+```
+
+### Step 1 — Build and push the Docker image
+
+```bash
+# Build for linux/amd64 (required for Snowflake SPCS)
+docker build --platform linux/amd64 \
+  -f docker/autogluon/Dockerfile \
+  -t tabpfn-autogluon-ray:1.0.0 .
+
+# Health check (optional)
+docker run --rm tabpfn-autogluon-ray:1.0.0 \
+  -c "import ray, autogluon.tabular; print('ok')"
+
+# Push to Snowflake image repository
+docker login <account>.registry.snowflakecomputing.com
+
+docker tag tabpfn-autogluon-ray:1.0.0 \
+  <repository_url>/tabpfn-autogluon-ray:1.0.0
+
+docker push <repository_url>/tabpfn-autogluon-ray:1.0.0
+```
+
+Verify the image is available:
+
+```sql
+SHOW IMAGES IN IMAGE REPOSITORY AUTOGLUON_IMAGE_REPOSITORY;
+```
+
+### Step 2 — Configure environment variables
+
+```bash
+export SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job
+export SYNREG_AUTOGLUON_SPCS_IMAGE=<repository_url>/tabpfn-autogluon-ray:1.0.0
+```
+
+### Step 3 — SPCS import timing probe
+
+Validates that the custom image starts and all imports succeed. Unlike the MLJob probe,
+no pip install occurs; this measures pure scheduling + container startup latency.
+
+```sql
+CALL run_synthetic_regression_autogluon_spcs_import_probe('spcs_job', 1);
+```
+
+### Step 4 — SPCS session probe (mandatory)
+
+Validates that `snowflakeService.enabled=true` in the SPCS job spec causes Snowflake to mount
+the OAuth token at `/snowflake/session/token` and that Snowpark session creation succeeds inside
+a container. This is required before the capacity and worker-access probes — if the session probe
+fails, all subsequent probes that need dataset-stage access will also fail.
+
+```sql
+CALL run_synthetic_regression_autogluon_spcs_session_probe('spcs_job', 1);
+```
+
+Expected output: `session probe ok` with `account=<account>` and `role=<role>` in the container
+log. If the probe fails with a token error, check that `snowflakeService.enabled=true` is present
+in the SPCS job spec (it is injected automatically by `_build_spcs_job_spec()` — do not disable
+it via `enable_snowflake_service_token=False`).
+
+### Step 5 — SPCS capacity probe
+
+Verifies that the custom image starts correctly on the compute pool and Ray is importable.
+
+```sql
+-- Single-node mode (AUTOGLUON_CLUSTER_SHARDS=0): 2 concurrent containers
+CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  'spcs_job',   -- AUTOGLUON_RUNTIME_ENVIRONMENT (ignored; present for signature compat)
+  0,            -- AUTOGLUON_CLUSTER_SHARDS (0 = single-node mode)
+  1,            -- AUTOGLUON_WORKERS_PER_SHARD
+  2             -- AUTOGLUON_CONCURRENT_CLUSTERS
+);
+```
+
+### Step 6 — SPCS worker access probe
+
+Validates dataset access from SPCS containers using the same production path.
+
+```sql
+CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+  'spcs_job', 0, 1, 2
+);
+```
+
+### Step 7 — SPCS evaluation (single-node mode)
+
+Single-node mode: one SPCS job service per shard. No self-managed Ray.
+The entrypoint is `/app/src/evaluate_synthetic_regression.py`.
+
+```sql
+CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  'spcs_job',   -- AUTOGLUON_RUNTIME_ENVIRONMENT (ignored)
+  0,            -- AUTOGLUON_CLUSTER_SHARDS (0 = single-node)
+  1,            -- AUTOGLUON_WORKERS_PER_SHARD
+  1,            -- AUTOGLUON_TASK_CPUS
+  6,            -- AUTOGLUON_CONCURRENT_CLUSTERS (number of shards)
+  300,          -- AUTOGLUON_TIME_LIMIT
+  'best_quality'-- AUTOGLUON_PRESETS
+);
+```
+
+### Step 7b — SPCS evaluation (Ray distributed mode)
+
+Ray distributed mode: per shard, one head + N workers + one driver SPCS service.
+The driver connects to the head with `SYNREG_RAY_ADDRESS_MODE=explicit` and
+`RAY_HEAD_ADDRESS` set to the SPCS service DNS name of the head container.
+This is self-managed Ray — Snowflake does not manage the Ray cluster topology.
+
+```sql
+CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  'spcs_job',   -- AUTOGLUON_RUNTIME_ENVIRONMENT (ignored)
+  6,            -- AUTOGLUON_CLUSTER_SHARDS (Ray clusters)
+  4,            -- AUTOGLUON_WORKERS_PER_SHARD
+  1,            -- AUTOGLUON_TASK_CPUS
+  6,            -- AUTOGLUON_CONCURRENT_CLUSTERS (must equal AUTOGLUON_CLUSTER_SHARDS)
+  300,          -- AUTOGLUON_TIME_LIMIT
+  'best_quality'-- AUTOGLUON_PRESETS
+);
+```
+
+**Per-shard Ray head DNS:** Each shard's head address is derived automatically from the shard's
+SPCS service name and `SPCS_RAY_HEAD_DNS_SUFFIX`. Set the suffix to the SPCS internal DNS
+domain for your Snowflake account:
+
+```bash
+# Format: <service_name_lower>.<suffix>:<port>
+# Example: shard 0 head service SPCS_RAY_HEAD_R0_0 → spcs_ray_head_r0_0.<suffix>:6379
+export SPCS_RAY_HEAD_DNS_SUFFIX=<spcs_internal_dns_suffix>
+```
+
+The suffix is typically the SPCS service endpoint domain shown in `SHOW SERVICES` or in
+the Snowflake SPCS documentation for your account region. Each shard has a unique derived
+address — do not use a single global override for multi-shard deployments.
+
+### Rollback to MLJob backend
+
+To revert to the MLJob backend, unset or change the backend env var:
+
+```bash
+export SYNREG_AUTOGLUON_EXECUTION_BACKEND=mljob
+# SYNREG_AUTOGLUON_SPCS_IMAGE is not required for mljob
+```
+
+Then use the original procedures:
+
+```sql
+CALL run_synthetic_regression_combined_autogluon_evaluation(...);
+```
+
+### Operational caveats
+
+- The SPCS backend uses `EXECUTE JOB SERVICE` which does not support `pip_requirements`
+  or `runtime_environment` — all dependencies must be preinstalled in the image.
+- **`snowflakeService.enabled=true` is required** in the SPCS job spec for any container
+  that needs a Snowpark session (head, driver). The spec builder injects this automatically.
+  Do not disable it — without it, the OAuth token mount at `/snowflake/session/token` is
+  absent and session creation fails.
+- **Self-managed Ray head starts with `--num-cpus=0`** so it does not consume schedulable
+  CPU from the pool. The driver's readiness check uses `expected_nodes = WORKERS_PER_SHARD + 1`
+  (head counts as a live node with zero CPUs) and `expected_cpus = WORKERS_PER_SHARD * TASK_CPUS`.
+- **Cluster identity verification:** The head announces a custom Ray resource
+  `spcs_cluster_id_<run_id>_<shard_index>=1`. The driver checks for this resource after
+  `ray.init()` to confirm it joined the correct shard's cluster. If the check fails, the
+  driver raises `RuntimeError` with a remediation message rather than submitting work to
+  the wrong cluster.
+- **Per-shard DNS with `SPCS_RAY_HEAD_DNS_SUFFIX`:** Each shard's head address is derived as
+  `<service_name_lower>.<suffix>:<port>`. Set `SPCS_RAY_HEAD_DNS_SUFFIX` to the SPCS internal
+  DNS domain. Do not set `SPCS_RAY_HEAD_DNS_OVERRIDE` — it is no longer supported and will
+  be ignored.
+- **Presigned URL expiry:** The default expiry is 86400 s (24 h). For very long runs, set
+  `SYNREG_PRESIGNED_URL_EXPIRY_SECONDS` to a larger value. The driver logs a warning if the
+  estimated shard runtime exceeds the expiry minus a 1 h buffer.
+- **Image verification:** At job submission the driver queries `SHOW IMAGE REPOSITORIES` and
+  warns (non-fatal) if the image reference does not match any known repository URL. Treat
+  `[WARN] Image ... was not matched` as a signal to verify `SYNREG_AUTOGLUON_SPCS_IMAGE`.
+- The Snowpark session probe (`run_synthetic_regression_autogluon_spcs_session_probe`) uses
+  the SPCS-injected OAuth token at `/snowflake/session/token` with `SNOWFLAKE_ACCOUNT` and
+  `SNOWFLAKE_HOST`. Run it as a SQL stored procedure call (Step 4), not as a bash command.
+- AUTOGLUON_IMAGE_REPOSITORY images are private to the Snowflake account. Each push
+  requires re-authentication with `docker login`.
+- The `SYNREG_AUTOGLUON_SPCS_IMAGE` env var must be set to the full OCI image reference
+  including the registry hostname, database, schema, repository, image name, and tag.

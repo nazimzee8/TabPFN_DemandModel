@@ -149,6 +149,34 @@ SYNREG_EXPECTED_DEEPSET_SHARDS  = int(os.getenv("SYNREG_EXPECTED_DEEPSET_SHARDS"
 SYNREG_EXPECTED_BASELINE_SHARDS = int(os.getenv("SYNREG_EXPECTED_BASELINE_SHARDS", "0"))
 SYNREG_EXPECTED_AG_SHARDS       = int(os.getenv("SYNREG_EXPECTED_AG_SHARDS",       "0"))
 
+
+def create_snowpark_session():
+    """Create a Snowpark session in stored-proc or SPCS container contexts."""
+    token_path = os.getenv("SNOWFLAKE_SESSION_TOKEN_PATH", "/snowflake/session/token")
+    account = os.getenv("SNOWFLAKE_ACCOUNT")
+    host = os.getenv("SNOWFLAKE_HOST")
+    if account and host and os.path.exists(token_path):
+        with open(token_path, "r") as f:
+            token = f.read().strip()
+        configs = {
+            "account": account,
+            "host": host,
+            "authenticator": "oauth",
+            "token": token,
+        }
+        optional_env = {
+            "database": "SNOWFLAKE_DATABASE",
+            "schema": "SNOWFLAKE_SCHEMA",
+            "role": "SNOWFLAKE_ROLE",
+            "warehouse": "SNOWFLAKE_WAREHOUSE",
+        }
+        for config_key, env_key in optional_env.items():
+            value = os.getenv(env_key)
+            if value:
+                configs[config_key] = value
+        return Session.builder.configs(configs).create()
+    return Session.builder.getOrCreate()
+
 SYNREG_EXPECTED_OUTPUTS = [
     "synthetic_regression_model_comparison.csv",
     "synthetic_regression_model_comparison_summary.csv",
@@ -367,7 +395,7 @@ def load_best_deepset_checkpoint():
     """
     import glob as _glob
 
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
 
     ckpt_dir = str(Path(SYNREG_CKPT_LOCAL).parent)
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -452,7 +480,7 @@ def _normalize_synreg_row(r) -> dict:
 def load_synthetic_regression_index(suite_family: str | None = None, session=None) -> list[dict]:
     """Query SYNTHETIC_REGRESSION_DATASET_INDEX for the current suite_id."""
     if session is None:
-        session = Session.builder.getOrCreate()
+        session = create_snowpark_session()
 
     where = f"suite_id = '{SYNREG_SUITE_ID}'"
     if suite_family:
@@ -809,7 +837,7 @@ def _read_dataset_local_file(row: dict, local_path: str) -> dict:
 
 def load_prepared_synthetic_dataset(row: dict, local_cache_dir: str = SYNREG_LOCAL_CACHE) -> dict:
     """Download dataset from row['stage_path'] using a local Snowpark session."""
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
     return _load_prepared_synthetic_dataset_from_stage(
         row,
         stage_path=row["stage_path"],
@@ -1227,7 +1255,7 @@ def run_deepset_synthetic_regression() -> None:
                 flush=True,
             )
 
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
 
     all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
     # Expand to explicit (dataset, split_seed, n_train_condition) work items
@@ -1436,7 +1464,7 @@ def run_baseline_synthetic_regression() -> None:
     validate_baseline_dependencies(
         method for method in SYNREG_BASELINE_METHODS if method != "FixedRidgeLambda1"
     )
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
 
     all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
     my_rows = assign_synthetic_regression_shard(all_rows_index, SYNREG_SHARD_INDEX, SYNREG_NUM_SHARDS)
@@ -1627,7 +1655,7 @@ def run_autogluon_synthetic_regression() -> None:
     Cleans AutoGluon /tmp artifacts after each fit.
     """
     get_tabular_predictor_class()
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
 
     all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
     my_rows = assign_synthetic_regression_shard(all_rows_index, SYNREG_SHARD_INDEX, SYNREG_NUM_SHARDS)
@@ -2016,7 +2044,7 @@ def run_synthetic_regression_aggregation() -> None:
     """
     Ingest all synthetic_regression_parts, rank, compute ratios, write summary CSVs.
     """
-    session = Session.builder.getOrCreate()
+    session = create_snowpark_session()
 
     agg_local_dir = os.path.join(tempfile.gettempdir(), "synreg_agg_output")
     os.makedirs(agg_local_dir, exist_ok=True)

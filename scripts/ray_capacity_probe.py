@@ -61,10 +61,25 @@ expected_nodes = _env_int("EXPECTED_RAY_NODES", 1)
 expected_cpus_min = _env_int("EXPECTED_RAY_CPUS_MIN", expected_nodes)
 sleep_seconds = _env_int("CAPACITY_PROBE_SLEEP_SECONDS", 30)
 label = os.getenv("CAPACITY_PROBE_LABEL", "ray_capacity_probe")
+ray_address_mode = os.getenv("SYNREG_RAY_ADDRESS_MODE", "auto")
+if ray_address_mode == "explicit":
+    ray_address = os.getenv("RAY_HEAD_ADDRESS")
+    if not ray_address:
+        raise RuntimeError(
+            "SYNREG_RAY_ADDRESS_MODE=explicit requires RAY_HEAD_ADDRESS."
+        )
+elif ray_address_mode == "auto":
+    ray_address = "auto"
+else:
+    raise RuntimeError(
+        f"Unsupported SYNREG_RAY_ADDRESS_MODE={ray_address_mode!r}; "
+        "expected 'auto' or 'explicit'."
+    )
 
 print(
     f"[ray_capacity_probe] started: label={label!r} "
-    f"expected_nodes={expected_nodes} expected_cpus_min={expected_cpus_min}",
+    f"expected_nodes={expected_nodes} expected_cpus_min={expected_cpus_min} "
+    f"ray_address_mode={ray_address_mode!r}",
     flush=True,
 )
 
@@ -76,7 +91,7 @@ except ImportError as exc:
         "requires the Snowflake Ray runtime to be available."
     ) from exc
 
-ray.init(address="auto", ignore_reinit_error=True, include_dashboard=False)
+ray.init(address=ray_address, ignore_reinit_error=True, include_dashboard=False)
 live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
     ray,
     expected_nodes=expected_nodes,
