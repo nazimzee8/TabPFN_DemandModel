@@ -223,6 +223,22 @@ CALL run_synthetic_regression_combined_autogluon_worker_access_probe('2.5.0-py31
 CALL run_synthetic_regression_combined_autogluon_evaluation('2.5.0-py311', '2.5.0-py311', 6, 4, 1, 6, 300, 'best_quality');
 ```
 
+**AutoGluon import timing probe** — measures scheduling + image startup + pip bootstrap latency:
+```sql
+-- Single pip-mode probe (default):
+CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311');
+
+-- 8 concurrent pip-mode probes (simulates full evaluation wave concurrency):
+CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', TRUE, 8);
+
+-- 8 concurrent no-pip probes (scheduling + image startup baseline):
+CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', FALSE, 8);
+```
+Interpretation: time from MLJob submission to `python_entrypoint_started` ≈ scheduling + image pull + pip install. `autogluon_import_complete.import_seconds` is pure import overhead. Compare pip vs no-pip waves to isolate bootstrap cost. Stage with:
+```sql
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
 ### 9B. Single-node shard mode (`CLUSTER_SHARDS = 0`)
 
 **Topology:** N single-instance MLJobs (`target_instances=1`), each running
@@ -270,10 +286,20 @@ CALL run_synthetic_regression_combined_autogluon_capacity_probe(
   `target_instances=WORKERS_PER_SHARD`, and runs `ray_capacity_probe.py`.
   Uses the same Ray dependency contract as distributed evaluation
   (`SYNREG_AG_RAY_PIP`).
+- Ray capacity readiness is configurable per call through the extended overload:
+  `(..., CLUSTER_SHARDS, WORKERS_PER_SHARD, CONCURRENT_CLUSTERS,
+  RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS)`. Default is 300s timeout,
+  10s poll.
 - Single-node mode (`CLUSTER_SHARDS = 0`): submits `CONCURRENT_CLUSTERS`
   single-instance probes and runs `capacity_probe.py`.
 - The probe verifies container/Ray startup and resource visibility only. It does not
   download full datasets and does not run AutoGluon.
+
+**AutoGluon Ray evaluation readiness:** the distributed evaluation extended overload
+accepts `RAY_READY_TIMEOUT_SECONDS` and `RAY_READY_POLL_SECONDS` after
+`AUTOGLUON_PRESETS`. Default is 600s timeout, 10s poll. The entrypoint receives these
+as `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` and
+`SYNREG_RAY_CLUSTER_READY_POLL_SECONDS`.
 
 **Worker-access probe:** `run_synthetic_regression_combined_autogluon_worker_access_probe`
 validates that the deployed worker data-access path works with the same runtime

@@ -29,6 +29,20 @@ import os
 import sys
 import time
 
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}.") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive; got {raw!r}.")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Pool / stage / shard constants
 # ---------------------------------------------------------------------------
@@ -82,6 +96,22 @@ SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS_DEFAULT = int(
 SYNREG_AUTOGLUON_DISTRIBUTED_MODE_DEFAULT = os.getenv(
     "SYNREG_AUTOGLUON_DISTRIBUTED_MODE",
     "ray_work_items",
+)
+SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS_DEFAULT = _env_positive_int(
+    "SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS",
+    _env_positive_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 300),
+)
+SYNREG_RAY_CAPACITY_READY_POLL_SECONDS_DEFAULT = _env_positive_int(
+    "SYNREG_RAY_CAPACITY_READY_POLL_SECONDS",
+    _env_positive_int("SYNREG_RAY_CLUSTER_READY_POLL_SECONDS", 10),
+)
+SYNREG_RAY_EVALUATION_READY_TIMEOUT_SECONDS_DEFAULT = _env_positive_int(
+    "SYNREG_RAY_EVALUATION_READY_TIMEOUT_SECONDS",
+    _env_positive_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 600),
+)
+SYNREG_RAY_EVALUATION_READY_POLL_SECONDS_DEFAULT = _env_positive_int(
+    "SYNREG_RAY_EVALUATION_READY_POLL_SECONDS",
+    _env_positive_int("SYNREG_RAY_CLUSTER_READY_POLL_SECONDS", 10),
 )
 
 DEEPSET_GPU_POOL = "DEEPSET_GPU_POOL"
@@ -1891,6 +1921,8 @@ def run_synthetic_regression_combined_autogluon_evaluation(
     autogluon_concurrent_clusters=None,
     autogluon_time_limit=None,
     autogluon_presets=None,
+    ray_ready_timeout_seconds=None,
+    ray_ready_poll_seconds=None,
 ) -> str:
     """Phase 4: AutoGluon evaluation on AUTOGLUON_CPU_POOL.
 
@@ -1915,6 +1947,7 @@ def run_synthetic_regression_combined_autogluon_evaluation(
       CALL run_synthetic_regression_combined_autogluon_evaluation(bench_rt, ag_rt,
            cluster_shards, workers_per_shard, task_cpus, concurrent_clusters,
            time_limit_secs, presets);
+      Optional extended form adds ray_ready_timeout_seconds and ray_ready_poll_seconds.
     """
     proc = "run_synthetic_regression_combined_autogluon_evaluation"
 
@@ -1939,6 +1972,18 @@ def run_synthetic_regression_combined_autogluon_evaluation(
         sql_arg=autogluon_presets, env_var="AUTOGLUON_PRESETS",
         default="best_quality",
     )
+    ray_ready_timeout = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS",
+        sql_arg=ray_ready_timeout_seconds,
+        env_var="SYNREG_RAY_EVALUATION_READY_TIMEOUT_SECONDS",
+        default=SYNREG_RAY_EVALUATION_READY_TIMEOUT_SECONDS_DEFAULT,
+    )
+    ray_ready_poll = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
+        sql_arg=ray_ready_poll_seconds,
+        env_var="SYNREG_RAY_EVALUATION_READY_POLL_SECONDS",
+        default=SYNREG_RAY_EVALUATION_READY_POLL_SECONDS_DEFAULT,
+    )
 
     ag_min_tmp = os.getenv(
         "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES",
@@ -1960,7 +2005,7 @@ def run_synthetic_regression_combined_autogluon_evaluation(
         "SYNREG_AUTOGLUON_MAX_IN_FLIGHT",
         str(SYNREG_AUTOGLUON_MAX_IN_FLIGHT_DEFAULT),
     )
-    worker_access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "scoped_file_url")
+    worker_access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
     max_work_item_bytes = os.getenv("SYNREG_MAX_WORK_ITEM_BYTES", "8192")
 
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
@@ -2043,7 +2088,9 @@ def run_synthetic_regression_combined_autogluon_evaluation(
             f"cluster_shards={cluster_shards} workers_per_shard={workers_per_shard} "
             f"task_cpus={task_cpus} concurrent_clusters={concurrent_clusters} "
             f"max_requested_nodes={max_requested_nodes} "
-            f"time_limit={time_limit} presets={presets!r} entrypoint={resolved_entrypoint!r}",
+            f"time_limit={time_limit} presets={presets!r} "
+            f"ray_ready_timeout={ray_ready_timeout}s ray_ready_poll={ray_ready_poll}s "
+            f"entrypoint={resolved_entrypoint!r}",
             flush=True,
         )
         jobs = []
@@ -2068,6 +2115,8 @@ def run_synthetic_regression_combined_autogluon_evaluation(
                             "AUTOGLUON_TIME_LIMIT": str(time_limit),
                             "AUTOGLUON_PRESETS": presets,
                             "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                            "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout),
+                            "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS": str(ray_ready_poll),
                             "SYNREG_AUTOGLUON_MAX_IN_FLIGHT": ag_max_in_flight,
                             "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
                             "SYNREG_MAX_WORK_ITEM_BYTES": max_work_item_bytes,
@@ -2327,6 +2376,8 @@ def run_synthetic_regression_combined_autogluon_capacity_probe(
     autogluon_cluster_shards=None,
     autogluon_workers_per_shard=None,
     autogluon_concurrent_clusters=None,
+    ray_ready_timeout_seconds=None,
+    ray_ready_poll_seconds=None,
 ) -> str:
     """Capacity probe: test the node envelope for combined AutoGluon execution.
 
@@ -2349,6 +2400,18 @@ def run_synthetic_regression_combined_autogluon_capacity_probe(
         cluster_shards_arg=autogluon_cluster_shards,
         workers_per_shard_arg=autogluon_workers_per_shard,
         concurrent_clusters_arg=autogluon_concurrent_clusters,
+    )
+    ray_ready_timeout = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS",
+        sql_arg=ray_ready_timeout_seconds,
+        env_var="SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS",
+        default=SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS_DEFAULT,
+    )
+    ray_ready_poll = _resolve_positive_int_runtime_param(
+        procedure_name=proc, name="SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
+        sql_arg=ray_ready_poll_seconds,
+        env_var="SYNREG_RAY_CAPACITY_READY_POLL_SECONDS",
+        default=SYNREG_RAY_CAPACITY_READY_POLL_SECONDS_DEFAULT,
     )
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
 
@@ -2411,7 +2474,8 @@ def run_synthetic_regression_combined_autogluon_capacity_probe(
             f"[INFO] {proc}: mode=ray_clusters "
             f"submitting {concurrent_clusters} probes to {AUTOGLUON_CPU_POOL} "
             f"each with target_instances={workers_per_shard} "
-            f"(total_requested_nodes={total_requested_nodes})",
+            f"(total_requested_nodes={total_requested_nodes}) "
+            f"ray_ready_timeout={ray_ready_timeout}s ray_ready_poll={ray_ready_poll}s",
             flush=True,
         )
         jobs = []
@@ -2437,6 +2501,8 @@ def run_synthetic_regression_combined_autogluon_capacity_probe(
                         "AUTOGLUON_TASK_CPUS": str(SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT),
                         "EXPECTED_RAY_NODES": str(workers_per_shard),
                         "EXPECTED_RAY_CPUS_MIN": str(workers_per_shard),
+                        "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout),
+                        "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS": str(ray_ready_poll),
                     },
                     runtime_environment=ag_rt,
                     entrypoint="ray_capacity_probe.py",
@@ -2462,7 +2528,9 @@ def run_synthetic_regression_combined_autogluon_capacity_probe(
             f"{proc}: ok mode=ray_clusters "
             f"cluster_shards={cluster_shards} workers_per_shard={workers_per_shard} "
             f"concurrent_clusters={concurrent_clusters} "
-            f"total_requested_nodes={total_requested_nodes} pool={AUTOGLUON_CPU_POOL}"
+            f"total_requested_nodes={total_requested_nodes} "
+            f"ray_ready_timeout={ray_ready_timeout}s ray_ready_poll={ray_ready_poll}s "
+            f"pool={AUTOGLUON_CPU_POOL}"
         )
 
 
@@ -2495,7 +2563,7 @@ def run_synthetic_regression_combined_autogluon_worker_access_probe(
         workers_per_shard_arg=autogluon_workers_per_shard,
         concurrent_clusters_arg=autogluon_concurrent_clusters,
     )
-    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "scoped_file_url")
+    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
     probe_items = os.getenv(
         "SYNREG_WORKER_ACCESS_PROBE_ITEMS",
         str(max(1, plan.workers_per_shard)),
@@ -2594,6 +2662,12 @@ def run_synthetic_regression_combined_autogluon_worker_access_probe(
                         "AUTOGLUON_TASK_CPUS": str(SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT),
                         "EXPECTED_RAY_NODES": str(workers_per_shard),
                         "EXPECTED_RAY_CPUS_MIN": str(workers_per_shard),
+                        "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(
+                            SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS_DEFAULT
+                        ),
+                        "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS": str(
+                            SYNREG_RAY_CAPACITY_READY_POLL_SECONDS_DEFAULT
+                        ),
                     },
                 ),
                 runtime_environment=ag_rt,
@@ -2656,6 +2730,83 @@ def run_synthetic_regression_combined_aggregation_ag(
 
 
 # ---------------------------------------------------------------------------
+def run_synthetic_regression_autogluon_import_timing_probe(
+    session,
+    ag_rt: str = "2.5.0-py311",
+    with_pip: bool = True,
+    probe_count: int = 1,
+) -> str:
+    """Submit lightweight AutoGluon import-timing probes to AUTOGLUON_CPU_POOL.
+
+    Each probe is a single-instance MLJob running autogluon_import_timing_probe.py.
+    The probe emits structured JSON log lines to stdout:
+      - python_entrypoint_started: emitted immediately when the entrypoint starts.
+        Time from MLJob submission to this event approximates scheduling + image
+        startup + pip install (with_pip=True) or just scheduling + image startup
+        (with_pip=False).
+      - autogluon_import_complete: time spent importing autogluon.tabular.
+      - ray_import_complete: time spent importing ray.
+      - import_failed: emitted (then exception re-raised) if an import fails.
+
+    with_pip=True  — pip_requirements=SYNREG_AG_PIP, external_access_integrations=SYNREG_PYPI_EAI.
+                     Measures the full bootstrap overhead under production conditions.
+    with_pip=False — no pip install; expected to fail import unless autogluon is
+                     already preinstalled in the runtime image. Provides a no-pip
+                     scheduling + startup baseline.
+    """
+    proc = "run_synthetic_regression_autogluon_import_timing_probe"
+    if probe_count < 1:
+        raise ValueError(f"{proc}: probe_count must be >= 1; got {probe_count!r}.")
+
+    _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
+
+    deps_mode = "pip" if with_pip else "preinstalled"
+    pip_reqs = SYNREG_AG_PIP if with_pip else None
+    eai = SYNREG_PYPI_EAI if with_pip else None
+
+    print(
+        f"[INFO] {proc}: submitting {probe_count} probe(s) to {AUTOGLUON_CPU_POOL} "
+        f"with_pip={with_pip} deps_mode={deps_mode!r} runtime={ag_rt!r}",
+        flush=True,
+    )
+
+    jobs = []
+    for i in range(probe_count):
+        lbl = f"ag_import_timing_probe_{i}"
+        job = _submit_synreg(
+            session=session,
+            label=lbl,
+            compute_pool=AUTOGLUON_CPU_POOL,
+            env_vars={
+                "SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE": deps_mode,
+                "SYNREG_AG_IMPORT_PROBE_LABEL": f"ag_import_timing_probe_{i}_of_{probe_count}",
+                "EVAL_RUNTIME_ENVIRONMENT": ag_rt,
+            },
+            runtime_environment=ag_rt,
+            entrypoint="autogluon_import_timing_probe.py",
+            target_instances=1,
+            pip_requirements=pip_reqs,
+            external_access_integrations=eai,
+        )
+        jobs.append((lbl, job))
+
+    _wait_job_group(jobs, session)
+    return (
+        f"{proc}: ok with_pip={with_pip} deps_mode={deps_mode!r} "
+        f"probe_count={probe_count} runtime={ag_rt!r} pool={AUTOGLUON_CPU_POOL}"
+    )
+
+
+def run_synthetic_regression_autogluon_import_timing_probe_default(
+    session,
+    ag_rt: str = "2.5.0-py311",
+) -> str:
+    """Default single-probe pip-mode import timing probe."""
+    return run_synthetic_regression_autogluon_import_timing_probe(
+        session, ag_rt=ag_rt, with_pip=True, probe_count=1
+    )
+
+
 # Main (for direct invocation / stored proc driver entry)
 # ---------------------------------------------------------------------------
 

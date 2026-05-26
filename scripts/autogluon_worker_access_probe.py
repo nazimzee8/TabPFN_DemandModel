@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 
 def _env_int(name: str, default: int) -> int:
@@ -62,6 +63,44 @@ def _require_env(name: str, description: str = "") -> str:
     return value.strip()
 
 
+def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) -> tuple[int, int, dict]:
+    ready_timeout_seconds = _env_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 300)
+    poll_seconds = _env_int("SYNREG_RAY_CLUSTER_READY_POLL_SECONDS", 10)
+    deadline = time.monotonic() + ready_timeout_seconds
+    last_state: tuple[int, int] | None = None
+
+    while True:
+        live_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        cluster_resources = ray.cluster_resources()
+        available_cpus = int(cluster_resources.get("CPU", 0))
+        state = (len(live_nodes), available_cpus)
+        if state != last_state:
+            print(
+                "[ag_worker_access_probe] ray readiness: "
+                f"live_nodes={len(live_nodes)}/{expected_nodes} "
+                f"available_cpus={available_cpus}/{expected_cpus_min} "
+                f"resources={dict(cluster_resources)}",
+                flush=True,
+            )
+            last_state = state
+
+        if len(live_nodes) >= expected_nodes and available_cpus >= expected_cpus_min:
+            return len(live_nodes), available_cpus, dict(cluster_resources)
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Ray cluster did not reach requested capacity before readiness timeout: "
+                f"live_nodes={len(live_nodes)}/{expected_nodes}, "
+                f"available_cpus={available_cpus}/{expected_cpus_min}, "
+                f"timeout_seconds={ready_timeout_seconds}, "
+                f"resources={dict(cluster_resources)}. "
+                "Snowflake may still be starting target_instances, or account/compute-pool "
+                "concurrency may be below the requested Ray capacity envelope."
+            )
+
+        time.sleep(poll_seconds)
+
+
 def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> list[dict]:
     from snowflake.snowpark import Session
     from evaluate_synthetic_regression import (
@@ -89,16 +128,16 @@ def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> l
             "Check SYNTHETIC_REGRESSION_NUM_SHARDS and SYNTHETIC_REGRESSION_SHARD_INDEX."
         )
 
-    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "scoped_file_url")
+    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
     max_item_bytes = _env_int("SYNREG_MAX_WORK_ITEM_BYTES", 8192)
-    scoped_url_cache: dict[str, str] = {}
+    dataset_url_cache: dict[str, str] = {}
     items = [
         build_compact_synreg_work_item(
             row,
             session=session,
             access_mode=access_mode,
             max_item_bytes=max_item_bytes,
-            scoped_url_cache=scoped_url_cache,
+            dataset_url_cache=dataset_url_cache,
         )
         for row in assigned[:max_items]
     ]
@@ -107,7 +146,7 @@ def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> l
         "[ag_worker_access_probe] driver loaded metadata only: "
         f"index_rows={len(rows)} work_items={len(work_items)} "
         f"assigned={len(assigned)} probe_items={len(items)} "
-        f"unique_dataset_access_urls={len(scoped_url_cache)} "
+        f"unique_dataset_access_urls={len(dataset_url_cache)} "
         f"serialized_total_bytes={total_bytes} serialized_max_item_bytes={max_bytes}",
         flush=True,
     )
@@ -121,7 +160,7 @@ def _validate_item_access(item_meta: dict) -> dict:
     from evaluate_synthetic_regression import load_prepared_synthetic_dataset_from_access
 
     dataset_access = item_meta.get("dataset_access") or {}
-    access_mode = dataset_access.get("mode", "scoped_file_url")
+    access_mode = dataset_access.get("mode", "driver_presigned_url")
     stage_path = dataset_access.get("stage_path") or item_meta.get("stage_path")
     if not stage_path:
         raise RuntimeError("Worker item is missing dataset stage_path.")
@@ -206,24 +245,17 @@ def _run_ray() -> None:
         ) from exc
 
     ray.init(address="auto", ignore_reinit_error=True, log_to_driver=True, include_dashboard=False)
-    live_nodes = [node for node in ray.nodes() if node.get("Alive")]
-    cluster_resources = ray.cluster_resources()
-    available_cpus = int(cluster_resources.get("CPU", 0))
+    live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
+        ray,
+        expected_nodes=expected_nodes,
+        expected_cpus_min=expected_cpus_min,
+    )
     print(
-        "[ag_worker_access_probe] ray attached: "
-        f"live_nodes={len(live_nodes)} available_cpus={available_cpus} "
+        "[ag_worker_access_probe] ray ready: "
+        f"live_nodes={live_node_count} available_cpus={available_cpus} "
         f"resources={dict(cluster_resources)}",
         flush=True,
     )
-    if len(live_nodes) < expected_nodes:
-        raise RuntimeError(
-            f"Ray cluster has {len(live_nodes)} live nodes, expected at least "
-            f"{expected_nodes}. Snowflake did not attach all requested target_instances."
-        )
-    if available_cpus < expected_cpus_min:
-        raise RuntimeError(
-            f"Ray cluster has {available_cpus} CPUs, expected at least {expected_cpus_min}."
-        )
 
     items = _load_probe_items(
         shard_index=shard_index,
@@ -255,7 +287,7 @@ def main() -> None:
         "Set to the combined suite id, usually 'linear_all_v1'.",
     )
     use_ray = _env_bool("SYNREG_WORKER_ACCESS_PROBE_USE_RAY", False)
-    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "scoped_file_url")
+    access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
     print(
         "[ag_worker_access_probe] started: "
         f"use_ray={use_ray} suite_id={os.getenv('SYNTHETIC_REGRESSION_SUITE_ID')!r} "

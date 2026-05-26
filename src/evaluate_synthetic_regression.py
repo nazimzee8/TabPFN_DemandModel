@@ -75,7 +75,10 @@ SYNREG_OUTPUT_STAGE = os.getenv("SYNREG_OUTPUT_STAGE", "@EVALUATION_RESULTS_STAG
 SYNREG_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
 SYNREG_WORKER_DATA_ACCESS_MODE = os.getenv(
     "SYNREG_WORKER_DATA_ACCESS_MODE",
-    "scoped_file_url",
+    "driver_presigned_url",
+)
+SYNREG_PRESIGNED_URL_EXPIRY_SECONDS = int(
+    os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400")
 )
 SYNREG_MAX_WORK_ITEM_BYTES = int(os.getenv("SYNREG_MAX_WORK_ITEM_BYTES", "8192"))
 CHECKPOINT_STAGE_PATH = "@MODEL_STAGE/checkpoints/best.pt"
@@ -554,7 +557,7 @@ def build_compact_synreg_work_item(
     session=None,
     access_mode: str | None = None,
     max_item_bytes: int | None = None,
-    scoped_url_cache: dict[str, str] | None = None,
+    dataset_url_cache: dict[str, str] | None = None,
 ) -> dict:
     """Build the compact Ray task argument for one synthetic-regression work item.
 
@@ -585,17 +588,30 @@ def build_compact_synreg_work_item(
                 "build_compact_synreg_work_item requires a driver Snowpark session "
                 "to derive dataset_access.scoped_url for access_mode='scoped_file_url'."
             )
-        if scoped_url_cache is not None and stage_path in scoped_url_cache:
-            scoped_url = scoped_url_cache[stage_path]
+        if dataset_url_cache is not None and stage_path in dataset_url_cache:
+            scoped_url = dataset_url_cache[stage_path]
         else:
             scoped_url = build_scoped_dataset_file_url(session, stage_path)
-            if scoped_url_cache is not None:
-                scoped_url_cache[stage_path] = scoped_url
+            if dataset_url_cache is not None:
+                dataset_url_cache[stage_path] = scoped_url
         item["dataset_access"]["scoped_url"] = scoped_url
+    elif access_mode == "driver_presigned_url":
+        if session is None:
+            raise RuntimeError(
+                "build_compact_synreg_work_item requires a driver Snowpark session "
+                "to derive dataset_access.presigned_url for access_mode='driver_presigned_url'."
+            )
+        if dataset_url_cache is not None and stage_path in dataset_url_cache:
+            presigned_url = dataset_url_cache[stage_path]
+        else:
+            presigned_url = build_presigned_dataset_file_url(session, stage_path)
+            if dataset_url_cache is not None:
+                dataset_url_cache[stage_path] = presigned_url
+        item["dataset_access"]["presigned_url"] = presigned_url
     else:
         raise RuntimeError(
             f"Unsupported synthetic regression worker dataset access mode {access_mode!r}. "
-            "Supported mode: 'scoped_file_url'."
+            "Supported modes: 'driver_presigned_url', 'scoped_file_url'."
         )
 
     encoded = json.dumps(item, sort_keys=True, default=str).encode("utf-8")
@@ -688,6 +704,28 @@ def build_scoped_dataset_file_url(session, stage_path: str) -> str:
     if not scoped_url:
         raise RuntimeError(f"BUILD_SCOPED_FILE_URL returned an empty URL for {stage_path!r}.")
     return str(scoped_url)
+
+
+def build_presigned_dataset_file_url(
+    session, stage_path: str, expiry_seconds: int = SYNREG_PRESIGNED_URL_EXPIRY_SECONDS
+) -> str:
+    """Driver-only helper that generates a time-limited HTTPS URL for session-free worker access."""
+    stage_name, relative_path = _split_stage_path(stage_path)
+    rows = session.sql(
+        f"SELECT GET_PRESIGNED_URL({stage_name}, {_sql_string_literal(relative_path)}, "
+        f"{int(expiry_seconds)}) AS PRESIGNED_URL"
+    ).collect()
+    if not rows:
+        raise RuntimeError(f"GET_PRESIGNED_URL returned no rows for {stage_path!r}.")
+    row = rows[0]
+    if hasattr(row, "as_dict"):
+        d = {str(k).lower(): v for k, v in row.as_dict().items()}
+        presigned_url = d.get("presigned_url")
+    else:
+        presigned_url = row[0]
+    if not presigned_url:
+        raise RuntimeError(f"GET_PRESIGNED_URL returned an empty URL for {stage_path!r}.")
+    return str(presigned_url)
 
 
 def _validate_dataset_metadata(payload: dict, row: dict) -> None:
@@ -786,55 +824,84 @@ def load_prepared_synthetic_dataset_from_access(
 ) -> dict:
     """Load a worker dataset through the explicit dataset_access descriptor.
 
-    Current production mode is ``scoped_file_url``: the driver derives a scoped
-    URL from the stage path, and Ray workers open the URL with SnowflakeFile
-    without creating Snowpark sessions. Workers must not query
-    SYNTHETIC_REGRESSION_DATASET_INDEX.
+    Supported access modes:
+    - driver_presigned_url (default): driver generates a time-limited HTTPS URL via
+      GET_PRESIGNED_URL(); workers download with urllib.request without a session.
+    - scoped_file_url (legacy): driver generates a scoped URL via BUILD_SCOPED_FILE_URL();
+      workers open with SnowflakeFile (requires Snowflake UDF/SP execution context).
     """
     dataset_access = item_meta.get("dataset_access") or {}
     access_mode = dataset_access.get("mode", SYNREG_WORKER_DATA_ACCESS_MODE)
     stage_path = dataset_access.get("stage_path") or item_meta.get("stage_path")
-    scoped_url = dataset_access.get("scoped_url")
     if not stage_path:
         raise RuntimeError("dataset_access.stage_path is required for worker dataset loading.")
-    if access_mode != "scoped_file_url":
-        raise RuntimeError(
-            f"Unsupported synthetic regression worker dataset access mode {access_mode!r}. "
-            "Supported mode: 'scoped_file_url'."
-        )
-    if not scoped_url:
-        raise RuntimeError("dataset_access.scoped_url is required for access_mode='scoped_file_url'.")
 
     os.makedirs(local_cache_dir, exist_ok=True)
     dataset_key = _stage_path_to_local_name(stage_path)
     local_path = os.path.join(local_cache_dir, dataset_key)
 
     if not os.path.exists(local_path):
-        try:
-            from snowflake.snowpark.files import SnowflakeFile
-        except ImportError as exc:
-            raise RuntimeError(
-                "snowflake.snowpark.files.SnowflakeFile is required for "
-                "session-free scoped_file_url worker dataset access."
-            ) from exc
-        tmp_path = os.path.join(local_cache_dir, f".{dataset_key}.{os.getpid()}.tmp")
-        try:
-            with open(tmp_path, "wb") as dst:
-                with SnowflakeFile.open(scoped_url, "rb", require_scoped_url=True) as src:
-                    shutil.copyfileobj(src, dst)
-            os.replace(tmp_path, local_path)
-            tmp_path = None  # published; do not delete in except
-        except Exception:
+        if access_mode == "driver_presigned_url":
+            presigned_url = dataset_access.get("presigned_url")
+            if not presigned_url:
+                raise RuntimeError(
+                    "dataset_access.presigned_url is required for access_mode='driver_presigned_url'."
+                )
+            import urllib.request
+            tmp_path = os.path.join(local_cache_dir, f".{dataset_key}.{os.getpid()}.tmp")
             try:
-                if tmp_path is not None and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-            except OSError:
-                pass
-            if not os.path.exists(local_path):
-                raise
-            # Another worker published first; proceed to read their complete file
+                with urllib.request.urlopen(presigned_url) as resp:
+                    with open(tmp_path, "wb") as dst:
+                        shutil.copyfileobj(resp, dst)
+                os.replace(tmp_path, local_path)
+                tmp_path = None  # published; do not delete in except
+            except Exception:
+                try:
+                    if tmp_path is not None and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError:
+                    pass
+                if not os.path.exists(local_path):
+                    raise
+                # Another worker published first; proceed to read their complete file
 
-    # Pre-read validation
+        elif access_mode == "scoped_file_url":
+            scoped_url = dataset_access.get("scoped_url")
+            if not scoped_url:
+                raise RuntimeError(
+                    "dataset_access.scoped_url is required for access_mode='scoped_file_url'."
+                )
+            try:
+                from snowflake.snowpark.files import SnowflakeFile
+            except ImportError as exc:
+                raise RuntimeError(
+                    "snowflake.snowpark.files.SnowflakeFile is required for "
+                    "session-free scoped_file_url worker dataset access."
+                ) from exc
+            tmp_path = os.path.join(local_cache_dir, f".{dataset_key}.{os.getpid()}.tmp")
+            try:
+                with open(tmp_path, "wb") as dst:
+                    with SnowflakeFile.open(scoped_url, "rb", require_scoped_url=True) as src:
+                        shutil.copyfileobj(src, dst)
+                os.replace(tmp_path, local_path)
+                tmp_path = None  # published; do not delete in except
+            except Exception:
+                try:
+                    if tmp_path is not None and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                except OSError:
+                    pass
+                if not os.path.exists(local_path):
+                    raise
+                # Another worker published first; proceed to read their complete file
+
+        else:
+            raise RuntimeError(
+                f"Unsupported synthetic regression worker dataset access mode {access_mode!r}. "
+                "Supported modes: 'driver_presigned_url', 'scoped_file_url'."
+            )
+
+    # Pre-read validation (shared by all modes)
     if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
         raise RuntimeError(
             f"Dataset cache file missing or empty for {stage_path!r}: {local_path}"

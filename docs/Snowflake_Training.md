@@ -2395,28 +2395,54 @@ Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CL
 -- PUT file://scripts/autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/autogluon_worker_access_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- PUT file://scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- PUT file://src/evaluate_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 -- Verify:
--- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|autogluon_ray|capacity_probe|ray_capacity_probe|autogluon_worker_access_probe)[.]py';
+-- LIST @MODEL_STAGE/scripts/ PATTERN='.*(run_synthetic_regression_evaluation|evaluate_synthetic_regression|autogluon_ray|capacity_probe|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
 
 -- Step 0a: Runtime probes
 CALL run_synthetic_regression_runtime_probes('2.5.0-py311', '2.5.0-py311', '2.5.0-py311');
 
 -- Step 1: Capacity probes (verify node envelope before evaluation)
+-- Ray readiness knobs:
+--   capacity probe default: SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS=300, POLL_SECONDS=10
+--   evaluation default:     SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS=600, POLL_SECONDS=10
+-- Use the extended overloads below to override these per run.
 CALL run_synthetic_regression_combined_baseline_capacity_probe(
   '2.5.0-py311', '2.5.0-py311', 6
 );
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
 
 CALL run_synthetic_regression_combined_autogluon_capacity_probe(
-  '2.5.0-py311', '2.5.0-py311', 6, 4, 6
+  '2.5.0-py311', '2.5.0-py311',
+  6,     -- AUTOGLUON_CLUSTER_SHARDS
+  4,     -- AUTOGLUON_WORKERS_PER_SHARD
+  6,     -- AUTOGLUON_CONCURRENT_CLUSTERS
+  300,   -- RAY_READY_TIMEOUT_SECONDS
+  10     -- RAY_READY_POLL_SECONDS
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 
 CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
   '2.5.0-py311', '2.5.0-py311', 6, 4, 6
 );
+ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
+
+-- Optional: AutoGluon import timing probe — measures dependency bootstrap latency.
+-- Time from MLJob submission to python_entrypoint_started approximates scheduling +
+-- image startup + pip install (pip mode) or just scheduling + image startup (no-pip).
+-- autogluon_import_complete.import_seconds measures import overhead only.
+-- Compare pip vs no-pip waves to estimate bootstrap overhead under concurrency.
+--
+-- Single pip-mode probe (default):
+CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311');
+--
+-- 8 concurrent pip-mode probes (simulates full evaluation wave concurrency):
+-- CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', TRUE, 8);
+--
+-- 8 concurrent no-pip probes (scheduling + image startup baseline, no AutoGluon install):
+-- CALL run_synthetic_regression_autogluon_import_timing_probe('2.5.0-py311', FALSE, 8);
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 
 -- Step 2: Combined prep (index composition)
@@ -2444,7 +2470,9 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(
   1,     -- AUTOGLUON_TASK_CPUS
   6,     -- AUTOGLUON_CONCURRENT_CLUSTERS
   300,   -- AUTOGLUON_TIME_LIMIT_SECONDS
-  'best_quality'
+  'best_quality',
+  600,   -- RAY_READY_TIMEOUT_SECONDS
+  10     -- RAY_READY_POLL_SECONDS
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 

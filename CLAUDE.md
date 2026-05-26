@@ -825,6 +825,13 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 - Ray-mode capacity probe, worker-access probe, and distributed AutoGluon evaluation jobs all
   carry `SYNREG_AG_RAY_PIP` + `SYNREG_PYPI_EAI`; single-node AutoGluon jobs carry
   `SYNREG_AG_PIP` only and no Ray env vars.
+- Ray readiness is a runtime knob, not a hardcoded startup assumption. Capacity probe
+  overloads can pass `RAY_READY_TIMEOUT_SECONDS` and `RAY_READY_POLL_SECONDS`
+  after the topology arguments; default is 300s / 10s. Distributed AutoGluon
+  evaluation can pass the same two values after `AUTOGLUON_PRESETS`; default is
+  600s / 10s. The MLJob entrypoints receive them as
+  `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` and
+  `SYNREG_RAY_CLUSTER_READY_POLL_SECONDS`.
 
 ### HPO guardrails
 
@@ -874,7 +881,8 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_worker_access_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe)[.]py';
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
   ```
   Use the targeted block above when only the evaluator/helper refactor changed. Use
   the broad `src/*.py` plus `scripts/*.py` PUT block when procedure dependencies or

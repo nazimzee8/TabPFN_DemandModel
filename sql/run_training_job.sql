@@ -1433,6 +1433,10 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
 --   AUTOGLUON_CONCURRENT_CLUSTERS: must equal AUTOGLUON_CLUSTER_SHARDS; lower values fail fast
 --   AUTOGLUON_TIME_LIMIT_SECONDS:  per-fit time limit in seconds      (default 300)
 --   AUTOGLUON_PRESETS:             AutoGluon presets string           (default best_quality)
+--   RAY_READY_TIMEOUT_SECONDS:     optional Ray readiness timeout     (default 600)
+--   RAY_READY_POLL_SECONDS:        optional Ray readiness poll period  (default 10)
+--   These map to MLJob env vars SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS and
+--   SYNREG_RAY_CLUSTER_READY_POLL_SECONDS.
 --   entrypoint:                    always autogluon_ray.py (derived internally)
 --   total containers = AUTOGLUON_CLUSTER_SHARDS x AUTOGLUON_WORKERS_PER_SHARD
 --   aggregation expects N = AUTOGLUON_CLUSTER_SHARDS output shard files
@@ -1454,6 +1458,25 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
   AUTOGLUON_TIME_LIMIT_SECONDS INTEGER,
   AUTOGLUON_PRESETS STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_evaluation';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_TASK_CPUS INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  AUTOGLUON_TIME_LIMIT_SECONDS INTEGER,
+  AUTOGLUON_PRESETS STRING,
+  RAY_READY_TIMEOUT_SECONDS INTEGER,
+  RAY_READY_POLL_SECONDS INTEGER
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -1555,6 +1578,11 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_capacity_
 --   target_instances=AUTOGLUON_WORKERS_PER_SHARD. Verifies the pool can satisfy
 --   AUTOGLUON_CLUSTER_SHARDS * AUTOGLUON_WORKERS_PER_SHARD nodes simultaneously.
 --   AUTOGLUON_CONCURRENT_CLUSTERS must equal AUTOGLUON_CLUSTER_SHARDS.
+--   RAY_READY_TIMEOUT_SECONDS defaults to 300 seconds; RAY_READY_POLL_SECONDS
+--   defaults to 10 seconds. Use the extended overload when diagnosing cold-start
+--   or startup-convergence behavior. These map to MLJob env vars
+--   SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS and
+--   SYNREG_RAY_CLUSTER_READY_POLL_SECONDS.
 --
 -- Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):
 --   Submits AUTOGLUON_CONCURRENT_CLUSTERS single-node capacity_probe.py jobs
@@ -1579,6 +1607,22 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity_probe(
+  BENCH_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  RAY_READY_TIMEOUT_SECONDS INTEGER,
+  RAY_READY_POLL_SECONDS INTEGER
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -1629,6 +1673,48 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_worker_a
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_worker_access_probe';
 
+-- AutoGluon import timing probe — measures dependency bootstrap latency.
+--
+-- Stage the probe script before calling this procedure:
+--   PUT file:///path/to/scripts/autogluon_import_timing_probe.py
+--     @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--
+-- With-pip mode (WITH_PIP=TRUE, default):
+--   pip_requirements=autogluon.tabular==1.3.0 is installed at container startup.
+--   Time from MLJob submission to the python_entrypoint_started JSON log line
+--   approximates Snowflake scheduling + image startup + AutoGluon pip bootstrap.
+--   autogluon_import_complete.import_seconds measures pure import overhead after
+--   the environment is ready.
+--
+-- Preinstalled mode (WITH_PIP=FALSE):
+--   No pip install at startup; expected to fail import unless AutoGluon is already
+--   available in the runtime image. Provides a no-pip scheduling + startup baseline.
+--   Compare pip vs no-pip probe waves to estimate bootstrap overhead under concurrency.
+--
+-- PROBE_COUNT: number of independent single-instance MLJobs to submit concurrently.
+--   Use PROBE_COUNT=8 to simulate the concurrency of a full AutoGluon evaluation wave.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_import_timing_probe_default';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  WITH_PIP BOOLEAN,
+  PROBE_COUNT INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_import_timing_probe';
+
 -- Combined all-in-one evaluation with explicit baseline shard count.
 -- BASELINE_SHARDS: number of baseline shard files to write (default 6); must equal BASELINE_CONCURRENT_NODES.
 -- BASELINE_CONCURRENT_NODES: required single-wave CPU nodes; must equal BASELINE_SHARDS.
@@ -1673,7 +1759,8 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
 -- Capacity probe (verifies 24 CPU_X64_M nodes across 6 Ray clusters):
 -- CALL run_synthetic_regression_combined_autogluon_capacity_probe(
 --   '2.5.0-py311', '2.5.0-py311',
---   6, 4, 6
+--   6, 4, 6,
+--   300, 10  -- RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS
 -- );
 -- Worker-access probe (verifies compact item dict transfer and scoped_file_url access):
 -- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
@@ -1683,7 +1770,8 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
 -- Evaluation (6 cluster shards x 4 workers each; aggregation expects N=6):
 -- CALL run_synthetic_regression_combined_autogluon_evaluation(
 --   '2.5.0-py311', '2.5.0-py311',
---   6, 4, 1, 6, 300, 'best_quality'
+--   6, 4, 1, 6, 300, 'best_quality',
+--   600, 10  -- RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS
 -- );
 
 -- B. Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):

@@ -132,6 +132,13 @@ class TestSplitPhaseStoredProcedures:
             "run_synthetic_regression_combined_autogluon_worker_access_probe"
         ) in sql
 
+    def test_ray_readiness_overloads_exist(self):
+        sql = self._sql()
+        assert "RAY_READY_TIMEOUT_SECONDS INTEGER" in sql
+        assert "RAY_READY_POLL_SECONDS INTEGER" in sql
+        assert "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS" in sql
+        assert "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS" in sql
+
     def test_combined_autogluon_runbook_orders_capacity_worker_access_then_eval(self):
         sql = self._sql()
         capacity_pos = sql.index("CALL run_synthetic_regression_combined_autogluon_capacity_probe")
@@ -276,3 +283,32 @@ class TestSQLEnvVarRenames:
         assert "pretrain.pt" not in hpo_section, (
             "HPO comment block must not claim pretrain.pt (not gate-specific) is required"
         )
+
+
+class TestAutogluonImportTimingProbeSQLDDL:
+    """Tests that run_training_job.sql contains the import timing probe DDL."""
+
+    def _sql(self) -> str:
+        return (ROOT / "sql" / "run_training_job.sql").read_text()
+
+    def test_default_handler_exists(self):
+        assert (
+            "run_synthetic_regression_evaluation."
+            "run_synthetic_regression_autogluon_import_timing_probe_default"
+        ) in self._sql()
+
+    def test_full_handler_exists(self):
+        assert (
+            "run_synthetic_regression_evaluation."
+            "run_synthetic_regression_autogluon_import_timing_probe"
+        ) in self._sql()
+
+    def test_with_pip_boolean_param_exists(self):
+        assert "WITH_PIP BOOLEAN" in self._sql()
+
+    def test_probe_count_integer_param_exists(self):
+        assert "PROBE_COUNT INTEGER" in self._sql()
+
+    def test_staging_instructions_include_probe_script(self):
+        sql = self._sql()
+        assert "autogluon_import_timing_probe.py" in sql

@@ -63,6 +63,15 @@ def _env_int(name: str, default: int) -> int:
         ) from exc
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    value = _env_int(name, default)
+    if value <= 0:
+        raise RuntimeError(
+            f"[ag_ray] Environment variable {name!r} must be positive; got {value!r}."
+        )
+    return value
+
+
 SUITE_ID = _require_env(
     "SYNTHETIC_REGRESSION_SUITE_ID",
     "Set to 'linear_all_v1' for combined suite.",
@@ -84,9 +93,17 @@ MAX_DATASET_BYTES = _env_int("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", 2147483648
 LOCAL_CACHE = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
 WORKER_DATA_ACCESS_MODE = os.getenv(
     "SYNREG_WORKER_DATA_ACCESS_MODE",
-    "scoped_file_url",
+    "driver_presigned_url",
 )
 MAX_WORK_ITEM_BYTES = _env_int("SYNREG_MAX_WORK_ITEM_BYTES", 8192)
+RAY_READY_TIMEOUT_SECONDS = _env_positive_int(
+    "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS",
+    600,
+)
+RAY_READY_POLL_SECONDS = _env_positive_int(
+    "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
+    10,
+)
 
 print(
     f"[ag_ray] resolved env: suite_id={SUITE_ID} shard={SHARD_INDEX}/{NUM_SHARDS} "
@@ -94,7 +111,8 @@ print(
     f"task_cpus={TASK_CPUS} time_limit={TIME_LIMIT} presets={PRESETS!r} "
     f"distributed_mode={DISTRIBUTED_MODE!r} results_stage={RESULTS_STAGE!r} "
     f"worker_data_access_mode={WORKER_DATA_ACCESS_MODE!r} "
-    f"max_work_item_bytes={MAX_WORK_ITEM_BYTES}",
+    f"max_work_item_bytes={MAX_WORK_ITEM_BYTES} "
+    f"ray_ready_timeout_seconds={RAY_READY_TIMEOUT_SECONDS}",
     flush=True,
 )
 
@@ -178,6 +196,43 @@ except ImportError as exc:
         "Install it or use evaluate_synthetic_regression.py for single-node mode."
     ) from exc
 
+
+def _wait_for_ray_capacity(*, expected_nodes: int, expected_cpus_min: int) -> tuple[int, int, dict]:
+    deadline = time.monotonic() + RAY_READY_TIMEOUT_SECONDS
+    last_state: tuple[int, int] | None = None
+
+    while True:
+        cluster_resources = ray.cluster_resources()
+        available_cpus = int(cluster_resources.get("CPU", 0))
+        live_nodes = [node for node in ray.nodes() if node.get("Alive")]
+        state = (len(live_nodes), available_cpus)
+        if state != last_state:
+            print(
+                "[ag_ray] ray readiness: "
+                f"live_nodes={len(live_nodes)}/{expected_nodes} "
+                f"available_cpus={available_cpus}/{expected_cpus_min} "
+                f"cluster_resources={dict(cluster_resources)}",
+                flush=True,
+            )
+            last_state = state
+
+        if len(live_nodes) >= expected_nodes and available_cpus >= expected_cpus_min:
+            return len(live_nodes), available_cpus, dict(cluster_resources)
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "[ag_ray] Ray cluster did not reach requested capacity before readiness timeout: "
+                f"live_nodes={len(live_nodes)}/{expected_nodes}, "
+                f"available_cpus={available_cpus}/{expected_cpus_min}, "
+                f"timeout_seconds={RAY_READY_TIMEOUT_SECONDS}, "
+                f"cluster_resources={dict(cluster_resources)}. "
+                "Snowflake may still be starting target_instances, or account/compute-pool "
+                "concurrency may be below the requested Ray capacity envelope."
+            )
+
+        time.sleep(RAY_READY_POLL_SECONDS)
+
+
 print("[ag_ray] ray init starting", flush=True)
 try:
     ray.init(
@@ -186,26 +241,16 @@ try:
         log_to_driver=True,
         include_dashboard=False,
     )
-    cluster_resources = ray.cluster_resources()
-    available_cpus = int(cluster_resources.get("CPU", 0))
-    live_nodes = [node for node in ray.nodes() if node.get("Alive")]
+    expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD)
+    live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
+        expected_nodes=WORKERS_PER_SHARD,
+        expected_cpus_min=expected_cpus_min,
+    )
     print(
-        f"[ag_ray] ray init complete  cluster_cpus={available_cpus} "
-        f"live_nodes={len(live_nodes)} cluster_resources={dict(cluster_resources)}",
+        f"[ag_ray] ray ready  cluster_cpus={available_cpus} "
+        f"live_nodes={live_node_count} cluster_resources={dict(cluster_resources)}",
         flush=True,
     )
-    if len(live_nodes) < WORKERS_PER_SHARD:
-        raise RuntimeError(
-            f"[ag_ray] Ray cluster has only {len(live_nodes)} live nodes but "
-            f"SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD}. "
-            "Snowflake did not attach the requested target_instances to this MLJob."
-        )
-    if available_cpus < TASK_CPUS:
-        raise RuntimeError(
-            f"[ag_ray] Ray cluster has only {available_cpus} CPUs but "
-            f"AUTOGLUON_TASK_CPUS={TASK_CPUS} per task. "
-            "The Snowflake MLJob multi-instance environment did not provide enough CPU resources."
-        )
 except Exception as exc:
     raise RuntimeError(
         "AutoGluon distributed work-item mode requires a Ray-backed Snowflake MLJob cluster. "
@@ -216,7 +261,7 @@ except Exception as exc:
 
 print(f"[ag_ray] driver owns shard {SHARD_INDEX}/{NUM_SHARDS}", flush=True)
 print(
-    "[ag_ray] dataset loading mode=scoped_file_url "
+    f"[ag_ray] dataset loading mode={WORKER_DATA_ACCESS_MODE} "
     "driver_metadata_only=true no_driver_ray_put=true",
     flush=True,
 )
@@ -237,14 +282,14 @@ print(f"[ag_ray] loading index suite_id={SUITE_ID!r} …", flush=True)
 all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
 all_work_items = expand_synreg_work_items(all_rows_index, train_size_grid=None)
 assigned_work_items = assign_synthetic_regression_shard(all_work_items, SHARD_INDEX, NUM_SHARDS)
-scoped_url_cache: dict[str, str] = {}
+dataset_url_cache: dict[str, str] = {}
 my_work_items = [
     build_compact_synreg_work_item(
         row,
         session=session,
         access_mode=WORKER_DATA_ACCESS_MODE,
         max_item_bytes=MAX_WORK_ITEM_BYTES,
-        scoped_url_cache=scoped_url_cache,
+        dataset_url_cache=dataset_url_cache,
     )
     for row in assigned_work_items
 ]
@@ -254,7 +299,7 @@ print(
     f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS}: "
     f"{len(all_rows_index)} index rows → {len(all_work_items)} work items → "
     f"{len(my_work_items)} compact items assigned to this shard "
-    f"unique_dataset_access_urls={len(scoped_url_cache)} "
+    f"unique_dataset_access_urls={len(dataset_url_cache)} "
     f"serialized_total_bytes={items_total_bytes} "
     f"serialized_max_item_bytes={items_max_bytes}",
     flush=True,

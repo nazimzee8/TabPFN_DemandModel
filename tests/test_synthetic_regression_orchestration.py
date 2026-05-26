@@ -566,6 +566,12 @@ class TestCapacityProbePhases:
             assert job.env_vars["AUTOGLUON_TASK_CPUS"] == str(
                 orch.SYNREG_AUTOGLUON_TASK_CPUS_DEFAULT
             )
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS"] == str(
+                orch.SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS_DEFAULT
+            )
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_POLL_SECONDS"] == str(
+                orch.SYNREG_RAY_CAPACITY_READY_POLL_SECONDS_DEFAULT
+            )
 
     def test_combined_autogluon_capacity_probe_rejects_lower_clusters(self, fake_session):
         with pytest.raises(ValueError) as exc:
@@ -579,6 +585,28 @@ class TestCapacityProbePhases:
         assert "run_synthetic_regression_combined_autogluon_capacity_probe" in msg
         assert "AUTOGLUON_CONCURRENT_CLUSTERS=3" in msg
         assert "AUTOGLUON_CLUSTER_SHARDS=6" in msg
+
+    def test_combined_autogluon_capacity_probe_accepts_runtime_ray_readiness(
+        self, collector, fake_session
+    ):
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_autogluon_capacity_probe(
+                fake_session,
+                autogluon_cluster_shards=2,
+                autogluon_workers_per_shard=4,
+                autogluon_concurrent_clusters=2,
+                ray_ready_timeout_seconds=180,
+                ray_ready_poll_seconds=15,
+            )
+
+        ag_probes = [
+            j for j in collector.submitted
+            if j.label.startswith("combined_ag_cap_probe_")
+        ]
+        assert ag_probes
+        for job in ag_probes:
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS"] == "180"
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_POLL_SECONDS"] == "15"
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +783,7 @@ class TestMultiInstanceGuard:
             assert job.pip_requirements == orch.SYNREG_AG_RAY_PIP
             assert job.external_access_integrations == orch.SYNREG_PYPI_EAI
             assert job.env_vars["SYNREG_WORKER_ACCESS_PROBE_USE_RAY"] == "true"
-            assert job.env_vars["SYNREG_WORKER_DATA_ACCESS_MODE"] == "scoped_file_url"
+            assert job.env_vars["SYNREG_WORKER_DATA_ACCESS_MODE"] == "driver_presigned_url"
             assert job.env_vars["SYNREG_MAX_WORK_ITEM_BYTES"] == "8192"
             assert job.env_vars["EXPECTED_RAY_NODES"] == str(
                 orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
@@ -764,6 +792,12 @@ class TestMultiInstanceGuard:
                 orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
             )
             assert job.env_vars["SYNREG_AUTOGLUON_DISTRIBUTED_MODE"] == "ray_work_items"
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS"] == str(
+                orch.SYNREG_RAY_CAPACITY_READY_TIMEOUT_SECONDS_DEFAULT
+            )
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_POLL_SECONDS"] == str(
+                orch.SYNREG_RAY_CAPACITY_READY_POLL_SECONDS_DEFAULT
+            )
 
     def test_combined_autogluon_worker_access_probe_waits_once(
         self, collector, fake_session
@@ -1283,7 +1317,7 @@ class TestCombinedSplitPhase:
             assert job.env_vars["SYNREG_AUTOGLUON_WORKERS_PER_SHARD"] == str(
                 orch.SYNREG_AUTOGLUON_WORKERS_PER_SHARD_DEFAULT
             )
-            assert job.env_vars["SYNREG_WORKER_DATA_ACCESS_MODE"] == "scoped_file_url"
+            assert job.env_vars["SYNREG_WORKER_DATA_ACCESS_MODE"] == "driver_presigned_url"
             assert job.env_vars["SYNREG_MAX_WORK_ITEM_BYTES"] == "8192"
             assert job.env_vars["SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS"] == str(
                 orch.SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT
@@ -1303,6 +1337,37 @@ class TestCombinedSplitPhase:
             assert job.env_vars["BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES"] == str(
                 orch.SYNREG_AUTOGLUON_MAX_DATASET_BYTES_DEFAULT
             )
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS"] == str(
+                orch.SYNREG_RAY_EVALUATION_READY_TIMEOUT_SECONDS_DEFAULT
+            )
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_POLL_SECONDS"] == str(
+                orch.SYNREG_RAY_EVALUATION_READY_POLL_SECONDS_DEFAULT
+            )
+
+    def test_combined_autogluon_evaluation_accepts_runtime_ray_readiness(
+        self, collector, fake_session
+    ):
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_combined_autogluon_evaluation(
+                fake_session,
+                autogluon_cluster_shards=2,
+                autogluon_workers_per_shard=4,
+                autogluon_task_cpus=1,
+                autogluon_concurrent_clusters=2,
+                autogluon_time_limit=300,
+                autogluon_presets="best_quality",
+                ray_ready_timeout_seconds=900,
+                ray_ready_poll_seconds=20,
+            )
+
+        ag_jobs = [
+            j for j in collector.submitted
+            if j.env_vars.get("SYNTHETIC_REGRESSION_MODE") == "autogluon"
+        ]
+        assert ag_jobs
+        for job in ag_jobs:
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS"] == "900"
+            assert job.env_vars["SYNREG_RAY_CLUSTER_READY_POLL_SECONDS"] == "20"
 
     def test_combined_autogluon_default_single_wave_waits_once(self, collector, fake_session):
         batch_sizes = []
@@ -1437,7 +1502,7 @@ class TestCombinedSplitPhase:
         assert "load_synthetic_regression_index" in text
         assert "load_prepared_synthetic_dataset_from_access(item_meta" in text
         assert "SYNREG_WORKER_DATA_ACCESS_MODE" in text
-        assert "scoped_file_url" in text
+        assert "driver_presigned_url" in text
         assert "Worker failed to resolve dataset access" in text
 
     def test_worker_dataset_access_helper_is_session_free(self):
@@ -1449,17 +1514,19 @@ class TestCombinedSplitPhase:
         assert "getOrCreate" not in fn_body
         assert "SnowflakeFile.open" in fn_body
         assert "scoped_url" in fn_body
+        assert "presigned_url" in fn_body
+        assert "urlopen" in fn_body
 
     def test_compact_work_item_helper_drops_unexpected_payload_fields(self):
         from evaluate_synthetic_regression import build_compact_synreg_work_item
 
         class _Row:
             def as_dict(self):
-                return {"SCOPED_URL": "https://example.snowflakecomputing.com/scoped/file"}
+                return {"PRESIGNED_URL": "https://example.snowflakecomputing.com/presigned/file"}
 
         class _Session:
             def sql(self, query):
-                assert "BUILD_SCOPED_FILE_URL(@EVALUATION_DATASET_STAGE" in query
+                assert "GET_PRESIGNED_URL(@EVALUATION_DATASET_STAGE" in query
                 return self
 
             def collect(self):
@@ -1490,16 +1557,16 @@ class TestCombinedSplitPhase:
         item = build_compact_synreg_work_item(row, session=_Session(), max_item_bytes=8192)
         assert "X" not in item
         assert "unexpected_payload" not in item
-        assert item["dataset_access"]["mode"] == "scoped_file_url"
+        assert item["dataset_access"]["mode"] == "driver_presigned_url"
         assert item["dataset_access"]["stage_path"] == row["stage_path"]
-        assert item["dataset_access"]["scoped_url"].startswith("https://example.")
+        assert item["dataset_access"]["presigned_url"].startswith("https://example.")
 
     def test_compact_work_item_helper_enforces_size_guard(self):
         from evaluate_synthetic_regression import build_compact_synreg_work_item
 
         class _Row:
             def as_dict(self):
-                return {"SCOPED_URL": "https://example.snowflakecomputing.com/" + ("u" * 200)}
+                return {"PRESIGNED_URL": "https://example.snowflakecomputing.com/" + ("u" * 200)}
 
         class _Session:
             def sql(self, query):
@@ -2213,3 +2280,87 @@ class TestCombinedAutogluonPlanValidation:
             )
         msg = str(exc.value)
         assert "non-negative" in msg.lower() or "AUTOGLUON_CLUSTER_SHARDS" in msg
+
+
+# ---------------------------------------------------------------------------
+# AutoGluon import timing probe tests
+# ---------------------------------------------------------------------------
+
+class TestAutogluonImportTimingProbe:
+    """Tests for run_synthetic_regression_autogluon_import_timing_probe."""
+
+    def test_default_probe_submits_one_pip_job(self, collector, fake_session):
+        """Default (single pip-mode) probe must submit exactly one job."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_autogluon_import_timing_probe_default(
+                fake_session, ag_rt="2.5.0-py311"
+            )
+
+        assert len(collector.submitted) == 1
+        job = collector.submitted[0]
+        assert job.entrypoint == "autogluon_import_timing_probe.py"
+        assert job.target_instances == 1
+        assert job.compute_pool == orch.AUTOGLUON_CPU_POOL
+        assert job.runtime_environment == "2.5.0-py311"
+        assert job.pip_requirements == orch.SYNREG_AG_PIP
+        assert job.external_access_integrations == orch.SYNREG_PYPI_EAI
+        assert job.env_vars["SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE"] == "pip"
+        assert "EVAL_RUNTIME_ENVIRONMENT" in job.env_vars
+        assert job.env_vars["EVAL_RUNTIME_ENVIRONMENT"] == "2.5.0-py311"
+
+    def test_pip_probe_count_8_submits_8_jobs(self, collector, fake_session):
+        """with_pip=True, probe_count=8 must submit exactly 8 independent jobs."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_autogluon_import_timing_probe(
+                fake_session, ag_rt="2.5.0-py311", with_pip=True, probe_count=8
+            )
+
+        assert len(collector.submitted) == 8
+        for job in collector.submitted:
+            assert job.entrypoint == "autogluon_import_timing_probe.py"
+            assert job.target_instances == 1
+            assert job.compute_pool == orch.AUTOGLUON_CPU_POOL
+            assert job.runtime_environment == "2.5.0-py311"
+            assert job.pip_requirements == orch.SYNREG_AG_PIP
+            assert job.external_access_integrations == orch.SYNREG_PYPI_EAI
+            assert job.env_vars["SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE"] == "pip"
+
+    def test_no_pip_probe_uses_no_requirements(self, collector, fake_session):
+        """with_pip=False must submit jobs with no pip requirements and no EAI."""
+        with _patch_submit(collector):
+            orch.run_synthetic_regression_autogluon_import_timing_probe(
+                fake_session, ag_rt="2.5.0-py311", with_pip=False, probe_count=4
+            )
+
+        assert len(collector.submitted) == 4
+        for job in collector.submitted:
+            assert job.entrypoint == "autogluon_import_timing_probe.py"
+            assert job.target_instances == 1
+            assert job.compute_pool == orch.AUTOGLUON_CPU_POOL
+            assert job.pip_requirements is None
+            assert job.external_access_integrations is None
+            assert job.env_vars["SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE"] == "preinstalled"
+
+    def test_invalid_probe_count_zero_raises(self, fake_session):
+        """probe_count=0 must raise ValueError before any submission."""
+        with pytest.raises(ValueError, match="probe_count"):
+            orch.run_synthetic_regression_autogluon_import_timing_probe(
+                fake_session, probe_count=0
+            )
+
+    def test_probe_script_does_not_call_ray_init(self):
+        """autogluon_import_timing_probe.py must not call ray.init(...)."""
+        text = (ROOT / "scripts" / "autogluon_import_timing_probe.py").read_text()
+        # Check for the invocation pattern (with opening paren), not the word in docstrings.
+        assert "ray.init(" not in text
+
+    def test_probe_script_does_not_import_snowflake_snowpark(self):
+        """autogluon_import_timing_probe.py must not import snowflake.snowpark."""
+        text = (ROOT / "scripts" / "autogluon_import_timing_probe.py").read_text()
+        assert "snowflake.snowpark" not in text
+        assert "snowflake.ml" not in text
+
+    def test_probe_script_does_not_query_index(self):
+        """autogluon_import_timing_probe.py must not reference SYNTHETIC_REGRESSION_DATASET_INDEX."""
+        text = (ROOT / "scripts" / "autogluon_import_timing_probe.py").read_text()
+        assert "SYNTHETIC_REGRESSION_DATASET_INDEX" not in text
