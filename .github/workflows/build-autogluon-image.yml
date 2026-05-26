@@ -1,0 +1,66 @@
+name: Build and Push AutoGluon Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker/autogluon/**"
+      - "scripts/**"
+      - "src/**"
+      - ".github/workflows/build-autogluon-image.yml"
+  workflow_dispatch:
+
+env:
+  SNOWFLAKE_REGISTRY_HOST: tiyovqw-tmb47818.registry.snowflakecomputing.com
+  SNOWFLAKE_IMAGE_REPOSITORY: tiyovqw-tmb47818.registry.snowflakecomputing.com/tabpfn_db/tabpfn_schema/model_image_repository
+  IMAGE_NAME: tabpfn-autogluon-ray
+  IMAGE_VERSION: 1.0.0
+
+jobs:
+  build-and-push:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          echo "version_tag=${SNOWFLAKE_IMAGE_REPOSITORY}/${IMAGE_NAME}:${IMAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${SNOWFLAKE_IMAGE_REPOSITORY}/${IMAGE_NAME}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/autogluon/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: |
+            ${{ steps.tags.outputs.version_tag }}
+            ${{ steps.tags.outputs.sha_tag }}
+
+      - name: Smoke test image imports
+        run: |
+          docker run --rm "${{ steps.tags.outputs.version_tag }}" \
+            -c "import ray, autogluon.tabular, snowflake.snowpark, pandas, numpy, pyarrow; print('ok')"
+
+      - name: Log in to Snowflake image registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SNOWFLAKE_REGISTRY_HOST }}
+          username: ${{ secrets.SNOWFLAKE_REGISTRY_USERNAME }}
+          password: ${{ secrets.SNOWFLAKE_REGISTRY_PASSWORD }}
+
+      - name: Push image tags
+        run: |
+          docker push "${{ steps.tags.outputs.version_tag }}"
+          docker push "${{ steps.tags.outputs.sha_tag }}"
