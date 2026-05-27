@@ -147,6 +147,11 @@ Required when SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job.
 SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT = int(
     os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT", "6379")
 )
+SPCS_RAY_NODE_MANAGER_PORT = int(os.getenv("SYNREG_SPCS_RAY_NODE_MANAGER_PORT", "6380"))
+SPCS_RAY_OBJECT_MANAGER_PORT = int(os.getenv("SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT", "6381"))
+SPCS_RAY_RUNTIME_ENV_AGENT_PORT = int(os.getenv("SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT", "6382"))
+SPCS_RAY_MIN_WORKER_PORT = int(os.getenv("SYNREG_SPCS_RAY_MIN_WORKER_PORT", "10002"))
+SPCS_RAY_MAX_WORKER_PORT = int(os.getenv("SYNREG_SPCS_RAY_MAX_WORKER_PORT", "10010"))
 SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS = int(
     os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", "600")
 )
@@ -166,6 +171,48 @@ SPCS_WORKER_CAPACITY_PROBE_RESOURCES = "worker_capacity_probe"
 # Workers and coordinators each cap Ray's object store to avoid OOM on fixed-memory nodes.
 _SYNREG_COORDINATOR_OBJ_STORE_ENV = "SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES"
 _SYNREG_WORKER_OBJ_STORE_ENV = "SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES"
+
+
+def _spcs_ray_port_env_vars() -> dict:
+    """Env vars for deterministic Ray port binding — passed to all coordinator/worker containers."""
+    return {
+        "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT),
+        "SYNREG_SPCS_RAY_NODE_MANAGER_PORT": str(SPCS_RAY_NODE_MANAGER_PORT),
+        "SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT": str(SPCS_RAY_OBJECT_MANAGER_PORT),
+        "SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT": str(SPCS_RAY_RUNTIME_ENV_AGENT_PORT),
+        "SYNREG_SPCS_RAY_MIN_WORKER_PORT": str(SPCS_RAY_MIN_WORKER_PORT),
+        "SYNREG_SPCS_RAY_MAX_WORKER_PORT": str(SPCS_RAY_MAX_WORKER_PORT),
+    }
+
+
+def _spcs_ray_coordinator_endpoints(head_port: int) -> list:
+    """SPCS endpoint list for a coordinator container — all Ray ports the head binds."""
+    return [
+        {"name": "ray-head", "port": head_port, "protocol": "TCP"},
+        {"name": "ray-node-manager", "port": SPCS_RAY_NODE_MANAGER_PORT, "protocol": "TCP"},
+        {"name": "ray-object-manager", "port": SPCS_RAY_OBJECT_MANAGER_PORT, "protocol": "TCP"},
+        {"name": "ray-runtime-env-agent", "port": SPCS_RAY_RUNTIME_ENV_AGENT_PORT, "protocol": "TCP"},
+        {
+            "name": "ray-worker-ports",
+            "portRange": f"{SPCS_RAY_MIN_WORKER_PORT}-{SPCS_RAY_MAX_WORKER_PORT}",
+            "protocol": "TCP",
+        },
+    ]
+
+
+def _spcs_ray_worker_endpoints() -> list:
+    """SPCS endpoint list for a worker container — all Ray ports the worker binds (no ray-head)."""
+    return [
+        {"name": "ray-node-manager", "port": SPCS_RAY_NODE_MANAGER_PORT, "protocol": "TCP"},
+        {"name": "ray-object-manager", "port": SPCS_RAY_OBJECT_MANAGER_PORT, "protocol": "TCP"},
+        {"name": "ray-runtime-env-agent", "port": SPCS_RAY_RUNTIME_ENV_AGENT_PORT, "protocol": "TCP"},
+        {
+            "name": "ray-worker-ports",
+            "portRange": f"{SPCS_RAY_MIN_WORKER_PORT}-{SPCS_RAY_MAX_WORKER_PORT}",
+            "protocol": "TCP",
+        },
+    ]
+
 
 _VALID_AUTOGLUON_EXECUTION_BACKENDS = {"mljob", "spcs_job"}
 
@@ -1114,7 +1161,6 @@ def _build_spcs_job_spec(
     memory_request: str | None = None,
     memory_limit: str | None = None,
     resource_role: str = SPCS_RAY_WORKER_RESOURCES,
-    enable_snowflake_service_token: bool = True,
     endpoints: list[dict] | None = None,
 ) -> str:
     """Build a SPCS job service YAML spec string.
@@ -1127,14 +1173,17 @@ def _build_spcs_job_spec(
         memory:   Backward-compatible memory override that sets request and limit.
         cpu_request/cpu_limit/memory_request/memory_limit: Explicit resource values.
         resource_role: Role-specific defaults used when explicit values are omitted.
-        enable_snowflake_service_token: When True (default), adds
-            ``snowflakeService: {enabled: true}`` so SPCS mounts the OAuth token
-            at ``/snowflake/session/token``. Required for any container that creates
-            a Snowpark session via ``create_snowpark_session()`` / ``spcs_snowpark_session_probe.py``.
         endpoints: Optional list of TCP/HTTP endpoint dicts to expose from the container.
-            Each dict must have ``name`` (str) and ``port`` (int); ``protocol`` defaults to "TCP".
+            Each dict must have ``name`` (str) and either ``port`` (int) or ``portRange`` (str,
+            e.g. ``"10002-10010"``); ``protocol`` defaults to "TCP".
             Example: ``[{"name": "ray-head", "port": 6379, "protocol": "TCP"}]``
+            Range example: ``[{"name": "ray-worker-ports", "portRange": "10002-10010", "protocol": "TCP"}]``
             Required for coordinator containers so workers can reach the Ray head port.
+
+    Note: SPCS job services automatically receive the OAuth token at
+        ``/snowflake/session/token``, ``SNOWFLAKE_ACCOUNT``, and ``SNOWFLAKE_HOST``.
+        No ``snowflakeService`` YAML block is required or supported — Snowflake rejects it
+        as an unknown spec option (error 395018).
 
     Returns:
         YAML spec string suitable for use in EXECUTE JOB SERVICE FROM SPECIFICATION $$.
@@ -1176,15 +1225,13 @@ def _build_spcs_job_spec(
         spec += "  endpoints:\n"
         for ep in endpoints:
             ep_name = ep["name"]
-            ep_port = int(ep["port"])
             ep_proto = ep.get("protocol", "TCP")
             spec += f"    - name: {ep_name}\n"
-            spec += f"      port: {ep_port}\n"
+            if "portRange" in ep:
+                spec += f"      portRange: {ep['portRange']}\n"
+            else:
+                spec += f"      port: {int(ep['port'])}\n"
             spec += f"      protocol: {ep_proto}\n"
-    if enable_snowflake_service_token:
-        # Enables OAuth token injection at /snowflake/session/token.
-        # Required for any container that calls create_snowpark_session() inside SPCS.
-        spec += "  snowflakeService:\n    enabled: true\n"
     return spec
 
 
@@ -3614,7 +3661,6 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                 results_stage=COMBINED_PARTS_PREFIX,
                 extra_env={
                     # Ray head config (consumed by spcs_ray_coordinator.py)
-                    "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(head_port),
                     _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
                     # Cluster identity (Finding 6): autogluon_ray.py verifies after ray.init()
                     "SPCS_RAY_RUN_ID": run_id,
@@ -3636,6 +3682,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                     "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
                     "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
                     "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
+                    **_spcs_ray_port_env_vars(),
                 },
             )
             coord_job = _submit_spcs_synreg(
@@ -3646,8 +3693,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                 image=image,
                 entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
                 resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                # Expose Ray head TCP port so workers in separate SPCS services can connect.
-                endpoints=[{"name": "ray-head", "port": head_port, "protocol": "TCP"}],
+                endpoints=_spcs_ray_coordinator_endpoints(head_port),
             )
             coordinator_jobs.append((coord_label, coord_job))
 
@@ -3658,6 +3704,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                 "AUTOGLUON_TASK_CPUS": str(task_cpus),
                 _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
                 "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+                **_spcs_ray_port_env_vars(),
             }
             for w in range(workers_per_shard):
                 w_label = f"spcs_ray_worker_{run_id}_{shard_index}_{w}"
@@ -3669,6 +3716,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                     image=image,
                     entrypoint_path="/app/scripts/spcs_ray_worker.py",
                     resource_role=SPCS_RAY_WORKER_RESOURCES,
+                    endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((w_label, w_job))
 
@@ -3733,8 +3781,8 @@ def run_synthetic_regression_autogluon_spcs_session_probe(
 
     Submits probe_count SPCS job services each running spcs_snowpark_session_probe.py.
     Validates that:
-    - The SPCS spec's ``snowflakeService.enabled=true`` causes the OAuth token to be
-      injected at ``/snowflake/session/token``.
+    - The SPCS job service receives the OAuth token automatically at ``/snowflake/session/token``
+      (provided by Snowflake for all job services; no ``snowflakeService`` YAML field required).
     - The container can open a Snowpark session with the correct database/schema/role
       context propagated via SNOWFLAKE_DATABASE / SNOWFLAKE_SCHEMA / SNOWFLAKE_ROLE.
 
@@ -3822,8 +3870,10 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
         coordinator_jobs = []
         head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
         dns_suffix = _spcs_dns_domain(session)
-        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "500000000")
-        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "2000000000")
+        # Capacity probe uses reduced object-store to avoid pressure on /dev/shm (64 MiB in SPCS).
+        # Production evaluation keeps its own larger defaults (500 MB / 2 GB).
+        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")
+        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")
 
         for shard_index in range(plan.output_shards):
             coord_label = f"spcs_cap_ray_coord_{run_id}_{shard_index}"
@@ -3833,7 +3883,6 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
             head_address = f"{coord_hostname}:{head_port}"
 
             coord_env = {
-                "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(head_port),
                 _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
                 "SPCS_RAY_RUN_ID": run_id,
                 "SPCS_RAY_SHARD_INDEX": str(shard_index),
@@ -3844,6 +3893,7 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                 "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
                 "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
                 "CAPACITY_PROBE_SLEEP_SECONDS": "10",
+                **_spcs_ray_port_env_vars(),
             }
             coord_job = _submit_spcs_synreg(
                 session=session,
@@ -3853,7 +3903,7 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                 image=image,
                 entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
                 resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                endpoints=[{"name": "ray-head", "port": head_port, "protocol": "TCP"}],
+                endpoints=_spcs_ray_coordinator_endpoints(head_port),
             )
             coordinator_jobs.append((coord_label, coord_job))
 
@@ -3862,6 +3912,7 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                 "AUTOGLUON_TASK_CPUS": "1",
                 _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
                 "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+                **_spcs_ray_port_env_vars(),
             }
             for worker_index in range(plan.workers_per_shard):
                 worker_label = f"spcs_cap_ray_worker_{run_id}_{shard_index}_{worker_index}"
@@ -3873,6 +3924,7 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                     image=image,
                     entrypoint_path="/app/scripts/spcs_ray_worker.py",
                     resource_role=SPCS_RAY_WORKER_RESOURCES,
+                    endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((worker_label, worker_job))
 
@@ -3933,7 +3985,6 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
             head_address = f"{coord_hostname}:{head_port}"
 
             coord_env = {
-                "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT": str(head_port),
                 _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
                 "SPCS_RAY_RUN_ID": run_id,
                 "SPCS_RAY_SHARD_INDEX": str(shard_index),
@@ -3948,6 +3999,7 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
                 "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
                 "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
                 "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(plan.workers_per_shard),
+                **_spcs_ray_port_env_vars(),
             }
             coord_job = _submit_spcs_synreg(
                 session=session,
@@ -3957,7 +4009,7 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
                 image=image,
                 entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
                 resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                endpoints=[{"name": "ray-head", "port": head_port, "protocol": "TCP"}],
+                endpoints=_spcs_ray_coordinator_endpoints(head_port),
             )
             driver_jobs.append((coord_label, coord_job))
 
@@ -3965,6 +4017,7 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
                 "RAY_HEAD_ADDRESS": head_address,
                 _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
                 "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
+                **_spcs_ray_port_env_vars(),
             }
             for worker_index in range(plan.workers_per_shard):
                 worker_label = f"spcs_worker_probe_ray_worker_{run_id}_{shard_index}_{worker_index}"
@@ -3976,6 +4029,7 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
                     image=image,
                     entrypoint_path="/app/scripts/spcs_ray_worker.py",
                     resource_role=SPCS_RAY_WORKER_RESOURCES,
+                    endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((worker_label, worker_job))
         try:

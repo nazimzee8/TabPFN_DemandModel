@@ -94,9 +94,10 @@ export SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job
   Set `SYNREG_WORKER_DATA_ACCESS_MODE=scoped_file_url` to use scoped Snowflake URLs instead.
 - **No `ray.put()` for datasets.** Workers receive only compact metadata dicts (~8 KB each).
   Datasets are loaded inside the worker task from the presigned or scoped URL.
-- **Snowpark session in coordinator:** containers with `snowflakeService.enabled=true` in their
-  SPCS spec receive an OAuth token at `/snowflake/session/token`. The coordinator/driver creates a
-  Snowpark session from this token using `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_HOST`. Workers do not
-  create Snowpark sessions in the default `driver_presigned_url` mode.
+- **Snowpark session in coordinator:** SPCS job services automatically receive the OAuth token
+  at `/snowflake/session/token`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_HOST`. The coordinator/driver
+  creates a Snowpark session from these values using `authenticator='oauth'`. Workers do not
+  create Snowpark sessions in the default `driver_presigned_url` mode. No `snowflakeService`
+  YAML block is needed or supported in the spec.
 - **`MAX_IN_FLIGHT` must not exceed `WORKERS_PER_SHARD`.** If `SYNREG_AUTOGLUON_MAX_IN_FLIGHT`
   is set higher than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD`, `autogluon_ray.py` fails fast.

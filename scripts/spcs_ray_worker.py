@@ -9,6 +9,11 @@ Environment variables:
   SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES  (default 2000000000 = ~2 GB)
   SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS       (default 300)
   SPCS_RAY_WORKER_KEEPALIVE_SECONDS             (default 7200)
+  SYNREG_SPCS_RAY_NODE_MANAGER_PORT             (default 6380) — deterministic raylet port
+  SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT           (default 6381) — deterministic object manager port
+  SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT        (default 6382) — deterministic runtime env agent port
+  SYNREG_SPCS_RAY_MIN_WORKER_PORT               (default 10002) — min port for Ray worker processes
+  SYNREG_SPCS_RAY_MAX_WORKER_PORT               (default 10010) — max port for Ray worker processes
 """
 
 from __future__ import annotations
@@ -41,12 +46,49 @@ task_cpus = int(os.getenv("AUTOGLUON_TASK_CPUS", "1"))
 obj_store_bytes = int(
     os.getenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", "2000000000")
 )
+node_manager_port = int(os.getenv("SYNREG_SPCS_RAY_NODE_MANAGER_PORT", "6380"))
+object_manager_port = int(os.getenv("SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT", "6381"))
+runtime_env_agent_port = int(os.getenv("SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT", "6382"))
+min_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MIN_WORKER_PORT", "10002"))
+max_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MAX_WORKER_PORT", "10010"))
+
+_RAY_LOG_FILES = [
+    "/tmp/ray/session_latest/logs/raylet.err",
+    "/tmp/ray/session_latest/logs/raylet.out",
+    "/tmp/ray/session_latest/logs/gcs_server.err",
+    "/tmp/ray/session_latest/logs/gcs_server.out",
+    "/tmp/ray/session_latest/logs/dashboard_agent.err",
+    "/tmp/ray/session_latest/logs/dashboard_agent.out",
+]
+_RAY_LOG_TAIL_BYTES = 32768  # 32 KB per file
+
+
+def _dump_ray_logs() -> None:
+    for path in _RAY_LOG_FILES:
+        try:
+            if not os.path.exists(path):
+                _log("ray_log_file", path=path, missing=True)
+                continue
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - _RAY_LOG_TAIL_BYTES))
+                tail = f.read().decode("utf-8", errors="replace")
+            _log("ray_log_file", path=path, bytes=min(size, _RAY_LOG_TAIL_BYTES), content=tail)
+        except Exception as exc:
+            _log("ray_log_file_error", path=path, error=str(exc))
+
 
 _log(
     "spcs_ray_worker_starting",
     ray_head_address=ray_head_address,
     task_cpus=task_cpus,
     obj_store_bytes=obj_store_bytes,
+    node_manager_port=node_manager_port,
+    object_manager_port=object_manager_port,
+    runtime_env_agent_port=runtime_env_agent_port,
+    min_worker_port=min_worker_port,
+    max_worker_port=max_worker_port,
 )
 
 # Parse host:port for reachability check
@@ -76,6 +118,11 @@ _log("spcs_ray_worker_head_reachable")
 cmd = [
     "ray", "start",
     f"--address={ray_head_address}",
+    f"--node-manager-port={node_manager_port}",
+    f"--object-manager-port={object_manager_port}",
+    f"--runtime-env-agent-port={runtime_env_agent_port}",
+    f"--min-worker-port={min_worker_port}",
+    f"--max-worker-port={max_worker_port}",
     f"--num-cpus={task_cpus}",
     f"--object-store-memory={obj_store_bytes}",
     "--block",
@@ -98,6 +145,8 @@ while time.monotonic() < deadline:
     ret = proc.poll()
     if ret is not None:
         _log("spcs_ray_worker_ray_exited", returncode=ret)
+        if ret != 0:
+            _dump_ray_logs()
         sys.exit(ret if ret != 0 else 0)
     time.sleep(poll_seconds)
 else:

@@ -23,6 +23,11 @@ Environment variables (read by this script):
   SPCS_RAY_RUN_ID                                Run ID for cluster identity (Finding 6)
   SPCS_RAY_SHARD_INDEX                           Shard index for cluster identity
   SPCS_RAY_DRIVER_SCRIPT                         Path to driver script (default: autogluon_ray.py)
+  SYNREG_SPCS_RAY_NODE_MANAGER_PORT             (default 6380) — deterministic raylet port
+  SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT           (default 6381) — deterministic object manager port
+  SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT        (default 6382) — deterministic runtime env agent port
+  SYNREG_SPCS_RAY_MIN_WORKER_PORT               (default 10002) — min port for Ray worker processes
+  SYNREG_SPCS_RAY_MAX_WORKER_PORT               (default 10010) — max port for Ray worker processes
 
 All other env vars (SYNTHETIC_REGRESSION_*, SYNREG_*, AUTOGLUON_*, BENCHMARK_*,
 HOME, SNOWFLAKE_*) are inherited by the driver script subprocess unchanged.
@@ -57,6 +62,11 @@ obj_store_bytes = int(
     os.getenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", "500000000")
 )
 head_connect_timeout = int(os.getenv("SPCS_RAY_HEAD_CONNECT_TIMEOUT_SECONDS", "300"))
+node_manager_port = int(os.getenv("SYNREG_SPCS_RAY_NODE_MANAGER_PORT", "6380"))
+object_manager_port = int(os.getenv("SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT", "6381"))
+runtime_env_agent_port = int(os.getenv("SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT", "6382"))
+min_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MIN_WORKER_PORT", "10002"))
+max_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MAX_WORKER_PORT", "10010"))
 
 _run_id = os.getenv("SPCS_RAY_RUN_ID", "")
 _shard_index = os.getenv("SPCS_RAY_SHARD_INDEX", "")
@@ -66,10 +76,42 @@ def _log(event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, default=str), flush=True)
 
 
+_RAY_LOG_FILES = [
+    "/tmp/ray/session_latest/logs/raylet.err",
+    "/tmp/ray/session_latest/logs/raylet.out",
+    "/tmp/ray/session_latest/logs/gcs_server.err",
+    "/tmp/ray/session_latest/logs/gcs_server.out",
+    "/tmp/ray/session_latest/logs/dashboard_agent.err",
+    "/tmp/ray/session_latest/logs/dashboard_agent.out",
+]
+_RAY_LOG_TAIL_BYTES = 32768  # 32 KB per file
+
+
+def _dump_ray_logs() -> None:
+    for path in _RAY_LOG_FILES:
+        try:
+            if not os.path.exists(path):
+                _log("ray_log_file", path=path, missing=True)
+                continue
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - _RAY_LOG_TAIL_BYTES))
+                tail = f.read().decode("utf-8", errors="replace")
+            _log("ray_log_file", path=path, bytes=min(size, _RAY_LOG_TAIL_BYTES), content=tail)
+        except Exception as exc:
+            _log("ray_log_file_error", path=path, error=str(exc))
+
+
 _log(
     "spcs_ray_coordinator_starting",
     head_port=head_port,
     obj_store_bytes=obj_store_bytes,
+    node_manager_port=node_manager_port,
+    object_manager_port=object_manager_port,
+    runtime_env_agent_port=runtime_env_agent_port,
+    min_worker_port=min_worker_port,
+    max_worker_port=max_worker_port,
     run_id=_run_id,
     shard_index=_shard_index,
 )
@@ -89,6 +131,11 @@ if _run_id and _shard_index != "":
 ray_head_cmd = [
     "ray", "start", "--head",
     f"--port={head_port}",
+    f"--node-manager-port={node_manager_port}",
+    f"--object-manager-port={object_manager_port}",
+    f"--runtime-env-agent-port={runtime_env_agent_port}",
+    f"--min-worker-port={min_worker_port}",
+    f"--max-worker-port={max_worker_port}",
     "--include-dashboard=false",
     # Finding 5: head contributes zero CPUs so workers provide all schedulable capacity.
     "--num-cpus=0",
@@ -121,6 +168,7 @@ try:
         rc = ray_head_proc.poll()
         if rc is not None:
             _log("spcs_ray_coordinator_head_exited_early", returncode=rc)
+            _dump_ray_logs()
             sys.exit(1)
         try:
             with socket.create_connection(("localhost", head_port), timeout=5):
@@ -155,14 +203,18 @@ finally:
     # ---------------------------------------------------------------------------
     # Step 4: Terminate Ray head gracefully
     # ---------------------------------------------------------------------------
-    if ray_head_proc is not None and ray_head_proc.poll() is None:
-        _log("spcs_ray_coordinator_terminating_head")
-        ray_head_proc.terminate()
-        try:
-            ray_head_proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            ray_head_proc.kill()
-        _log("spcs_ray_coordinator_head_terminated")
+    if ray_head_proc is not None:
+        head_rc = ray_head_proc.poll()
+        if head_rc is not None and head_rc != 0:
+            _dump_ray_logs()
+        if head_rc is None:
+            _log("spcs_ray_coordinator_terminating_head")
+            ray_head_proc.terminate()
+            try:
+                ray_head_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                ray_head_proc.kill()
+            _log("spcs_ray_coordinator_head_terminated")
 
 _log("spcs_ray_coordinator_done", driver_returncode=driver_rc)
 sys.exit(driver_rc)

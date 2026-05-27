@@ -37,8 +37,10 @@ if not os.path.exists(_OAUTH_TOKEN_PATH):
         "spcs_session_probe_token_missing",
         token_path=_OAUTH_TOKEN_PATH,
         remediation=(
-            "The Snowflake OAuth token is not mounted. Add 'snowflakeService: {enabled: true}' "
-            "to the SPCS service spec to enable the injected session token. "
+            "The Snowflake OAuth token is not present at the expected path. "
+            "SPCS job services receive this token automatically — verify the container "
+            "is running as a Snowflake job service (not a standalone container) and that "
+            "the compute pool and service are configured correctly. "
             "See Snowflake SPCS docs: Using a Snowflake connector in a Snowpark Container."
         ),
     )

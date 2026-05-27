@@ -2733,9 +2733,9 @@ CALL run_synthetic_regression_autogluon_spcs_import_probe('spcs_job', 1);
 
 ### Step 4 — SPCS session probe (mandatory)
 
-Validates that `snowflakeService.enabled=true` in the SPCS job spec causes Snowflake to mount
-the OAuth token at `/snowflake/session/token` and that Snowpark session creation succeeds inside
-a container. This is required before the capacity and worker-access probes — if the session probe
+Validates that the SPCS job service receives the Snowflake OAuth token automatically at
+`/snowflake/session/token` and that Snowpark session creation succeeds inside a container.
+This is required before the capacity and worker-access probes — if the session probe
 fails, all subsequent probes that need dataset-stage access will also fail.
 
 ```sql
@@ -2743,9 +2743,9 @@ CALL run_synthetic_regression_autogluon_spcs_session_probe('spcs_job', 1);
 ```
 
 Expected output: `session probe ok` with `account=<account>` and `role=<role>` in the container
-log. If the probe fails with a token error, check that `snowflakeService.enabled=true` is present
-in the SPCS job spec (it is injected automatically by `_build_spcs_job_spec()` — do not disable
-it via `enable_snowflake_service_token=False`).
+log. If the probe fails with a token error, verify that the compute pool and service network
+policy allow the container to reach the Snowflake token endpoint. The spec must NOT contain a
+`snowflakeService` block — Snowflake rejects it with error 395018.
 
 ### Step 5 — SPCS capacity probe
 
@@ -2842,11 +2842,20 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
 
 - The SPCS backend uses `EXECUTE JOB SERVICE` which does not support `pip_requirements`
   or `runtime_environment` — all dependencies must be preinstalled in the image.
-- **`snowflakeService.enabled=true` is required** in the SPCS job spec for any container
-  that needs a Snowpark session. The coordinator needs it to open a session for the
-  `autogluon_ray.py` driver subprocess. The spec builder injects this automatically.
-  Do not disable it — without it, the OAuth token mount at `/snowflake/session/token` is
-  absent and session creation fails.
+- **SPCS OAuth token:** SPCS job services automatically receive the OAuth token at
+  `/snowflake/session/token`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_HOST`. No `snowflakeService`
+  YAML block is required or supported — Snowflake rejects specs containing it with error 395018.
+  Container code must read the token from the file path and use `authenticator='oauth'`.
+- **Ray requires deterministic ports on SPCS:** Use `--node-manager-port=6380`,
+  `--object-manager-port=6381`, `--runtime-env-agent-port=6382`,
+  `--min-worker-port=10002 --max-worker-port=10010` on both head and worker `ray start` commands.
+  SPCS specs must declare these as TCP endpoints — traffic to undeclared ports is silently dropped.
+- **Capacity probe uses reduced object-store memory:** The SPCS capacity probe defaults coordinator
+  and worker object-store to 256 MB each (vs 500 MB / 2 GB for production). `/dev/shm` in SPCS
+  containers is only 64 MiB; Ray falls back to `/tmp` but stays stable.
+- **Raylet failure diagnostics:** If raylet exits, the coordinator/worker scripts now dump the last
+  32 KB of `/tmp/ray/session_latest/logs/raylet.err`, `gcs_server.err`, and related log files as
+  structured JSON log events for inspection in SPCS job service logs.
 - **Coordinator merges head + driver:** `spcs_ray_coordinator.py` starts `ray start --head
   --num-cpus=0 --object-store-memory=<bytes>` as a subprocess, polls localhost until the
   port is reachable, then executes `autogluon_ray.py` with `SYNREG_RAY_ADDRESS_MODE=explicit`
@@ -2859,8 +2868,11 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
 - **Workers advertise explicit `--num-cpus` and `--object-store-memory`** on the `ray start`
   command so Ray's resource accounting is accurate. `AUTOGLUON_TASK_CPUS` controls
   `--num-cpus`; `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` controls object store.
-- **TCP endpoint exposed for coordinator:** The coordinator SPCS spec includes a TCP endpoint
-  `ray-head` on port 6379 so workers can connect to it via the SPCS service DNS address.
+- **TCP endpoints for all Ray ports:** The coordinator SPCS spec exposes five TCP endpoints:
+  `ray-head` (6379), `ray-node-manager` (6380), `ray-object-manager` (6381),
+  `ray-runtime-env-agent` (6382), and `ray-worker-ports` (portRange 10002–10010). Worker specs
+  expose the same four ports except `ray-head`. All ports are deterministic — passed via
+  `--node-manager-port` etc. on `ray start` — so they can be declared in SPCS specs.
 - **Resource sizing:** Worker and single-node containers keep worker-sized resources because
   they run AutoGluon fits. Coordinators use a smaller profile (1/2 CPU, 4Gi/8Gi memory).
   In the default 6×4 topology this keeps 24 schedulable worker containers while avoiding

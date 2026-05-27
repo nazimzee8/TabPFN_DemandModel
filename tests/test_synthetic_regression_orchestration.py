@@ -2465,29 +2465,22 @@ class TestSPCSStaticAnalysis:
         assert "test:1.0" in spec
 
     # Finding 2: Snowflake token injection
-    def test_spcs_spec_includes_snowflake_service_token_by_default(self):
-        """SPCS job spec must enable Snowflake OAuth token injection by default.
+    def test_spcs_spec_does_not_include_snowflake_service(self):
+        """Generated SPCS job spec must NOT contain snowflakeService.
 
-        Without snowflakeService.enabled=true, the token at /snowflake/session/token
-        is not mounted and all Snowpark session creation inside the container fails.
+        Snowflake rejects specs that include this field with error 395018:
+        'Invalid spec: unknown option snowflakeService for spec'.
+        SPCS job services receive the OAuth token automatically at
+        /snowflake/session/token without any YAML configuration.
         """
         from run_synthetic_regression_evaluation import _build_spcs_job_spec
-        spec = _build_spcs_job_spec(image="test:1.0", args=["/app/scripts/autogluon_ray.py"], env_vars={})
-        assert "snowflakeService" in spec, (
-            "_build_spcs_job_spec must include 'snowflakeService' block by default"
-        )
-        assert "enabled: true" in spec, (
-            "_build_spcs_job_spec must set snowflakeService.enabled=true by default"
-        )
-
-    def test_spcs_spec_token_injection_can_be_disabled(self):
-        """enable_snowflake_service_token=False must suppress the snowflakeService block."""
-        from run_synthetic_regression_evaluation import _build_spcs_job_spec
         spec = _build_spcs_job_spec(
-            image="test:1.0", args=["/app/scripts/autogluon_ray.py"], env_vars={},
-            enable_snowflake_service_token=False,
+            image="test:1.0", args=["/app/scripts/autogluon_ray.py"], env_vars={}
         )
-        assert "snowflakeService" not in spec
+        assert "snowflakeService" not in spec, (
+            "_build_spcs_job_spec must not include 'snowflakeService' — "
+            "Snowflake rejects it with error 395018"
+        )
 
     # Finding 2: Session probe function
     def test_spcs_session_probe_function_exists(self):
@@ -2573,6 +2566,68 @@ class TestSPCSStaticAnalysis:
         assert parsed["image_name"] == "tabpfn-autogluon-ray"
         assert parsed["tag"] == "1.0.0"
         assert parsed["digest"] is None
+
+    def test_spcs_spec_portrange_endpoint(self):
+        """_build_spcs_job_spec emits portRange: in YAML when endpoint uses portRange key."""
+        from run_synthetic_regression_evaluation import _build_spcs_job_spec
+        spec = _build_spcs_job_spec(
+            image="img:1.0",
+            args=["/app/scripts/spcs_ray_worker.py"],
+            env_vars={},
+            endpoints=[
+                {"name": "ray-worker-ports", "portRange": "10002-10010", "protocol": "TCP"},
+            ],
+        )
+        assert "portRange: 10002-10010" in spec
+        assert "port:" not in spec.split("endpoints:")[1]  # no scalar port field in endpoint section
+
+    def test_spcs_coordinator_endpoint_list_includes_all_ray_ports(self):
+        """_spcs_ray_coordinator_endpoints returns 5 entries covering all required Ray ports."""
+        from run_synthetic_regression_evaluation import (
+            _spcs_ray_coordinator_endpoints,
+            _build_spcs_job_spec,
+        )
+        endpoints = _spcs_ray_coordinator_endpoints(6379)
+        assert len(endpoints) == 5
+        names = {ep["name"] for ep in endpoints}
+        assert "ray-head" in names
+        assert "ray-node-manager" in names
+        assert "ray-object-manager" in names
+        assert "ray-runtime-env-agent" in names
+        assert "ray-worker-ports" in names
+        # Confirm portRange entry exists
+        assert any("portRange" in ep for ep in endpoints)
+        # Confirm YAML spec renders all endpoint names
+        spec = _build_spcs_job_spec(
+            image="img:1.0", args=["/s.py"], env_vars={}, endpoints=endpoints
+        )
+        for name in names:
+            assert name in spec
+        assert "portRange:" in spec
+
+    def test_spcs_worker_endpoint_list_excludes_ray_head(self):
+        """_spcs_ray_worker_endpoints returns 4 entries; none named ray-head."""
+        from run_synthetic_regression_evaluation import _spcs_ray_worker_endpoints
+        endpoints = _spcs_ray_worker_endpoints()
+        assert len(endpoints) == 4
+        assert not any(ep["name"] == "ray-head" for ep in endpoints)
+        names = {ep["name"] for ep in endpoints}
+        assert "ray-node-manager" in names
+        assert "ray-object-manager" in names
+        assert "ray-runtime-env-agent" in names
+        assert "ray-worker-ports" in names
+
+    def test_spcs_ray_port_env_vars_returns_all_six(self):
+        """_spcs_ray_port_env_vars returns a dict with all 6 deterministic-port keys."""
+        from run_synthetic_regression_evaluation import _spcs_ray_port_env_vars
+        env = _spcs_ray_port_env_vars()
+        assert "SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT" in env
+        assert "SYNREG_SPCS_RAY_NODE_MANAGER_PORT" in env
+        assert "SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT" in env
+        assert "SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT" in env
+        assert "SYNREG_SPCS_RAY_MIN_WORKER_PORT" in env
+        assert "SYNREG_SPCS_RAY_MAX_WORKER_PORT" in env
+        assert len(env) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -3260,9 +3315,9 @@ class TestSPCSAutogluonBackend:
             f"run1={run_labels}, run2={run_labels_2}"
         )
 
-    # Finding 2: SPCS spec includes token injection in practice
-    def test_submit_spcs_synreg_spec_includes_snowflake_service(self, monkeypatch):
-        """_submit_spcs_synreg must produce a spec with snowflakeService.enabled=true."""
+    # Finding 2: SPCS spec must not include invalid snowflakeService field
+    def test_submit_spcs_synreg_spec_excludes_snowflake_service(self, monkeypatch):
+        """_submit_spcs_synreg generated spec must NOT contain snowflakeService."""
         import run_synthetic_regression_evaluation as mod
         captured_specs = []
 
@@ -3283,10 +3338,10 @@ class TestSPCSAutogluonBackend:
         )
         assert captured_specs, "No spec was captured"
         spec = captured_specs[0]
-        assert "snowflakeService" in spec, (
-            "_submit_spcs_synreg spec must include snowflakeService block"
+        assert "snowflakeService" not in spec, (
+            "_submit_spcs_synreg spec must not include snowflakeService — "
+            "Snowflake rejects it with error 395018"
         )
-        assert "enabled: true" in spec
 
     # Finding 4: Per-shard DNS derivation — each shard gets a unique head address
     def test_spcs_distributed_uses_per_shard_head_dns(self, monkeypatch):
@@ -3432,6 +3487,156 @@ class TestSPCSAutogluonBackend:
         match = re.search(r'EXPECTED_RAY_NODES[^"]*"(\d+)"', coord_specs[0])
         assert match, f"Could not find EXPECTED_RAY_NODES in coordinator spec: {coord_specs[0]}"
         assert int(match.group(1)) == 4, f"Expected EXPECTED_RAY_NODES=4, got {match.group(1)}"
+
+    def test_spcs_capacity_probe_coordinator_spec_has_all_ray_endpoints(self, monkeypatch):
+        """Capacity probe coordinator spec must expose all 5 Ray endpoints including portRange."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        monkeypatch.setattr(
+            mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper(),
+        )
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        assert coord_specs, "No coordinator specs captured"
+        spec = coord_specs[0]
+        for ep_name in ("ray-head", "ray-node-manager", "ray-object-manager",
+                        "ray-runtime-env-agent", "ray-worker-ports"):
+            assert ep_name in spec, f"Coordinator spec missing endpoint {ep_name!r}"
+        assert "portRange:" in spec, "Coordinator spec missing portRange endpoint"
+
+    def test_spcs_capacity_probe_worker_spec_has_ray_endpoints(self, monkeypatch):
+        """Capacity probe worker spec must expose ray-node-manager and portRange endpoints."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        monkeypatch.setattr(
+            mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper(),
+        )
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        worker_specs = [spec for label, spec in submitted if "worker" in label]
+        assert worker_specs, "No worker specs captured"
+        spec = worker_specs[0]
+        assert "ray-node-manager" in spec, "Worker spec missing ray-node-manager endpoint"
+        assert "portRange:" in spec, "Worker spec missing portRange endpoint"
+        assert "ray-head" not in spec, "Worker spec must not include ray-head endpoint"
+
+    def test_spcs_capacity_probe_uses_reduced_object_store(self, monkeypatch):
+        """Capacity probe defaults to 256 MB object-store for coordinator and worker."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        monkeypatch.setattr(
+            mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper(),
+        )
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.delenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", raising=False)
+        monkeypatch.delenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", raising=False)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        worker_specs = [spec for label, spec in submitted if "worker" in label]
+        assert coord_specs, "No coordinator specs captured"
+        assert worker_specs, "No worker specs captured"
+        assert "268435456" in coord_specs[0], (
+            "Capacity probe coordinator must default to 268435456 bytes object-store"
+        )
+        assert "268435456" in worker_specs[0], (
+            "Capacity probe worker must default to 268435456 bytes object-store"
+        )
+
+    def test_spcs_production_eval_uses_production_object_store_defaults(self, monkeypatch):
+        """Production eval coordinator defaults to 500 MB and worker to 2 GB object-store."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        monkeypatch.setattr(
+            mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper(),
+        )
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.delenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", raising=False)
+        monkeypatch.delenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", raising=False)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        worker_specs = [spec for label, spec in submitted if "worker" in label]
+        assert coord_specs, "No coordinator specs captured"
+        assert worker_specs, "No worker specs captured"
+        assert "500000000" in coord_specs[0], (
+            "Production eval coordinator must default to 500000000 bytes object-store"
+        )
+        assert "2000000000" in worker_specs[0], (
+            "Production eval worker must default to 2000000000 bytes object-store"
+        )
+
+    def test_ray_dashboard_not_in_coordinator_spec(self, monkeypatch):
+        """Coordinator spec must not expose a dashboard endpoint or port 8265."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        monkeypatch.setattr(
+            mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper(),
+        )
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        assert coord_specs, "No coordinator specs captured"
+        spec = coord_specs[0]
+        assert "dashboard" not in spec.lower() or "include-dashboard=false" in spec.lower(), (
+            "Coordinator spec must not declare a dashboard endpoint"
+        )
+        assert "8265" not in spec, "Coordinator spec must not expose port 8265 (dashboard)"
 
     # Finding 1: Image verification is called during SPCS evaluation
     def test_spcs_evaluation_calls_image_verification(self, monkeypatch):

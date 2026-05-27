@@ -535,8 +535,12 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
   with `RAY_HEAD_ADDRESS=localhost:<port>`. Workers connect via the coordinator's external DNS address.
   **SPCS DNS rule:** underscores in the service name are replaced by dashes in DNS
   (e.g. `spcs_ray_coord_r0_0` → `spcs-ray-coord-r0-0.<suffix>`). The coordinator's SPCS spec
-  exposes a TCP endpoint on port 6379. Do not add a separate head or driver service — the coordinator
-  replaces both. Resource profile: `SYNREG_SPCS_RAY_COORDINATOR_*` (default 1/2 CPU, 4Gi/8Gi memory).
+  exposes TCP endpoints for all required Ray ports: `ray-head` (6379), `ray-node-manager` (6380),
+  `ray-object-manager` (6381), `ray-runtime-env-agent` (6382), and `ray-worker-ports` (portRange
+  10002–10010). Worker specs expose all except `ray-head`. All ports must be deterministic (set via
+  `--node-manager-port` etc.) and declared as SPCS TCP endpoints — SPCS only allows
+  service-to-service traffic on declared endpoints. Do not add a separate head or driver service —
+  the coordinator replaces both. Resource profile: `SYNREG_SPCS_RAY_COORDINATOR_*` (default 1/2 CPU, 4Gi/8Gi memory).
 - **Session-free worker dataset loading:** The Ray driver opens Snowpark only to query
   `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.scoped_url` with
   `BUILD_SCOPED_FILE_URL`. Each Ray worker receives only a compact item dict and opens
