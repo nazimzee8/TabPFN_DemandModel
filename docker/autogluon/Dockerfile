@@ -41,6 +41,7 @@ COPY scripts/autogluon_import_timing_probe.py /app/scripts/autogluon_import_timi
 COPY scripts/autogluon_ray.py /app/scripts/autogluon_ray.py
 COPY scripts/autogluon_worker_access_probe.py /app/scripts/autogluon_worker_access_probe.py
 COPY scripts/ray_capacity_probe.py /app/scripts/ray_capacity_probe.py
+COPY scripts/spcs_ray_coordinator.py /app/scripts/spcs_ray_coordinator.py
 COPY scripts/spcs_ray_head.py /app/scripts/spcs_ray_head.py
 COPY scripts/spcs_ray_worker.py /app/scripts/spcs_ray_worker.py
 COPY scripts/spcs_snowpark_session_probe.py /app/scripts/spcs_snowpark_session_probe.py

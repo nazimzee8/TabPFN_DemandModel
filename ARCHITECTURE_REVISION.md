@@ -1872,3 +1872,83 @@ MODEL2 is a strong intermediate architecture. It fixes early feature collapse an
 But relative to Hartford et al., it is not yet the right final architecture for a market mental model built on structured interactions across exchangeable axes.
 
 The next principled step is not to keep stretching `retired MODEL2 model`; it is to design `MODEL3 = MarketExchangeableModel` around exchangeable matrix/tensor blocks, mask-aware reductions, and a clear inductive-vs-transductive objective split.
+
+---
+
+## SPCS AutoGluon Coordinator Topology (Updated 2026-05)
+
+### Changed Behavior
+
+The SPCS Ray distributed AutoGluon backend now uses a **30-container coordinator topology**
+instead of the previous 36-container (head + workers + driver) topology for a 6×4 setup.
+
+| Setup | Old (36 containers) | New (30 containers) |
+|-------|---------------------|---------------------|
+| 6 shards × 4 workers | 6 heads + 24 workers + 6 drivers | **6 coordinators + 24 workers** |
+| Container roles | head: Ray only; driver: AutoGluon only | coordinator: Ray head + AutoGluon driver |
+
+### New Script: `scripts/spcs_ray_coordinator.py`
+
+Each shard now runs a single **coordinator** container that:
+1. Starts the Ray head subprocess with `--num-cpus=0` and `--object-store-memory=<N>`.
+2. Polls `localhost:{head_port}` until reachable.
+3. Runs `autogluon_ray.py` as a child subprocess, with `SYNREG_RAY_ADDRESS_MODE=explicit`
+   and `RAY_HEAD_ADDRESS=localhost:{head_port}` set in the subprocess environment.
+4. Propagates the driver exit code and terminates the Ray head in `finally`.
+
+Workers (`scripts/spcs_ray_worker.py`) connect to the coordinator's DNS address and now
+pass explicit `--num-cpus=<AUTOGLUON_TASK_CPUS>` and `--object-store-memory=<N>` to Ray.
+
+### SPCS TCP Endpoint
+
+The coordinator SPCS job spec now exposes port 6379 as a named TCP endpoint (`ray-head`)
+so that workers in separate SPCS services can reach the Ray head port:
+
+```yaml
+endpoints:
+  - name: ray-head
+    port: 6379
+    protocol: TCP
+```
+
+### DNS Normalization
+
+Per Snowflake SPCS documentation, **underscores in service names are replaced by dashes
+in DNS names**. The orchestrator now applies this normalization explicitly when deriving
+worker `RAY_HEAD_ADDRESS` values:
+
+```python
+dns_service_name = safe_coord_label.lower().replace("_", "-")
+coord_hostname = f"{dns_service_name}.{dns_suffix}"
+# e.g. "spcs-ray-coord-tst00001-0.myschema.mydb.snowflakecomputing.internal"
+```
+
+This fix also applies to the capacity probe and worker access probe DNS derivations.
+
+### Required Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SPCS_RAY_HEAD_DNS_SUFFIX` | `""` | Domain suffix for coordinator DNS (e.g. `myschema.mydb.snowflakecomputing.internal`) |
+| `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES` | `500000000` | Ray object store cap for coordinator (~500 MB) |
+| `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` | `2000000000` | Ray object store cap for workers (~2 GB) |
+| `SYNREG_SPCS_RAY_COORDINATOR_CPU_REQUEST` | `1` | CPU request for coordinator container |
+| `SYNREG_SPCS_RAY_COORDINATOR_CPU_LIMIT` | `2` | CPU limit for coordinator container |
+| `SYNREG_SPCS_RAY_COORDINATOR_MEMORY_REQUEST` | `4Gi` | Memory request for coordinator container |
+| `SYNREG_SPCS_RAY_COORDINATOR_MEMORY_LIMIT` | `8Gi` | Memory limit for coordinator container |
+
+The existing `SYNREG_SPCS_RAY_HEAD_*` and `SYNREG_SPCS_RAY_WORKER_*` env vars are
+preserved for backward compatibility (capacity probe and worker access probe still use
+separate head containers for diagnostic purposes).
+
+### Preserved Invariants
+
+- MLJob backend (`run_synthetic_regression_combined_autogluon_evaluation`) is unchanged.
+- Single-node SPCS mode (`autogluon_cluster_shards=0`) is unchanged.
+- One output CSV per shard: `autogluon_ray.py` writes the shard CSV; the coordinator
+  invokes it as a subprocess.
+- No `ray.put()` of dataset payloads; `MAX_IN_FLIGHT ≤ workers_per_shard` enforced.
+- Cluster identity check (custom Ray resource `spcs_cluster_id_{run_id}_{shard}`) works
+  because the coordinator passes `SPCS_RAY_RUN_ID` and `SPCS_RAY_SHARD_INDEX` through to
+  the `autogluon_ray.py` subprocess environment.
+- Modulo shard assignment determinism and atomic work item uniqueness are unchanged.

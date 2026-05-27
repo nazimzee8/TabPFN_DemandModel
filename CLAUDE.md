@@ -520,7 +520,7 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
 | `AUTOGLUON_TASK_CPUS` | 1 | CPUs per individual AutoGluon fit |
 | `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Max simultaneous MLJob clusters; must equal `CLUSTER_SHARDS` |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
-| `SYNREG_WORKER_DATA_ACCESS_MODE` | `scoped_file_url` | Driver-derived scoped URL; workers do not create Snowpark sessions |
+| `SYNREG_WORKER_DATA_ACCESS_MODE` | `driver_presigned_url` | Driver-derived presigned HTTPS URL; workers download via urllib without a Snowpark session |
 | `SYNREG_MAX_WORK_ITEM_BYTES` | 8192 | Compact Ray item metadata size guard |
 
 **Architecture guardrails:**
@@ -528,6 +528,15 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
 - AutoGluon is distributed across **independent work items**, not a single multi-node AutoGluon
   fit. Each MLJob cluster runs one logical shard; Ray distributes the shard's work items across
   the cluster's `target_instances` nodes.
+- **SPCS custom-image backend (coordinator topology):** When `SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job`,
+  each shard submits one coordinator SPCS service (`spcs_ray_coordinator.py`) and N worker SPCS
+  services (`spcs_ray_worker.py`). For 6×4 this is **30 containers** (6 coordinators + 24 workers),
+  not 36. The coordinator starts `ray start --head --num-cpus=0` locally, then runs `autogluon_ray.py`
+  with `RAY_HEAD_ADDRESS=localhost:<port>`. Workers connect via the coordinator's external DNS address.
+  **SPCS DNS rule:** underscores in the service name are replaced by dashes in DNS
+  (e.g. `spcs_ray_coord_r0_0` → `spcs-ray-coord-r0-0.<suffix>`). The coordinator's SPCS spec
+  exposes a TCP endpoint on port 6379. Do not add a separate head or driver service — the coordinator
+  replaces both. Resource profile: `SYNREG_SPCS_RAY_COORDINATOR_*` (default 1/2 CPU, 4Gi/8Gi memory).
 - **Session-free worker dataset loading:** The Ray driver opens Snowpark only to query
   `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.scoped_url` with
   `BUILD_SCOPED_FILE_URL`. Each Ray worker receives only a compact item dict and opens

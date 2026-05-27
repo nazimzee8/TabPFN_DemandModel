@@ -10,6 +10,7 @@ on:
       - "scripts/autogluon_ray.py"
       - "scripts/autogluon_worker_access_probe.py"
       - "scripts/ray_capacity_probe.py"
+      - "scripts/spcs_ray_coordinator.py"
       - "scripts/spcs_ray_head.py"
       - "scripts/spcs_ray_worker.py"
       - "scripts/spcs_snowpark_session_probe.py"

@@ -486,8 +486,14 @@ def load_synthetic_regression_index(suite_family: str | None = None, session=Non
     if suite_family:
         where += f" AND suite_family = '{suite_family}'"
 
+    # Select only the scalar columns consumed by _normalize_synreg_row and
+    # expand_synreg_work_items. Avoids fetching large payload columns that may
+    # exist in the index table and reduces per-driver data transfer.
     rows = session.sql(
-        f"SELECT * FROM {SYNREG_INDEX_TABLE} WHERE {where} "
+        f"SELECT suite_id, suite_family, prior_regime, dataset_id, dataset_seed, "
+        f"stage_path, split_seeds, n_total, n_train_default, n_holdout_default, "
+        f"p_signal, p_noise, p_total, feature_noise_level, target_noise_scale "
+        f"FROM {SYNREG_INDEX_TABLE} WHERE {where} "
         f"ORDER BY suite_id, suite_family, prior_regime, dataset_id, "
         f"feature_noise_level, target_noise_scale, stage_path"
     ).collect()

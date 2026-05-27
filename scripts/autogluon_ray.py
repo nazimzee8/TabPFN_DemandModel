@@ -358,6 +358,25 @@ print(
     flush=True,
 )
 
+# Atomic work-item uniqueness guard: detect duplicates before submitting to Ray.
+# Each (suite_id, stage_path, split_seed, n_train_override) must be unique within this shard.
+_seen_keys: set[tuple] = set()
+for _item in my_work_items:
+    _key = (
+        _item.get("suite_id"),
+        _item.get("stage_path") or _item.get("dataset_id"),
+        _item.get("split_seed"),
+        _item.get("n_train_override"),
+    )
+    if _key in _seen_keys:
+        raise RuntimeError(
+            f"[ag_ray] Duplicate atomic work item detected before Ray submission: "
+            f"{_key!r}. This indicates a bug in shard assignment or work-item expansion. "
+            f"Aborting to prevent double-evaluation."
+        )
+    _seen_keys.add(_key)
+del _seen_keys
+
 if not my_work_items:
     raise RuntimeError(
         f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} has zero work items. "
@@ -365,13 +384,27 @@ if not my_work_items:
     )
 
 # Finding 7: Presigned URL expiry validation.
-# Warn if presigned URLs may expire before all work items in this shard complete.
+# Strict by default so late workers do not silently hit expired URLs.
 if WORKER_DATA_ACCESS_MODE == "driver_presigned_url":
     _expiry_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400"))
     # Conservative upper bound: all items run sequentially at max time_limit.
     _estimated_max_shard_seconds = len(my_work_items) * TIME_LIMIT
-    _buffer_seconds = 3600  # 1-hour safety margin
+    _buffer_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS", "3600"))
+    _policy = os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_POLICY", "strict").strip().lower()
+    if _policy not in {"strict", "warn"}:
+        raise RuntimeError(
+            "[ag_ray] SYNREG_PRESIGNED_URL_EXPIRY_POLICY must be 'strict' or 'warn'; "
+            f"got {_policy!r}."
+        )
     if _expiry_seconds < _estimated_max_shard_seconds + _buffer_seconds:
+        if _policy == "strict":
+            raise RuntimeError(
+                f"[ag_ray] presigned URL expiry={_expiry_seconds}s may be insufficient: "
+                f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
+                f"for {len(my_work_items)} items at {TIME_LIMIT}s plus buffer={_buffer_seconds}s. "
+                "Increase SYNREG_PRESIGNED_URL_EXPIRY_SECONDS or set "
+                "SYNREG_PRESIGNED_URL_EXPIRY_POLICY=warn to accept late-worker HTTP 403 risk."
+            )
         print(
             f"[ag_ray] WARNING presigned URL expiry={_expiry_seconds}s may be insufficient: "
             f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
@@ -588,6 +621,14 @@ MAX_IN_FLIGHT = _env_int("SYNREG_AUTOGLUON_MAX_IN_FLIGHT", WORKERS_PER_SHARD)
 if MAX_IN_FLIGHT < 1:
     raise RuntimeError(
         f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} must be >= 1."
+    )
+if MAX_IN_FLIGHT > WORKERS_PER_SHARD:
+    raise RuntimeError(
+        f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} exceeds "
+        f"SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD}. "
+        f"MAX_IN_FLIGHT must not exceed WORKERS_PER_SHARD to avoid scheduling "
+        f"starvation (more in-flight futures than available workers). "
+        f"Reduce SYNREG_AUTOGLUON_MAX_IN_FLIGHT or increase SYNREG_AUTOGLUON_WORKERS_PER_SHARD."
     )
 
 print(

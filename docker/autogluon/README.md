@@ -66,8 +66,37 @@ export SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job
 ## Notes
 
 - PYTHONPATH is set to `/app/scripts:/app/src` inside the image.
-- The image ENTRYPOINT is `python`; SPCS job service `args` specify the script path.
-- Self-managed Ray: the orchestrator starts a Ray head container and worker containers;
-  the driver container connects with `SYNREG_RAY_ADDRESS_MODE=explicit` and `RAY_HEAD_ADDRESS`.
-- For SPCS session access (Snowpark), containers use the Snowflake-injected OAuth token
-  at `/snowflake/session/token` with `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_HOST`.
+- The image ENTRYPOINT is `python`; SPCS job spec `args` specify the script path.
+- **Coordinator topology (default for distributed mode):** one coordinator container per shard
+  merges the Ray head and AutoGluon driver. For a 6-shard × 4-worker deployment this is
+  **30 SPCS containers** (6 coordinators + 24 workers).
+  - `scripts/spcs_ray_coordinator.py` starts `ray start --head --num-cpus=0` as a subprocess,
+    polls localhost until reachable, then runs the configured driver script with
+    `SYNREG_RAY_ADDRESS_MODE=explicit` and `RAY_HEAD_ADDRESS=localhost:<port>`.
+  - The driver script defaults to `autogluon_ray.py`. Set `SPCS_RAY_DRIVER_SCRIPT` env var
+    to run a different script (e.g. `ray_capacity_probe.py` for capacity probes).
+- **SPCS DNS:** service names have underscores replaced by dashes in DNS. The orchestrator
+  auto-resolves the DNS domain via `SYSTEM$GET_SERVICE_DNS_DOMAIN`; set `SPCS_RAY_HEAD_DNS_SUFFIX`
+  to override.
+- **Default SPCS resource profiles:**
+  | Role | CPU request | CPU limit | Memory request | Memory limit |
+  |------|-------------|-----------|----------------|--------------|
+  | Coordinator | 1 | 2 | 4Gi | 8Gi |
+  | Worker | 4 | 4 | 16Gi | 16Gi |
+  | Single-node AutoGluon | 4 | 4 | 16Gi | 16Gi |
+  | Probe / import-timing | 0.5 | 0.5 | 2Gi | 2Gi |
+  Override via `SYNREG_SPCS_RAY_COORDINATOR_*`, `SYNREG_SPCS_RAY_WORKER_*`,
+  `SYNREG_SPCS_SINGLE_NODE_*`, or `SYNREG_SPCS_PROBE_*` with `_CPU`, `_MEMORY`,
+  `_CPU_REQUEST`, `_CPU_LIMIT`, `_MEMORY_REQUEST`, or `_MEMORY_LIMIT` suffixes.
+- **Worker data access (default):** `driver_presigned_url` — the driver builds a time-limited
+  HTTPS presigned URL for each dataset and passes it in the compact work-item dict.
+  Workers download using `urllib.request` without creating a Snowpark session.
+  Set `SYNREG_WORKER_DATA_ACCESS_MODE=scoped_file_url` to use scoped Snowflake URLs instead.
+- **No `ray.put()` for datasets.** Workers receive only compact metadata dicts (~8 KB each).
+  Datasets are loaded inside the worker task from the presigned or scoped URL.
+- **Snowpark session in coordinator:** containers with `snowflakeService.enabled=true` in their
+  SPCS spec receive an OAuth token at `/snowflake/session/token`. The coordinator/driver creates a
+  Snowpark session from this token using `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_HOST`. Workers do not
+  create Snowpark sessions in the default `driver_presigned_url` mode.
+- **`MAX_IN_FLIGHT` must not exceed `WORKERS_PER_SHARD`.** If `SYNREG_AUTOGLUON_MAX_IN_FLIGHT`
+  is set higher than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD`, `autogluon_ray.py` fails fast.

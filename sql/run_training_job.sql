@@ -1741,13 +1741,21 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
 --   Step 5. One-shard mini evaluation — verify end-to-end with 1 shard before full run.
 --   Step 6. Full distributed evaluation.
 --   Step 7. Aggregation.
--- Set SYNREG_AUTOGLUON_SPCS_IMAGE in the session before calling:
+-- Default separated Ray topology: 6 heads + 24 workers + 6 drivers = 36 containers.
+-- Only the 24 worker containers advertise Ray CPUs for AutoGluon tasks.
+-- Heads and drivers are intentionally downsized: head 0.5 CPU, 2Gi/4Gi memory;
+-- driver 0.5/1 CPU, 2Gi/4Gi memory; worker/single-node 4 CPU, 16Gi memory.
+-- Override with SYNREG_SPCS_RAY_HEAD_*, SYNREG_SPCS_RAY_DRIVER_*,
+-- SYNREG_SPCS_RAY_WORKER_*, SYNREG_SPCS_SINGLE_NODE_*, or explicit
+-- *_CPU_REQUEST/*_CPU_LIMIT/*_MEMORY_REQUEST/*_MEMORY_LIMIT suffixes.
+-- Pass the full pushed image reference as AUTOGLUON_SPCS_IMAGE when calling.
+-- Legacy callers that still pass 'spcs_job' may optionally set:
 --   ALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE = '<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0';
 -- For multi-shard Ray mode, also set SPCS_RAY_HEAD_DNS_SUFFIX:
 --   ALTER SESSION SET SPCS_RAY_HEAD_DNS_SUFFIX = '<schema_lower>.<db_lower>.snowflakecomputing.internal';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_import_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   PROBE_COUNT INTEGER
 )
   RETURNS STRING
@@ -1763,7 +1771,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_import_probe
 -- snowflakeService.enabled=true so the container receives the OAuth token at /snowflake/session/token.
 -- Must be run after the import probe and before the capacity probe.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_session_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   PROBE_COUNT INTEGER
 )
   RETURNS STRING
@@ -1774,7 +1782,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_session_prob
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_session_probe';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
@@ -1787,7 +1795,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_cap
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
@@ -1800,7 +1808,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_wor
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_TASK_CPUS INTEGER,

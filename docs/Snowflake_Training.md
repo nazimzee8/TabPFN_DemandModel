@@ -2333,11 +2333,11 @@ CALL run_synthetic_regression_combined_baseline_capacity_probe(
   '2.5.0-py311', '2.5.0-py311', 10, 10
 );
 CALL run_synthetic_regression_combined_baseline_evaluation(
-  '2.5.0-py311', '2.5.0-py311', 10, 10
+  '2.5.0-py311', 10, 10
 );
 -- Aggregation must expect 10 baseline shard files:
 CALL run_synthetic_regression_combined_aggregation(
-  '2.5.0-py311', '2.5.0-py311', 6, 10, 10
+  '2.5.0-py311', 6, 10, 10
 );
 ```
 
@@ -2360,7 +2360,7 @@ single-node path used by the main and OOD suites.
 | `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` | 512 | Per-task processed feature cap |
 | `BENCHMARK_CPU_MAX_MATRIX_BYTES` | 2147483648 | Per-task train+holdout matrix byte cap |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution strategy |
-| `SYNREG_WORKER_DATA_ACCESS_MODE` | `scoped_file_url` | Driver-derived scoped URL; workers do not create Snowpark sessions |
+| `SYNREG_WORKER_DATA_ACCESS_MODE` | `driver_presigned_url` | Driver-derived presigned HTTPS URL; workers download via urllib without a Snowpark session |
 | `SYNREG_MAX_WORK_ITEM_BYTES` | 8192 | Compact Ray item metadata size guard |
 
 Each MLJob cluster runs `autogluon_ray.py` (derived internally — not a runtime argument). The
@@ -2455,11 +2455,11 @@ CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
 -- GROUP BY prior_regime ORDER BY prior_regime;
 
 -- Step 3: DeepSet evaluation (10 GPU shards → 10 MODEL3-ICL shard files)
-CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
 
 -- Step 4: Baseline evaluation (6 CPU shards)
-CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', 6);
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
 
 -- Step 5: Distributed AutoGluon evaluation (6 clusters × 4 workers → 6 shard files)
@@ -2478,7 +2478,7 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 
 -- Step 6: Aggregation (expects N=6 AutoGluon shard files)
-CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', 6);
 
 -- Step 7: Final model training with explicit runtime lineage
 CALL run_model_training(
@@ -2633,24 +2633,52 @@ Key differences from the MLJob backend:
 ```
 SPCS Job Services per shard (Ray distributed mode):
 
-  [SPCS head container]    spcs_ray_head.py
-         (--num-cpus=0, --resources={"spcs_cluster_id_<run_id>_<shard>": 1})
-          |
-          | <-- RAY_HEAD_ADDRESS (<service_name_lower>.<SPCS_RAY_HEAD_DNS_SUFFIX>:<port>)
-          |
+  [SPCS coordinator]       spcs_ray_coordinator.py
+    subprocess 1: ray start --head --num-cpus=0 --object-store-memory=...
+                            --resources={"spcs_cluster_id_<run_id>_<shard>": 1}
+    subprocess 2: autogluon_ray.py
+                            (SYNREG_RAY_ADDRESS_MODE=explicit,
+                             RAY_HEAD_ADDRESS=localhost:<port>)
+    TCP endpoint: ray-head → port 6379 (exposed in SPCS spec)
+
+          | <-- RAY_HEAD_ADDRESS (<coordinator_dns>.<SPCS_RAY_HEAD_DNS_SUFFIX>:<port>)
+          |     SPCS DNS rule: underscores in service name → dashes
+          |     e.g. spcs_ray_coord_r0_0 → spcs-ray-coord-r0-0.<suffix>
+
   [SPCS worker 0]          spcs_ray_worker.py
+                            (--num-cpus=<AUTOGLUON_TASK_CPUS>
+                             --object-store-memory=<SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES>)
   [SPCS worker 1]          spcs_ray_worker.py
   ...
-          |
-  [SPCS driver container]  autogluon_ray.py
-         (SYNREG_RAY_ADDRESS_MODE=explicit)
-         (RAY_HEAD_ADDRESS=<head_dns>:<port>)
-         (expected_nodes = WORKERS_PER_SHARD + 1, expected_cpus = WORKERS_PER_SHARD * TASK_CPUS)
-         (verifies spcs_cluster_id_<run_id>_<shard> resource before submitting work)
 ```
 
 Single-node mode (AUTOGLUON_CLUSTER_SHARDS=0): one SPCS container per shard running
-`evaluate_synthetic_regression.py`. No Ray, no head/worker containers.
+`evaluate_synthetic_regression.py`. No Ray, no coordinator/worker containers.
+
+Default coordinator topology: 6 coordinators + 24 workers = **30 SPCS containers**
+for a 6×4 deployment. The coordinator merges the Ray head and AutoGluon driver into
+one container: it starts `ray start --head --num-cpus=0` as a subprocess, waits for
+the head to become reachable on localhost, then runs `autogluon_ray.py` with
+`RAY_HEAD_ADDRESS=localhost:<port>`. Workers connect to the coordinator's external
+DNS address. Only the 24 worker containers provide schedulable Ray CPUs.
+
+Default SPCS resource profiles:
+
+| Role | CPU request | CPU limit | Memory request | Memory limit |
+| --- | ---: | ---: | ---: | ---: |
+| Ray coordinator | 1 | 2 | 4Gi | 8Gi |
+| Ray worker | 4 | 4 | 16Gi | 16Gi |
+| Single-node AutoGluon | 4 | 4 | 16Gi | 16Gi |
+| Import/session probe | 0.5 | 0.5 | 2Gi | 2Gi |
+
+Override with `SYNREG_SPCS_RAY_COORDINATOR_CPU`, `SYNREG_SPCS_RAY_COORDINATOR_MEMORY`,
+`SYNREG_SPCS_RAY_WORKER_CPU`, `SYNREG_SPCS_RAY_WORKER_MEMORY`,
+`SYNREG_SPCS_SINGLE_NODE_CPU`, or `SYNREG_SPCS_SINGLE_NODE_MEMORY`. To separate
+requests from limits, use the same prefixes with `_CPU_REQUEST`, `_CPU_LIMIT`,
+`_MEMORY_REQUEST`, and `_MEMORY_LIMIT`.
+
+Object store memory overrides: `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES`
+(default 500 MB) and `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` (default 2 GB).
 
 ### Step 0 — Create the image repository (once)
 
@@ -2762,16 +2790,17 @@ CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
 
 ### Step 7b — SPCS evaluation (Ray distributed mode)
 
-Ray distributed mode: per shard, one head + N workers + one driver SPCS service.
-The driver connects to the head with `SYNREG_RAY_ADDRESS_MODE=explicit` and
-`RAY_HEAD_ADDRESS` set to the SPCS service DNS name of the head container.
-This is self-managed Ray — Snowflake does not manage the Ray cluster topology.
+Ray distributed mode: per shard, one coordinator SPCS service + N worker SPCS services.
+The coordinator merges the Ray head and AutoGluon driver into a single container:
+it starts `ray start --head --num-cpus=0` locally, then runs `autogluon_ray.py` with
+`RAY_HEAD_ADDRESS=localhost:<port>`. Workers connect to the coordinator via its external
+DNS address. This is self-managed Ray — Snowflake does not manage the Ray cluster topology.
 
 ```sql
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
   'spcs_job',   -- AUTOGLUON_RUNTIME_ENVIRONMENT (ignored)
-  6,            -- AUTOGLUON_CLUSTER_SHARDS (Ray clusters)
-  4,            -- AUTOGLUON_WORKERS_PER_SHARD
+  6,            -- AUTOGLUON_CLUSTER_SHARDS (Ray clusters; 6 coordinators)
+  4,            -- AUTOGLUON_WORKERS_PER_SHARD (4 workers per coordinator)
   1,            -- AUTOGLUON_TASK_CPUS
   6,            -- AUTOGLUON_CONCURRENT_CLUSTERS (must equal AUTOGLUON_CLUSTER_SHARDS)
   300,          -- AUTOGLUON_TIME_LIMIT
@@ -2779,13 +2808,14 @@ CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
 );
 ```
 
-**Per-shard Ray head DNS:** Each shard's head address is derived automatically from the shard's
-SPCS service name and `SPCS_RAY_HEAD_DNS_SUFFIX`. Set the suffix to the SPCS internal DNS
-domain for your Snowflake account:
+**Per-shard coordinator DNS:** Each shard's head address is derived automatically from the
+shard's coordinator SPCS service name and `SPCS_RAY_HEAD_DNS_SUFFIX`. Set the suffix to the
+SPCS internal DNS domain for your Snowflake account:
 
 ```bash
-# Format: <service_name_lower>.<suffix>:<port>
-# Example: shard 0 head service SPCS_RAY_HEAD_R0_0 → spcs_ray_head_r0_0.<suffix>:6379
+# SPCS DNS rule: underscores in the service name are replaced by dashes in DNS
+# Format: <service_name_lower_with_dashes>.<suffix>:<port>
+# Example: shard 0 coordinator SPCS_RAY_COORD_R0_0 → spcs-ray-coord-r0-0.<suffix>:6379
 export SPCS_RAY_HEAD_DNS_SUFFIX=<spcs_internal_dns_suffix>
 ```
 
@@ -2813,27 +2843,47 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
 - The SPCS backend uses `EXECUTE JOB SERVICE` which does not support `pip_requirements`
   or `runtime_environment` — all dependencies must be preinstalled in the image.
 - **`snowflakeService.enabled=true` is required** in the SPCS job spec for any container
-  that needs a Snowpark session (head, driver). The spec builder injects this automatically.
+  that needs a Snowpark session. The coordinator needs it to open a session for the
+  `autogluon_ray.py` driver subprocess. The spec builder injects this automatically.
   Do not disable it — without it, the OAuth token mount at `/snowflake/session/token` is
   absent and session creation fails.
-- **Self-managed Ray head starts with `--num-cpus=0`** so it does not consume schedulable
-  CPU from the pool. The driver's readiness check uses `expected_nodes = WORKERS_PER_SHARD + 1`
-  (head counts as a live node with zero CPUs) and `expected_cpus = WORKERS_PER_SHARD * TASK_CPUS`.
-- **Cluster identity verification:** The head announces a custom Ray resource
-  `spcs_cluster_id_<run_id>_<shard_index>=1`. The driver checks for this resource after
-  `ray.init()` to confirm it joined the correct shard's cluster. If the check fails, the
-  driver raises `RuntimeError` with a remediation message rather than submitting work to
-  the wrong cluster.
-- **Per-shard DNS with `SPCS_RAY_HEAD_DNS_SUFFIX`:** Each shard's head address is derived as
-  `<service_name_lower>.<suffix>:<port>`. Set `SPCS_RAY_HEAD_DNS_SUFFIX` to the SPCS internal
-  DNS domain. Do not set `SPCS_RAY_HEAD_DNS_OVERRIDE` — it is no longer supported and will
-  be ignored.
-- **Presigned URL expiry:** The default expiry is 86400 s (24 h). For very long runs, set
-  `SYNREG_PRESIGNED_URL_EXPIRY_SECONDS` to a larger value. The driver logs a warning if the
-  estimated shard runtime exceeds the expiry minus a 1 h buffer.
-- **Image verification:** At job submission the driver queries `SHOW IMAGE REPOSITORIES` and
-  warns (non-fatal) if the image reference does not match any known repository URL. Treat
-  `[WARN] Image ... was not matched` as a signal to verify `SYNREG_AUTOGLUON_SPCS_IMAGE`.
+- **Coordinator merges head + driver:** `spcs_ray_coordinator.py` starts `ray start --head
+  --num-cpus=0 --object-store-memory=<bytes>` as a subprocess, polls localhost until the
+  port is reachable, then executes `autogluon_ray.py` with `SYNREG_RAY_ADDRESS_MODE=explicit`
+  and `RAY_HEAD_ADDRESS=localhost:<port>`. The coordinator's exit code propagates from the
+  driver subprocess. The Ray head subprocess is always terminated in a `finally` block.
+- **Ray head starts with `--num-cpus=0`** (inside coordinator) so it does not consume
+  schedulable CPU from the pool. The driver's readiness check uses
+  `expected_nodes = WORKERS_PER_SHARD + 1` (head counts as a live node with zero CPUs) and
+  `expected_cpus = WORKERS_PER_SHARD * TASK_CPUS`.
+- **Workers advertise explicit `--num-cpus` and `--object-store-memory`** on the `ray start`
+  command so Ray's resource accounting is accurate. `AUTOGLUON_TASK_CPUS` controls
+  `--num-cpus`; `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` controls object store.
+- **TCP endpoint exposed for coordinator:** The coordinator SPCS spec includes a TCP endpoint
+  `ray-head` on port 6379 so workers can connect to it via the SPCS service DNS address.
+- **Resource sizing:** Worker and single-node containers keep worker-sized resources because
+  they run AutoGluon fits. Coordinators use a smaller profile (1/2 CPU, 4Gi/8Gi memory).
+  In the default 6×4 topology this keeps 24 schedulable worker containers while avoiding
+  worker-sized reservations for the 6 coordinator containers.
+- **Cluster identity verification:** The coordinator announces a custom Ray resource
+  `spcs_cluster_id_<run_id>_<shard_index>=1`. The driver (running inside coordinator) checks
+  for this resource after `ray.init()` to confirm it joined the correct shard's cluster. If
+  the check fails, the driver raises `RuntimeError` rather than submitting work to the wrong cluster.
+- **Per-shard DNS with `SPCS_RAY_HEAD_DNS_SUFFIX` and underscore→dash normalization:**
+  SPCS replaces underscores in service names with dashes in DNS. Each shard's coordinator
+  address is derived as `<service_name_with_underscores_to_dashes>.<suffix>:<port>`. For
+  example, coordinator service `SPCS_RAY_COORD_R0_0` → DNS hostname `spcs-ray-coord-r0-0.<suffix>`.
+  Set `SPCS_RAY_HEAD_DNS_SUFFIX` to the SPCS internal DNS domain. Do not set
+  `SPCS_RAY_HEAD_DNS_OVERRIDE` — it is no longer supported and will be ignored.
+- **Presigned URL expiry:** The default expiry is 86400 s (24 h). The driver uses
+  `SYNREG_PRESIGNED_URL_EXPIRY_POLICY=strict` by default and fails before submitting Ray work
+  if the conservative shard runtime estimate exceeds the expiry minus
+  `SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS` (default 3600). Set the policy to `warn` only
+  when you accept late-worker HTTP 403 risk.
+- **Image verification:** At job submission the driver first matches the exact repository URL
+  from `SYNREG_AUTOGLUON_SPCS_IMAGE`, then attempts exact image name/tag or digest matching via
+  `SHOW IMAGES IN IMAGE REPOSITORY`. If the procedure role cannot query those metadata views,
+  it logs a warning and you must manually run `SHOW IMAGES IN IMAGE REPOSITORY AUTOGLUON_IMAGE_REPOSITORY;`.
 - The Snowpark session probe (`run_synthetic_regression_autogluon_spcs_session_probe`) uses
   the SPCS-injected OAuth token at `/snowflake/session/token` with `SNOWFLAKE_ACCOUNT` and
   `SNOWFLAKE_HOST`. Run it as a SQL stored procedure call (Step 4), not as a bash command.

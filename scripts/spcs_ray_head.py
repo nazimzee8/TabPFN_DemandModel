@@ -5,7 +5,6 @@ or SIGTERM is received. Used in the SPCS self-managed Ray distributed AutoGluon 
 
 Environment variables:
   SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT   (default 6379)
-  SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT (default 8265)
   SPCS_RAY_HEAD_KEEPALIVE_SECONDS       (default 7200 = 2h)
   SPCS_RAY_RUN_ID                        Run ID injected by the orchestrator for cluster
                                           identity verification (Finding 6).
@@ -37,7 +36,6 @@ import time
 _SENTINEL_FILE = "/tmp/spcs_ray_head_done"
 
 head_port = int(os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT", "6379"))
-dashboard_port = int(os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_DASHBOARD_PORT", "8265"))
 keepalive_seconds = int(os.getenv("SPCS_RAY_HEAD_KEEPALIVE_SECONDS", "7200"))
 
 # Cluster identity (Finding 6)
@@ -52,7 +50,6 @@ def _log(event: str, **fields) -> None:
 _log(
     "spcs_ray_head_starting",
     head_port=head_port,
-    dashboard_port=dashboard_port,
     run_id=_run_id,
     shard_index=_shard_index,
 )
@@ -68,8 +65,7 @@ if _run_id and _shard_index != "":
 cmd = [
     "ray", "start", "--head",
     f"--port={head_port}",
-    "--dashboard-host=0.0.0.0",
-    f"--dashboard-port={dashboard_port}",
+    "--include-dashboard=false",
     # Finding 5: head contributes zero CPUs — only worker nodes provide schedulable capacity.
     # This prevents the readiness check from counting the head as a worker node.
     "--num-cpus=0",

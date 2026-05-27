@@ -2563,6 +2563,17 @@ class TestSPCSStaticAnalysis:
         from run_synthetic_regression_evaluation import _verify_spcs_image_in_repository
         assert callable(_verify_spcs_image_in_repository)
 
+    def test_spcs_image_reference_parser_extracts_repo_name_tag(self):
+        from run_synthetic_regression_evaluation import _parse_spcs_image_reference
+
+        parsed = _parse_spcs_image_reference(
+            "acct.registry.snowflakecomputing.com/db/schema/repo/tabpfn-autogluon-ray:1.0.0"
+        )
+        assert parsed["repository_url"] == "acct.registry.snowflakecomputing.com/db/schema/repo"
+        assert parsed["image_name"] == "tabpfn-autogluon-ray"
+        assert parsed["tag"] == "1.0.0"
+        assert parsed["digest"] is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: SPCS AutoGluon backend
@@ -2608,6 +2619,44 @@ class TestSPCSAutogluonBackend:
         from run_synthetic_regression_evaluation import _validate_autogluon_backend
         _validate_autogluon_backend("mljob", "", "test_proc")  # should not raise
 
+    def test_resolve_spcs_image_prefers_procedure_argument(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.delenv("SYNREG_AUTOGLUON_SPCS_IMAGE", raising=False)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "env/img:1.0")
+
+        assert mod._resolve_spcs_image("test_proc", "arg/img:2.0") == "arg/img:2.0"
+
+    def test_resolve_spcs_image_legacy_placeholder_uses_env(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.setenv("SYNREG_AUTOGLUON_SPCS_IMAGE", "env/img:1.0")
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "")
+
+        assert mod._resolve_spcs_image("test_proc", "spcs_job") == "env/img:1.0"
+
+    def test_resolve_spcs_image_missing_image_raises(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.delenv("SYNREG_AUTOGLUON_SPCS_IMAGE", raising=False)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "")
+
+        with pytest.raises(ValueError, match="SYNREG_AUTOGLUON_SPCS_IMAGE"):
+            mod._resolve_spcs_image("test_proc", "spcs_job")
+
+    def test_spcs_handler_missing_image_raises_before_submission(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.delenv("SYNREG_AUTOGLUON_SPCS_IMAGE", raising=False)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "")
+
+        with pytest.raises(ValueError, match="SYNREG_AUTOGLUON_SPCS_IMAGE"):
+            mod.run_synthetic_regression_autogluon_spcs_import_probe(
+                object(),
+                "spcs_job",
+                probe_count=1,
+            )
+
     def test_build_spcs_job_spec_contains_image(self):
         from run_synthetic_regression_evaluation import _build_spcs_job_spec
         spec = _build_spcs_job_spec(
@@ -2630,6 +2679,54 @@ class TestSPCSAutogluonBackend:
         # Must not contain runtime_environment or pip_requirements fields
         assert "runtime_environment" not in spec
         assert "pip_requirements" not in spec
+
+    def test_spcs_resource_profiles_have_role_specific_defaults(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        for prefix in (
+            "SYNREG_SPCS_RAY_HEAD",
+            "SYNREG_SPCS_RAY_DRIVER",
+            "SYNREG_SPCS_RAY_WORKER",
+        ):
+            for suffix in ("CPU", "MEMORY", "CPU_REQUEST", "CPU_LIMIT", "MEMORY_REQUEST", "MEMORY_LIMIT"):
+                monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+
+        assert mod._spcs_resources_for_role(mod.SPCS_RAY_HEAD_RESOURCES) == {
+            "cpu_request": "0.5",
+            "cpu_limit": "0.5",
+            "memory_request": "2Gi",
+            "memory_limit": "4Gi",
+        }
+        assert mod._spcs_resources_for_role(mod.SPCS_RAY_DRIVER_RESOURCES) == {
+            "cpu_request": "0.5",
+            "cpu_limit": "1",
+            "memory_request": "2Gi",
+            "memory_limit": "4Gi",
+        }
+        assert mod._spcs_resources_for_role(mod.SPCS_RAY_WORKER_RESOURCES) == {
+            "cpu_request": "4",
+            "cpu_limit": "4",
+            "memory_request": "16Gi",
+            "memory_limit": "16Gi",
+        }
+
+    def test_spcs_resource_profile_env_overrides_request_and_limit(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.setenv("SYNREG_SPCS_RAY_HEAD_CPU_REQUEST", "250m")
+        monkeypatch.setenv("SYNREG_SPCS_RAY_HEAD_CPU_LIMIT", "750m")
+        monkeypatch.setenv("SYNREG_SPCS_RAY_HEAD_MEMORY_REQUEST", "1Gi")
+        monkeypatch.setenv("SYNREG_SPCS_RAY_HEAD_MEMORY_LIMIT", "3Gi")
+        spec = mod._build_spcs_job_spec(
+            image="img:1.0",
+            args=["/app/scripts/spcs_ray_head.py"],
+            env_vars={},
+            resource_role=mod.SPCS_RAY_HEAD_RESOURCES,
+        )
+        assert 'cpu: "250m"' in spec
+        assert 'cpu: "750m"' in spec
+        assert 'memory: "1Gi"' in spec
+        assert 'memory: "3Gi"' in spec
 
     def test_execute_spcs_job_service_is_async(self):
         import run_synthetic_regression_evaluation as mod
@@ -2707,23 +2804,52 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", _mock_wait)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", _mock_ensure_pool)
-        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "myrepo/img:1.0")
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "env/img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
         monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
 
         session = object()
         mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
             session,
+            "procedure/img:2.0",
             autogluon_cluster_shards=0,
             autogluon_concurrent_clusters=2,
         )
         assert len(submitted) == 2
-        # Specs must contain the image
+        # Specs must contain the procedure image argument, not the legacy env/global fallback.
         for s in submitted:
-            assert "myrepo/img:1.0" in s["spec"]
+            assert "procedure/img:2.0" in s["spec"]
+            assert "env/img:1.0" not in s["spec"]
             # No runtime_environment or pip_requirements
             assert "runtime_environment" not in s["spec"]
             assert "pip_requirements" not in s["spec"]
+
+    def test_spcs_legacy_placeholder_still_uses_env_image(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted.append(spec)
+            return f"MOCK_{label.upper()}"
+
+        monkeypatch.setenv("SYNREG_AUTOGLUON_SPCS_IMAGE", "env/img:1.0")
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "")
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            "spcs_job",
+            autogluon_cluster_shards=0,
+            autogluon_concurrent_clusters=1,
+        )
+
+        assert submitted
+        assert "env/img:1.0" in submitted[0]
 
     def test_spcs_single_node_uses_correct_entrypoint(self, monkeypatch):
         import run_synthetic_regression_evaluation as mod
@@ -2749,36 +2875,30 @@ class TestSPCSAutogluonBackend:
         assert "/app/src/evaluate_synthetic_regression.py" in submitted[0]
 
     def test_spcs_distributed_ray_driver_uses_explicit_address(self, monkeypatch):
-        """SPCS distributed Ray mode must set SYNREG_RAY_ADDRESS_MODE=explicit, not 'auto'."""
-        import run_synthetic_regression_evaluation as mod
-        submitted_envs = []
+        """spcs_ray_coordinator.py must set SYNREG_RAY_ADDRESS_MODE=explicit when launching the driver.
 
-        def _mock_execute(session, *, label, compute_pool, spec):
-            submitted_envs.append({"label": label, "spec": spec})
-            return f"MOCK_{label.upper()}"
-
-        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
-        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
-        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
-        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
-        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
-        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
-
-        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
-            object(),
-            autogluon_cluster_shards=1,
-            autogluon_workers_per_shard=2,
-            autogluon_concurrent_clusters=1,
+        In the coordinator topology, head and driver are merged into one container.
+        SYNREG_RAY_ADDRESS_MODE is set programmatically inside spcs_ray_coordinator.py
+        (not in the SPCS spec), so this is verified via static analysis.
+        """
+        import pathlib
+        coordinator_src = (
+            pathlib.Path(__file__).parent.parent / "scripts" / "spcs_ray_coordinator.py"
+        ).read_text(encoding="utf-8")
+        assert "SYNREG_RAY_ADDRESS_MODE" in coordinator_src, (
+            "spcs_ray_coordinator.py must set SYNREG_RAY_ADDRESS_MODE in the subprocess env"
         )
-        # Find driver spec
-        driver_items = [s for s in submitted_envs if "driver" in s["label"].lower()]
-        assert driver_items, "No driver job submitted"
-        driver_spec = driver_items[0]["spec"]
-        assert "SYNREG_RAY_ADDRESS_MODE" in driver_spec
-        assert '"explicit"' in driver_spec
+        assert "explicit" in coordinator_src, (
+            "spcs_ray_coordinator.py must use explicit address mode, not 'auto'"
+        )
 
     def test_spcs_distributed_ray_driver_has_ray_head_address(self, monkeypatch):
-        """SPCS driver spec must include RAY_HEAD_ADDRESS env var."""
+        """Worker SPCS specs must include RAY_HEAD_ADDRESS pointing to the coordinator's DNS hostname.
+
+        In the coordinator topology there is no separate driver SPCS service; the driver runs
+        inside the coordinator container. Workers receive RAY_HEAD_ADDRESS in their SPCS spec
+        so they can join the correct Ray cluster.
+        """
         import run_synthetic_regression_evaluation as mod
         submitted_envs = []
 
@@ -2788,6 +2908,7 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -2799,13 +2920,13 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=1,
             autogluon_concurrent_clusters=1,
         )
-        driver_items = [s for s in submitted_envs if "driver" in s["label"].lower()]
-        assert driver_items
-        driver_spec = driver_items[0]["spec"]
-        assert "RAY_HEAD_ADDRESS" in driver_spec
+        worker_items = [s for s in submitted_envs if "worker" in s["label"].lower()]
+        assert worker_items, "No worker job submitted"
+        worker_spec = worker_items[0]["spec"]
+        assert "RAY_HEAD_ADDRESS" in worker_spec
 
     def test_spcs_distributed_creates_head_worker_driver(self, monkeypatch):
-        """SPCS distributed mode must submit head, workers, and driver for each shard."""
+        """SPCS distributed mode must submit coordinator and workers for each shard (no separate head/driver)."""
         import run_synthetic_regression_evaluation as mod
         submitted = []
 
@@ -2815,6 +2936,7 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -2826,17 +2948,91 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=2,
             autogluon_concurrent_clusters=2,
         )
-        # 2 shards x (1 head + 2 workers + 1 driver) = 8 jobs
-        assert len(submitted) == 8
-        head_labels = [l for l in submitted if "head" in l]
+        # 2 shards × (1 coordinator + 2 workers) = 6 jobs (head+driver merged into coordinator)
+        assert len(submitted) == 6
+        coord_labels = [l for l in submitted if "coord" in l]
         worker_labels = [l for l in submitted if "worker" in l]
-        driver_labels = [l for l in submitted if "driver" in l]
-        assert len(head_labels) == 2
+        assert len(coord_labels) == 2
         assert len(worker_labels) == 4
-        assert len(driver_labels) == 2
+        assert not any("head" in l for l in submitted), "No separate head services in coordinator topology"
+        assert not any("driver" in l for l in submitted), "No separate driver services in coordinator topology"
+
+    def test_spcs_default_topology_submits_30_containers_with_24_workers(self, monkeypatch):
+        """6×4 SPCS Ray run submits 30 containers: 6 coordinators + 24 workers (not 36)."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = []
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted.append(label)
+            return f"MOCK_{label.upper()}"
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=6,
+            autogluon_workers_per_shard=4,
+            autogluon_concurrent_clusters=6,
+        )
+
+        # 6 coordinators (merged head+driver) + 24 workers = 30 (not 36)
+        assert len(submitted) == 30
+        assert sum(1 for label in submitted if "coord" in label) == 6
+        assert sum(1 for label in submitted if "worker" in label) == 24
+        assert not any("head" in label for label in submitted)
+        assert not any("driver" in label for label in submitted)
+
+    def test_spcs_distributed_uses_role_specific_resource_profiles(self, monkeypatch):
+        """Coordinator and worker must use distinct resource profiles (coordinator: 1/2 cpu, 4Gi/8Gi mem)."""
+        import re
+        import run_synthetic_regression_evaluation as mod
+        submitted = {}
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted[label] = spec
+            return f"MOCK_{label.upper()}"
+
+        def _resource_values(spec):
+            return re.findall(r'(?:cpu|memory): "([^"]+)"', spec)
+
+        for prefix in (
+            "SYNREG_SPCS_RAY_COORDINATOR",
+            "SYNREG_SPCS_RAY_WORKER",
+        ):
+            for suffix in ("CPU", "MEMORY", "CPU_REQUEST", "CPU_LIMIT", "MEMORY_REQUEST", "MEMORY_LIMIT"):
+                monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+
+        # Coordinator default: cpu request=1, limit=2; memory request=4Gi, limit=8Gi
+        assert _resource_values(submitted["spcs_ray_coord_r0_0"]) == ["1", "4Gi", "2", "8Gi"]
+        # Worker default: cpu request=4, limit=4; memory request=16Gi, limit=16Gi
+        assert _resource_values(submitted["spcs_ray_worker_r0_0_0"]) == ["4", "16Gi", "4", "16Gi"]
 
     def test_spcs_distributed_waits_drivers_and_cancels_support_jobs(self, monkeypatch):
-        """Head/worker Ray services are long-running support jobs; only drivers are waited to completion."""
+        """Coordinator is waited to completion; workers are cancelled as support jobs after coordinator finishes."""
         import run_synthetic_regression_evaluation as mod
         waits = []
         cancels = []
@@ -2867,10 +3063,11 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=2,
             autogluon_concurrent_clusters=1,
         )
-        assert waits == ["spcs_ray_driver_r0_0"]
-        assert "spcs_ray_head_r0_0" in cancels
+        # Coordinator (merged head+driver) is waited; workers are cancelled as support jobs
+        assert waits == ["spcs_ray_coord_r0_0"]
         assert "spcs_ray_worker_r0_0_0" in cancels
         assert "spcs_ray_worker_r0_0_1" in cancels
+        assert not any("head" in c for c in cancels), "No separate head service in coordinator topology"
 
     def test_spcs_capacity_probe_uses_self_managed_ray_topology(self, monkeypatch):
         import run_synthetic_regression_evaluation as mod
@@ -2894,13 +3091,15 @@ class TestSPCSAutogluonBackend:
             concurrent_clusters=1,
         )
         labels = [label for label, _spec in submitted]
-        assert "spcs_cap_ray_head_r0_0" in labels
-        assert "spcs_cap_ray_worker_r0_0_0" in labels
-        assert "spcs_cap_ray_worker_r0_0_1" in labels
-        probe_specs = [spec for label, spec in submitted if label == "spcs_cap_ray_probe_r0_0"]
-        assert probe_specs
-        assert "SYNREG_RAY_ADDRESS_MODE" in probe_specs[0]
-        assert '"explicit"' in probe_specs[0]
+        assert "spcs_cap_ray_coord_r0_0" in labels
+        assert not any("head" in l for l in labels), "No separate head service in capacity probe"
+        assert not any("probe" in l and "worker" not in l and "coord" not in l for l in labels)
+        coord_specs = [spec for label, spec in submitted if label == "spcs_cap_ray_coord_r0_0"]
+        assert coord_specs
+        # Coordinator runs ray_capacity_probe.py via SPCS_RAY_DRIVER_SCRIPT
+        assert "ray_capacity_probe.py" in coord_specs[0]
+        # Coordinator spec includes TCP endpoint for Ray port
+        assert "ray-head" in coord_specs[0]
 
     def test_spcs_worker_access_probe_uses_self_managed_ray_topology(self, monkeypatch):
         import run_synthetic_regression_evaluation as mod
@@ -2924,13 +3123,13 @@ class TestSPCSAutogluonBackend:
             concurrent_clusters=1,
         )
         labels = [label for label, _spec in submitted]
-        assert "spcs_worker_probe_ray_head_r0_0" in labels
-        assert "spcs_worker_probe_ray_worker_r0_0_0" in labels
-        assert "spcs_worker_probe_ray_worker_r0_0_1" in labels
-        driver_specs = [spec for label, spec in submitted if label == "spcs_ag_worker_probe_r0_0"]
-        assert driver_specs
-        assert "SYNREG_RAY_ADDRESS_MODE" in driver_specs[0]
-        assert '"explicit"' in driver_specs[0]
+        assert "spcs_worker_probe_ray_coord_r0_0" in labels
+        assert not any("head" in l and "coord" not in l for l in labels)
+        coord_specs = [spec for label, spec in submitted if label == "spcs_worker_probe_ray_coord_r0_0"]
+        assert coord_specs
+        assert "autogluon_worker_access_probe.py" in coord_specs[0]
+        assert "SYNREG_WORKER_DATA_ACCESS_MODE" in coord_specs[0]
+        assert "driver_presigned_url" in coord_specs[0]
 
     def test_mljob_backend_unchanged(self, monkeypatch):
         """MLJob backend must still call submit_from_stage, not SPCS helpers."""
@@ -2979,6 +3178,26 @@ class TestSPCSAutogluonBackend:
         assert "create_snowpark_session" not in fn_src, (
             "_autogluon_work_item must not call create_snowpark_session (workers are session-free)"
         )
+
+    def test_worker_access_ray_task_body_does_not_create_snowpark_session(self):
+        """The worker-access probe Ray task must also stay session-free."""
+        import ast
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "scripts" / "autogluon_worker_access_probe.py"
+        source = src.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+
+        worker_fn = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_worker_access_probe_item":
+                worker_fn = node
+                break
+        assert worker_fn is not None, "_worker_access_probe_item not found"
+
+        fn_src = ast.get_source_segment(source, worker_fn) or ""
+        assert "Session.builder" not in fn_src
+        assert "getOrCreate" not in fn_src
+        assert "create_snowpark_session" not in fn_src
 
     def test_spcs_job_names_include_unique_run_id(self, monkeypatch):
         """Each SPCS orchestration call must embed a unique run ID in job service labels.
@@ -3071,7 +3290,7 @@ class TestSPCSAutogluonBackend:
 
     # Finding 4: Per-shard DNS derivation — each shard gets a unique head address
     def test_spcs_distributed_uses_per_shard_head_dns(self, monkeypatch):
-        """Each shard must receive a unique Ray head address derived from its service label."""
+        """Each shard's workers must receive a unique RAY_HEAD_ADDRESS derived from coordinator's service label."""
         import run_synthetic_regression_evaluation as mod
         submitted_envs: list[dict] = []
 
@@ -3095,32 +3314,31 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=1,
             autogluon_concurrent_clusters=2,
         )
-        # Find driver specs and extract their RAY_HEAD_ADDRESS values
-        driver_specs = [e["spec"] for e in submitted_envs if "driver" in e["label"]]
-        assert len(driver_specs) == 2, f"Expected 2 driver specs; got {len(driver_specs)}"
-        # Extract head addresses — they must be different for shard 0 vs shard 1
+        # Workers receive RAY_HEAD_ADDRESS pointing to their shard's coordinator; addresses must differ
+        worker_specs = [e["spec"] for e in submitted_envs if "worker" in e["label"]]
+        assert len(worker_specs) == 2, f"Expected 2 worker specs; got {len(worker_specs)}"
         import re
         head_addresses = [
             re.search(r'RAY_HEAD_ADDRESS[^"]*"([^"]+)"', s)
-            for s in driver_specs
+            for s in worker_specs
         ]
         addresses = [m.group(1) if m else None for m in head_addresses]
         assert addresses[0] is not None and addresses[1] is not None, (
-            f"Could not extract RAY_HEAD_ADDRESS from driver specs: {driver_specs}"
+            f"Could not extract RAY_HEAD_ADDRESS from worker specs: {worker_specs}"
         )
         assert addresses[0] != addresses[1], (
             f"Two shards must use different head addresses; got {addresses}"
         )
 
-    # Finding 6: Head env includes shard identity
+    # Finding 6: Coordinator env includes shard identity (merged head+driver)
     def test_spcs_head_env_includes_cluster_identity(self, monkeypatch):
-        """Head containers must receive SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX env vars."""
+        """Coordinator containers must receive SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX env vars."""
         import run_synthetic_regression_evaluation as mod
-        head_specs: list[str] = []
+        coord_specs: list[str] = []
 
         def _mock_execute(session, *, label, compute_pool, spec):
-            if "head" in label:
-                head_specs.append(spec)
+            if "coord" in label:
+                coord_specs.append(spec)
             return label.upper()
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
@@ -3139,20 +3357,20 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=1,
             autogluon_concurrent_clusters=1,
         )
-        assert head_specs, "No head specs captured"
-        spec = head_specs[0]
-        assert "SPCS_RAY_RUN_ID" in spec, "Head spec must include SPCS_RAY_RUN_ID"
-        assert "SPCS_RAY_SHARD_INDEX" in spec, "Head spec must include SPCS_RAY_SHARD_INDEX"
+        assert coord_specs, "No coordinator specs captured"
+        spec = coord_specs[0]
+        assert "SPCS_RAY_RUN_ID" in spec, "Coordinator spec must include SPCS_RAY_RUN_ID"
+        assert "SPCS_RAY_SHARD_INDEX" in spec, "Coordinator spec must include SPCS_RAY_SHARD_INDEX"
 
-    # Finding 6: Driver env includes cluster identity
+    # Finding 6: Coordinator env includes driver config (merged head+driver)
     def test_spcs_driver_env_includes_cluster_identity(self, monkeypatch):
-        """Driver containers must receive SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX."""
+        """Coordinator containers must carry both cluster identity and driver config env vars."""
         import run_synthetic_regression_evaluation as mod
-        driver_specs: list[str] = []
+        coord_specs: list[str] = []
 
         def _mock_execute(session, *, label, compute_pool, spec):
-            if "driver" in label:
-                driver_specs.append(spec)
+            if "coord" in label:
+                coord_specs.append(spec)
             return label.upper()
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
@@ -3171,20 +3389,28 @@ class TestSPCSAutogluonBackend:
             autogluon_workers_per_shard=1,
             autogluon_concurrent_clusters=1,
         )
-        assert driver_specs, "No driver specs captured"
-        spec = driver_specs[0]
+        assert coord_specs, "No coordinator specs captured"
+        spec = coord_specs[0]
+        # Cluster identity (formerly in head spec)
         assert "SPCS_RAY_RUN_ID" in spec
         assert "SPCS_RAY_SHARD_INDEX" in spec
+        # Driver config (formerly in driver spec) is now in the same coordinator container
+        assert "AUTOGLUON_TASK_CPUS" in spec, "Coordinator must include driver env vars"
 
     # Finding 5: Capacity probe uses workers+1 expected nodes in SPCS Ray mode
     def test_spcs_capacity_probe_expects_workers_plus_head(self, monkeypatch):
-        """Capacity probe EXPECTED_RAY_NODES must equal workers_per_shard + 1 in Ray mode."""
+        """Capacity probe EXPECTED_RAY_NODES must equal workers_per_shard + 1 in Ray mode.
+
+        In the coordinator topology the coordinator spec carries EXPECTED_RAY_NODES
+        (previously it was in a separate probe job spec).
+        """
         import run_synthetic_regression_evaluation as mod
-        probe_specs: list[str] = []
+        coord_specs: list[str] = []
 
         def _mock_execute(session, *, label, compute_pool, spec):
-            if "probe" in label and "worker" not in label and "head" not in label:
-                probe_specs.append(spec)
+            # Coordinator label: spcs_cap_ray_coord_<run_id>_<shard>
+            if "coord" in label and "worker" not in label:
+                coord_specs.append(spec)
             return label.upper()
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
@@ -3197,14 +3423,14 @@ class TestSPCSAutogluonBackend:
         mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
             object(), cluster_shards=1, workers_per_shard=3, concurrent_clusters=1,
         )
-        assert probe_specs, "No probe specs captured"
-        # EXPECTED_RAY_NODES must be 4 (3 workers + 1 head)
-        assert '"4"' in probe_specs[0] or "'4'" in probe_specs[0] or "EXPECTED_RAY_NODES" in probe_specs[0], (
-            f"Probe spec should contain EXPECTED_RAY_NODES=4 for 3 workers + 1 head; spec={probe_specs[0]}"
+        assert coord_specs, "No coordinator specs captured"
+        # EXPECTED_RAY_NODES must be 4 (3 workers + 1 coordinator head)
+        assert "EXPECTED_RAY_NODES" in coord_specs[0], (
+            f"Coordinator spec should contain EXPECTED_RAY_NODES; spec={coord_specs[0]}"
         )
         import re
-        match = re.search(r'EXPECTED_RAY_NODES[^"]*"(\d+)"', probe_specs[0])
-        assert match, f"Could not find EXPECTED_RAY_NODES in probe spec: {probe_specs[0]}"
+        match = re.search(r'EXPECTED_RAY_NODES[^"]*"(\d+)"', coord_specs[0])
+        assert match, f"Could not find EXPECTED_RAY_NODES in coordinator spec: {coord_specs[0]}"
         assert int(match.group(1)) == 4, f"Expected EXPECTED_RAY_NODES=4, got {match.group(1)}"
 
     # Finding 1: Image verification is called during SPCS evaluation
@@ -3231,3 +3457,499 @@ class TestSPCSAutogluonBackend:
         )
         assert verify_calls, "_verify_spcs_image_in_repository must be called during SPCS evaluation"
         assert "img:1.0" in verify_calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: SPCS Ray Coordinator Topology (30-container model)
+# ---------------------------------------------------------------------------
+
+class TestSPCSRayCoordinatorTopology:
+    """
+    Verify that the SPCS Ray distributed mode uses the corrected coordinator
+    topology: 6 coordinators (head+driver merged) + 24 workers = 30 containers
+    for a default 6×4 setup, not the old 6+24+6=36 container model.
+    """
+
+    def _setup_spcs_mocks(self, monkeypatch, cluster_shards=6, workers_per_shard=4):
+        """Return (submitted, mod) after patching SPCS helpers."""
+        import run_synthetic_regression_evaluation as mod
+
+        submitted = []
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted.append({"label": label, "compute_pool": compute_pool, "spec": spec})
+            return f"MOCK_{label.upper()}"
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "tst00001")
+        return submitted, mod
+
+    def test_6x4_spcs_ray_submits_30_containers(self, monkeypatch):
+        """6 shards × 4 workers must submit 6+24=30 containers (not 36)."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=6,
+            autogluon_workers_per_shard=4,
+            autogluon_concurrent_clusters=6,
+        )
+        assert len(submitted) == 30, (
+            f"Expected 30 containers (6 coordinators + 24 workers), got {len(submitted)}"
+        )
+
+    def test_no_separate_head_or_driver_services_in_spcs_ray_mode(self, monkeypatch):
+        """No label should match 'spcs_ray_head_*' or 'spcs_ray_driver_*' in Ray mode."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=6,
+            autogluon_workers_per_shard=4,
+            autogluon_concurrent_clusters=6,
+        )
+        labels = [s["label"] for s in submitted]
+        head_labels = [l for l in labels if l.startswith("spcs_ray_head_")]
+        driver_labels = [l for l in labels if l.startswith("spcs_ray_driver_")]
+        coord_labels = [l for l in labels if l.startswith("spcs_ray_coord_")]
+        worker_labels = [l for l in labels if l.startswith("spcs_ray_worker_")]
+
+        assert not head_labels, f"Found separate head services (should not exist): {head_labels}"
+        assert not driver_labels, f"Found separate driver services (should not exist): {driver_labels}"
+        assert len(coord_labels) == 6, f"Expected 6 coordinators, got {coord_labels}"
+        assert len(worker_labels) == 24, f"Expected 24 workers, got {len(worker_labels)}"
+
+    def test_coordinator_entrypoint_is_spcs_ray_coordinator_py(self, monkeypatch):
+        """Coordinator specs must invoke /app/scripts/spcs_ray_coordinator.py."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=2,
+        )
+        coord_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_coord_")
+        ]
+        assert coord_specs, "No coordinator specs found"
+        for spec in coord_specs:
+            assert "/app/scripts/spcs_ray_coordinator.py" in spec, (
+                f"Coordinator spec must reference spcs_ray_coordinator.py, got:\n{spec}"
+            )
+
+    def test_coordinator_spec_includes_tcp_endpoint_for_ray_port(self, monkeypatch):
+        """Coordinator YAML spec must expose the Ray head TCP port as an endpoint."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        coord_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_coord_")
+        ]
+        assert coord_specs
+        for spec in coord_specs:
+            assert "ray-head" in spec, "Coordinator spec must include 'ray-head' endpoint name"
+            assert "6379" in spec, "Coordinator spec must include port 6379"
+            assert "TCP" in spec, "Coordinator spec must specify TCP protocol"
+
+    def test_workers_receive_autogluon_task_cpus_env_var(self, monkeypatch):
+        """Worker specs must carry AUTOGLUON_TASK_CPUS in their env block."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=2,
+        )
+        worker_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_worker_")
+        ]
+        assert worker_specs, "No worker specs found"
+        for spec in worker_specs:
+            assert "AUTOGLUON_TASK_CPUS" in spec, (
+                f"Worker spec must contain AUTOGLUON_TASK_CPUS:\n{spec}"
+            )
+
+    def test_coordinator_resource_profile_distinct_from_worker(self, monkeypatch):
+        """SPCS_RAY_COORDINATOR_RESOURCES constant must exist and resolve differently from worker."""
+        import run_synthetic_regression_evaluation as mod
+
+        # Clear any env overrides
+        for prefix in ("SYNREG_SPCS_RAY_COORDINATOR", "SYNREG_SPCS_RAY_WORKER"):
+            for suffix in ("CPU", "MEMORY", "CPU_REQUEST", "CPU_LIMIT", "MEMORY_REQUEST", "MEMORY_LIMIT"):
+                monkeypatch.delenv(f"{prefix}_{suffix}", raising=False)
+
+        assert hasattr(mod, "SPCS_RAY_COORDINATOR_RESOURCES"), (
+            "SPCS_RAY_COORDINATOR_RESOURCES constant must exist in orchestration module"
+        )
+        assert mod.SPCS_RAY_COORDINATOR_RESOURCES != mod.SPCS_RAY_WORKER_RESOURCES
+
+        coord_profile = mod._spcs_resources_for_role(mod.SPCS_RAY_COORDINATOR_RESOURCES)
+        worker_profile = mod._spcs_resources_for_role(mod.SPCS_RAY_WORKER_RESOURCES)
+
+        assert coord_profile["cpu_request"] == "1", (
+            f"Coordinator default cpu_request should be '1', got {coord_profile['cpu_request']!r}"
+        )
+        assert coord_profile["cpu_request"] != worker_profile["cpu_request"], (
+            "Coordinator and worker must have different CPU defaults"
+        )
+
+    def test_coordinator_dns_uses_dashes_not_underscores(self, monkeypatch):
+        """Workers' RAY_HEAD_ADDRESS must use dashes in service name, matching SPCS DNS norm."""
+        import os
+        import run_synthetic_regression_evaluation as mod
+
+        submitted, mod2 = self._setup_spcs_mocks(monkeypatch, cluster_shards=1, workers_per_shard=1)
+        monkeypatch.setenv("SPCS_RAY_HEAD_DNS_SUFFIX", "myschema.mydb.snowflakecomputing.internal")
+
+        mod2.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        worker_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_worker_")
+        ]
+        assert worker_specs, "No worker spec found"
+        spec = worker_specs[0]
+        assert "RAY_HEAD_ADDRESS" in spec
+
+        # Extract the RAY_HEAD_ADDRESS value from spec
+        import re
+        match = re.search(r'RAY_HEAD_ADDRESS:\s*"?([^"\n]+)"?', spec)
+        assert match, f"RAY_HEAD_ADDRESS not found in spec:\n{spec}"
+        address = match.group(1).strip().strip('"')
+
+        # Service name portion (before the DNS suffix) must not contain underscores
+        service_part = address.split(".myschema.")[0]
+        assert "-" in service_part, (
+            f"DNS service name must use dashes (SPCS normalization), got: {service_part!r}"
+        )
+        assert "_" not in service_part, (
+            f"DNS service name must not contain underscores, got: {service_part!r}"
+        )
+
+    def test_single_node_spcs_mode_unchanged(self, monkeypatch):
+        """cluster_shards=0 must still use single-node path (no coordinator/worker services)."""
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=0,
+            autogluon_concurrent_clusters=3,
+        )
+        coord_labels = [s["label"] for s in submitted if s["label"].startswith("spcs_ray_coord_")]
+        worker_labels = [s["label"] for s in submitted if s["label"].startswith("spcs_ray_worker_")]
+        assert not coord_labels, f"Single-node mode must not submit coordinator services, got: {coord_labels}"
+        assert not worker_labels, f"Single-node mode must not submit worker services, got: {worker_labels}"
+        assert len(submitted) == 3, (
+            f"Single-node mode with 3 concurrent shards must submit 3 jobs, got {len(submitted)}"
+        )
+        for s in submitted:
+            assert "/app/src/evaluate_synthetic_regression.py" in s["spec"], (
+                f"Single-node spec must use evaluate_synthetic_regression.py entrypoint: {s['spec'][:200]}"
+            )
+
+    def test_spcs_ray_coordinator_starts_ray_head_with_zero_cpus(self):
+        """spcs_ray_coordinator.py must pass --num-cpus=0 to ray start."""
+        text = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "--num-cpus=0" in text, (
+            "spcs_ray_coordinator.py must pass '--num-cpus=0' to prevent the head "
+            "from consuming schedulable CPU capacity"
+        )
+
+    def test_spcs_ray_coordinator_starts_ray_head_with_object_store_memory(self):
+        """spcs_ray_coordinator.py must pass --object-store-memory to ray start."""
+        text = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "--object-store-memory=" in text, (
+            "spcs_ray_coordinator.py must pass '--object-store-memory' to cap Ray's "
+            "object store and prevent OOM on fixed-memory coordinator containers"
+        )
+
+    def test_spcs_ray_worker_passes_num_cpus_explicitly(self):
+        """spcs_ray_worker.py must pass --num-cpus=<N> to advertise CPU capacity to Ray."""
+        text = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "--num-cpus=" in text, (
+            "spcs_ray_worker.py must pass '--num-cpus=<N>' so Ray knows how many "
+            "schedulable CPUs each worker contributes"
+        )
+
+    def test_spcs_ray_worker_passes_object_store_memory(self):
+        """spcs_ray_worker.py must pass --object-store-memory to ray start."""
+        text = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "--object-store-memory=" in text, (
+            "spcs_ray_worker.py must pass '--object-store-memory' to bound Ray's "
+            "object store on worker containers"
+        )
+
+    def test_coordinator_object_store_env_passed_to_coordinator_spec(self, monkeypatch):
+        """SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES must appear in coordinator spec."""
+        monkeypatch.setenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", "999999")
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        coord_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_coord_")
+        ]
+        assert coord_specs, "No coordinator spec found"
+        assert "999999" in coord_specs[0], (
+            "Coordinator spec must contain the SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES value"
+        )
+
+    def test_worker_object_store_env_passed_to_worker_spec(self, monkeypatch):
+        """SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES must appear in worker spec."""
+        monkeypatch.setenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", "888888")
+        submitted, mod = self._setup_spcs_mocks(monkeypatch)
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        worker_specs = [
+            s["spec"] for s in submitted if s["label"].startswith("spcs_ray_worker_")
+        ]
+        assert worker_specs, "No worker spec found"
+        assert "888888" in worker_specs[0], (
+            "Worker spec must contain the SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES value"
+        )
+
+    def test_spec_endpoints_block_rendered_correctly(self):
+        """_build_spcs_job_spec must include endpoints YAML block when endpoints arg is given."""
+        from run_synthetic_regression_evaluation import _build_spcs_job_spec
+        spec = _build_spcs_job_spec(
+            image="img:1.0",
+            args=["/app/scripts/spcs_ray_coordinator.py"],
+            env_vars={},
+            endpoints=[{"name": "ray-head", "port": 6379, "protocol": "TCP"}],
+        )
+        assert "endpoints:" in spec
+        assert "ray-head" in spec
+        assert "6379" in spec
+        assert "TCP" in spec
+
+    def test_spec_no_endpoints_block_when_not_given(self):
+        """_build_spcs_job_spec must not include endpoints block when endpoints=None."""
+        from run_synthetic_regression_evaluation import _build_spcs_job_spec
+        spec = _build_spcs_job_spec(
+            image="img:1.0",
+            args=["/app/scripts/spcs_ray_worker.py"],
+            env_vars={},
+            endpoints=None,
+        )
+        assert "endpoints:" not in spec
+
+    def test_coordinator_script_runs_autogluon_ray_as_subprocess(self):
+        """spcs_ray_coordinator.py must run autogluon_ray.py as a child process."""
+        text = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "autogluon_ray.py" in text, (
+            "spcs_ray_coordinator.py must reference autogluon_ray.py as the driver script"
+        )
+        assert "subprocess" in text, (
+            "spcs_ray_coordinator.py must use subprocess to run the driver"
+        )
+
+    def test_coordinator_script_sets_explicit_address_mode(self):
+        """Coordinator must set SYNREG_RAY_ADDRESS_MODE=explicit for the driver subprocess."""
+        text = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "SYNREG_RAY_ADDRESS_MODE" in text
+        assert "explicit" in text
+        assert "RAY_HEAD_ADDRESS" in text
+
+
+# ---------------------------------------------------------------------------
+# Tests: SELECT * removal in dataset index query
+# ---------------------------------------------------------------------------
+
+class TestDatasetIndexSelectColumns:
+    """Verify that load_synthetic_regression_index uses an explicit column list."""
+
+    def test_load_index_does_not_use_select_star(self):
+        """load_synthetic_regression_index must not use SELECT *."""
+        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        fn_start = text.index("def load_synthetic_regression_index(")
+        fn_end_candidates = [
+            text.find("\ndef ", fn_start + 1),
+            text.find("\nclass ", fn_start + 1),
+        ]
+        fn_end = min(p for p in fn_end_candidates if p > 0)
+        fn_body = text[fn_start:fn_end]
+        assert "SELECT *" not in fn_body, (
+            "load_synthetic_regression_index must not use SELECT * — "
+            "use an explicit column list to avoid fetching payload columns"
+        )
+
+    def test_load_index_selects_required_columns(self):
+        """load_synthetic_regression_index must select known required columns."""
+        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        fn_start = text.index("def load_synthetic_regression_index(")
+        fn_end_candidates = [
+            text.find("\ndef ", fn_start + 1),
+            text.find("\nclass ", fn_start + 1),
+        ]
+        fn_end = min(p for p in fn_end_candidates if p > 0)
+        fn_body = text[fn_start:fn_end]
+        for col in ("suite_id", "stage_path", "prior_regime", "split_seeds"):
+            assert col in fn_body, (
+                f"load_synthetic_regression_index SQL must select column {col!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Tests: SPCS DNS domain resolution
+# ---------------------------------------------------------------------------
+
+class TestSPCSDNSDomainResolution:
+    def test_dns_domain_resolved_via_system_function_when_no_suffix(self, monkeypatch):
+        """When SPCS_RAY_HEAD_DNS_SUFFIX is not set, _spcs_dns_domain calls SYSTEM$GET_SERVICE_DNS_DOMAIN."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.delenv("SPCS_RAY_HEAD_DNS_SUFFIX", raising=False)
+        mock_session = MagicMock()
+        mock_session.sql.return_value.collect.return_value = [["abc123.svc.spcs.internal"]]
+        domain = mod._spcs_dns_domain(mock_session)
+        assert domain == "abc123.svc.spcs.internal"
+        mock_session.sql.assert_called_once()
+        assert "SYSTEM$GET_SERVICE_DNS_DOMAIN" in mock_session.sql.call_args[0][0]
+
+    def test_spcs_ray_head_dns_suffix_overrides_system_function(self, monkeypatch):
+        """When SPCS_RAY_HEAD_DNS_SUFFIX is set, it takes priority and no SQL is called."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.setenv("SPCS_RAY_HEAD_DNS_SUFFIX", "override.example.internal")
+        mock_session = MagicMock()
+        domain = mod._spcs_dns_domain(mock_session)
+        assert domain == "override.example.internal"
+        mock_session.sql.assert_not_called()
+
+    def test_dns_domain_returns_empty_string_when_system_function_fails(self, monkeypatch):
+        """If both override and SYSTEM$ function are unavailable, returns empty string gracefully."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.delenv("SPCS_RAY_HEAD_DNS_SUFFIX", raising=False)
+        mock_session = MagicMock()
+        mock_session.sql.side_effect = Exception("SQL error")
+        domain = mod._spcs_dns_domain(mock_session)
+        assert domain == ""
+
+    def test_coordinator_hostname_uses_system_dns_domain(self, monkeypatch):
+        """Production evaluation uses _spcs_dns_domain result in coordinator hostnames."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.delenv("SPCS_RAY_HEAD_DNS_SUFFIX", raising=False)
+        submitted_envs = []
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted_envs.append({"label": label, "spec": spec})
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        mock_session = MagicMock()
+        mock_session.sql.return_value.collect.return_value = [["auto-resolved.svc.spcs.internal"]]
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            mock_session,
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        worker_items = [s for s in submitted_envs if "worker" in s["label"]]
+        assert worker_items
+        assert "auto-resolved.svc.spcs.internal" in worker_items[0]["spec"]
+
+
+# ---------------------------------------------------------------------------
+# Tests: Additional coordinator topology guards
+# ---------------------------------------------------------------------------
+
+class TestSPCSCoordinatorTopologyGuards:
+    """Additional tests for coordinator topology correctness and guards."""
+
+    def test_max_in_flight_above_workers_per_shard_raises(self):
+        """autogluon_ray.py must fail fast when MAX_IN_FLIGHT > WORKERS_PER_SHARD."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "scripts" / "autogluon_ray.py"
+        text = src.read_text(encoding="utf-8")
+        assert "MAX_IN_FLIGHT > WORKERS_PER_SHARD" in text
+        assert "RuntimeError" in text
+
+    def test_duplicate_work_item_guard_exists(self):
+        """autogluon_ray.py must check for duplicate work items before Ray submission."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "scripts" / "autogluon_ray.py"
+        text = src.read_text(encoding="utf-8")
+        assert "Duplicate atomic work item" in text
+
+    def test_coordinator_driver_script_configurable_via_env_var(self):
+        """spcs_ray_coordinator.py must read SPCS_RAY_DRIVER_SCRIPT to configure driver."""
+        import pathlib
+        src = pathlib.Path(__file__).parent.parent / "scripts" / "spcs_ray_coordinator.py"
+        text = src.read_text(encoding="utf-8")
+        assert "SPCS_RAY_DRIVER_SCRIPT" in text
+
+    def test_capacity_probe_coordinator_runs_ray_capacity_probe(self, monkeypatch):
+        """Capacity probe coordinator spec must reference ray_capacity_probe.py via SPCS_RAY_DRIVER_SCRIPT."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = {}
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted[label] = spec
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        coord_labels = [l for l in submitted if "coord" in l]
+        assert coord_labels, "No coordinator label found in capacity probe"
+        coord_spec = submitted[coord_labels[0]]
+        assert "ray_capacity_probe.py" in coord_spec
+        assert not any("head" in l and "coord" not in l for l in submitted), "No separate head in capacity probe"
+
+    def test_worker_access_probe_coordinator_runs_worker_access_probe(self, monkeypatch):
+        """Worker access probe coordinator spec must reference autogluon_worker_access_probe.py."""
+        import run_synthetic_regression_evaluation as mod
+        submitted = {}
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            submitted[label] = spec
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+            object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+        )
+        coord_labels = [l for l in submitted if "coord" in l]
+        assert coord_labels, "No coordinator label found in worker access probe"
+        coord_spec = submitted[coord_labels[0]]
+        assert "autogluon_worker_access_probe.py" in coord_spec
+        assert not any("head" in l and "coord" not in l for l in submitted)

@@ -56,6 +56,16 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_evaluation_legacy_concurrency';
 
 -- Combined Suite — Split-Phase Procedures
+-- Drop older non-AutoGluon phase overloads that carried AUTOGLUON_RUNTIME_ENVIRONMENT
+-- only for signature symmetry. DeepSet, baseline, and aggregation use BENCH_RUNTIME_ENVIRONMENT.
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_deepset_evaluation(STRING, STRING);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_baseline_evaluation(STRING, STRING);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_baseline_evaluation(STRING, STRING, INTEGER);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_baseline_evaluation(STRING, STRING, INTEGER, INTEGER);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_aggregation(STRING, STRING);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_aggregation(STRING, STRING, INTEGER);
+DROP PROCEDURE IF EXISTS run_synthetic_regression_combined_aggregation(STRING, STRING, INTEGER, INTEGER, INTEGER);
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_prep(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -71,8 +81,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_prep(
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_prep';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_deepset_evaluation(
-  BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+  BENCH_RUNTIME_ENVIRONMENT STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -82,8 +91,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_deepset_evaluation
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_deepset_evaluation';
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
-  BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+  BENCH_RUNTIME_ENVIRONMENT STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -94,7 +102,6 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluatio
 
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
   BASELINE_CONCURRENT_NODES INTEGER
 )
   RETURNS STRING
@@ -110,7 +117,6 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluatio
 -- Increasing BASELINE_SHARDS increases required concurrent CPU nodes and output file count.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_baseline_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
   BASELINE_SHARDS INTEGER,
   BASELINE_CONCURRENT_NODES INTEGER
 )
@@ -186,8 +192,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_evaluati
 
 -- Combined aggregation — two-argument form defaults to SYNREG_AUTOGLUON_CLUSTER_SHARDS_DEFAULT=6:
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
-  BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+  BENCH_RUNTIME_ENVIRONMENT STRING
 )
   RETURNS STRING
   LANGUAGE PYTHON
@@ -199,7 +204,6 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
 -- Combined aggregation — three-argument form with explicit expected AutoGluon shard count:
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
   EXPECTED_AUTOGLUON_SHARDS INTEGER
 )
   RETURNS STRING
@@ -211,10 +215,9 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
 
 -- Combined aggregation - full explicit form matching the Python implementation
 -- signature after session:
---   (bench_rt, ag_rt, expected_ag_shards, expected_baseline_shards, expected_deepset_shards)
+--   (bench_rt, expected_ag_shards, expected_baseline_shards, expected_deepset_shards)
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_aggregation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
   EXPECTED_AUTOGLUON_SHARDS INTEGER,
   EXPECTED_BASELINE_SHARDS INTEGER,
   EXPECTED_DEEPSET_SHARDS INTEGER
@@ -294,10 +297,9 @@ SHOW IMAGES IN IMAGE REPOSITORY AUTOGLUON_IMAGE_REPOSITORY;
 -- Step D: Create the SPCS stored procedures.
 --
 -- SPCS import probe — measures container startup latency with preinstalled deps (no pip).
--- AUTOGLUON_RUNTIME_ENVIRONMENT is accepted for API symmetry but is not used by SPCS;
--- the OCI image (SYNREG_AUTOGLUON_SPCS_IMAGE) replaces the runtime environment.
+-- AUTOGLUON_SPCS_IMAGE is the full OCI image reference in the Snowflake image repository.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_import_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   PROBE_COUNT INTEGER
 )
   RETURNS STRING
@@ -307,10 +309,23 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_import_probe
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_import_probe';
 
+-- SPCS Snowpark session probe: validates OAuth token injection (snowflakeService.enabled=true)
+-- and Snowpark session creation inside SPCS containers.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_spcs_session_probe(
+  AUTOGLUON_SPCS_IMAGE STRING,
+  PROBE_COUNT INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_autogluon_spcs_session_probe';
+
 -- SPCS capacity probe — verifies custom-image containers start on AUTOGLUON_CPU_POOL
 -- and that Ray is importable. No AutoGluon training.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
@@ -325,7 +340,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_cap
 -- SPCS worker-access probe — driver queries index, builds compact item dicts,
 -- workers validate dataset access via presigned URLs. No AutoGluon training.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
@@ -342,7 +357,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_wor
 -- Single-node mode: AUTOGLUON_CLUSTER_SHARDS = 0, one SPCS job service per shard.
 -- Ray distributed mode: AUTOGLUON_CLUSTER_SHARDS > 0, self-managed Ray head+workers+driver.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation(
-  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_SPCS_IMAGE STRING,
   AUTOGLUON_CLUSTER_SHARDS INTEGER,
   AUTOGLUON_WORKERS_PER_SHARD INTEGER,
   AUTOGLUON_TASK_CPUS INTEGER,
@@ -367,56 +382,64 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_eva
 --      docker push <account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0
 --   2. Verify the push in Snowflake:
 --      SHOW IMAGES IN IMAGE REPOSITORY AUTOGLUON_IMAGE_REPOSITORY;
---   3. Set image reference and DNS suffix for Ray mode:
-ALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE = '<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0';
+--   3. Use the full pushed image reference as the first argument to every SPCS call:
+--      <image_ref> = '<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY/tabpfn-autogluon-ray:1.0.0'
+--      Optional legacy fallback for old calls that still pass 'spcs_job':
+--      ALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE = '<image_ref>';
 --      For multi-shard Ray mode, set per-shard DNS suffix (schema/db in lowercase):
 ALTER SESSION SET SPCS_RAY_HEAD_DNS_SUFFIX = 'tabpfn_schema.tabpfn_db.snowflakecomputing.internal';
 --
 -- Step 1: Import probe — verify image starts and AutoGluon/Ray/Snowpark imports succeed.
-CALL run_synthetic_regression_autogluon_spcs_import_probe('spcs_job', 1);
+CALL run_synthetic_regression_autogluon_spcs_import_probe('<image_ref>', 1);
 --
 -- Step 2: Session probe — verify Snowflake OAuth token injection (snowflakeService.enabled=true)
 --         and that Snowpark session creation works inside SPCS containers.
 --         Required for drivers to query SYNTHETIC_REGRESSION_DATASET_INDEX and GET_PRESIGNED_URL().
-CALL run_synthetic_regression_autogluon_spcs_session_probe('spcs_job', 1);
+CALL run_synthetic_regression_autogluon_spcs_session_probe('<image_ref>', 1);
 --
 -- Step 3: Capacity probe — single-node mode (CLUSTER_SHARDS=0), 6 concurrent probes.
 --         Then Ray mode (CLUSTER_SHARDS=1, 2 workers) to validate self-managed Ray topology.
-CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('spcs_job', 0, 1, 6);
-CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('spcs_job', 1, 2, 1);
+CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('<image_ref>', 0, 1, 6);
+CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('<image_ref>', 1, 2, 1);
 --
 -- Step 4: Worker-access probe — validate presigned-URL dataset loading via Ray workers.
-CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe('spcs_job', 0, 1, 6);
+CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe('<image_ref>', 0, 1, 6);
 --
 -- Step 5: One-shard mini evaluation — verify end-to-end with 1 shard in single-node mode.
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
-  'spcs_job', 0, 1, 1, 1, 300, 'best_quality'
+  '<image_ref>', 0, 1, 1, 1, 300, 'best_quality'
 );
 --
 -- Step 6a: Full evaluation — single-node mode (no Ray, one job per shard, 6 shards):
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
-  'spcs_job', 0, 1, 1, 6, 300, 'best_quality'
+  '<image_ref>', 0, 1, 1, 6, 300, 'best_quality'
 );
 --
 -- Step 6b: Full evaluation — Ray distributed mode (6 clusters x 4 workers, self-managed Ray).
 --   Each shard's Ray head gets a unique address derived from SPCS_RAY_HEAD_DNS_SUFFIX (set above).
 --   Head starts with --num-cpus=0; driver expects workers_per_shard+1 live nodes.
 --   Each driver verifies cluster identity via custom Ray resource before submitting work.
+--   Separated topology: 6 heads + 24 workers + 6 drivers = 36 containers.
+--   Only the 24 worker containers are schedulable AutoGluon workers; heads/drivers are downsized.
+--   Default resources: head 0.5 CPU, 2Gi/4Gi memory; driver 0.5/1 CPU, 2Gi/4Gi memory;
+--   worker and single-node AutoGluon 4 CPU, 16Gi memory.
+--   Override with SYNREG_SPCS_RAY_HEAD_*, SYNREG_SPCS_RAY_DRIVER_*,
+--   SYNREG_SPCS_RAY_WORKER_*, or SYNREG_SPCS_SINGLE_NODE_*.
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
-  'spcs_job', 6, 4, 1, 6, 300, 'best_quality'
+  '<image_ref>', 6, 4, 1, 6, 300, 'best_quality'
 );
 --
 -- Step 7: Aggregation (N=6 must match cluster_shards used in Step 6a or 6b):
-CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', 6);
 
 -- ===========================================================================
 -- Combined split-phase execution — Ray distributed AutoGluon (default):
 -- ===========================================================================
 -- Step 1: Run combined split phases.
 CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
-CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311', '2.5.0-py311');
+CALL run_synthetic_regression_combined_deepset_evaluation('2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
-CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', '2.5.0-py311', 6);
+CALL run_synthetic_regression_combined_baseline_evaluation('2.5.0-py311', 6);
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
 -- Ray mode: 6 clusters x 4 workers = 24 concurrent CPU_X64_M nodes, 1 CPU per fit task
 CALL run_synthetic_regression_combined_autogluon_evaluation(
@@ -424,4 +447,4 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 -- Aggregation expects 6 AutoGluon shard files (N=6 matches cluster_shards above)
-CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', '2.5.0-py311', 6);
+CALL run_synthetic_regression_combined_aggregation('2.5.0-py311', 6);

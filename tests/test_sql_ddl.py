@@ -392,3 +392,66 @@ class TestSPCSSQLDDL:
     def test_docs_mention_self_managed_ray(self):
         training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
         assert "self-managed" in training_md.lower() or "self managed" in training_md.lower()
+
+    def test_docs_mention_spcs_resource_profiles_and_container_counts(self):
+        training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
+        assert "36 SPCS" in training_md
+        assert "24 worker" in training_md
+        assert "SYNREG_SPCS_RAY_HEAD_CPU" in training_md
+        assert "SYNREG_SPCS_RAY_DRIVER_CPU" in training_md
+
+    def test_sql_runbook_mentions_spcs_resource_profiles(self):
+        sql = self._sql()
+        assert "36 containers" in sql
+        assert "24 worker" in sql
+        assert "SYNREG_SPCS_RAY_HEAD_*" in sql
+        assert "SYNREG_SPCS_RAY_DRIVER_*" in sql
+
+
+class TestCombined04SPCSSQLDDL:
+    def _sql(self) -> str:
+        return (ROOT / "sql" / "04_synthetic_regression_evaluation_pipeline.sql").read_text()
+
+    def test_spcs_session_probe_procedure_exists(self):
+        assert "run_synthetic_regression_autogluon_spcs_session_probe" in self._sql()
+
+    def test_spcs_procedure_signatures_use_explicit_image_arg(self):
+        import re
+
+        sql = self._sql()
+        procedure_names = [
+            "run_synthetic_regression_autogluon_spcs_import_probe",
+            "run_synthetic_regression_autogluon_spcs_session_probe",
+            "run_synthetic_regression_combined_autogluon_spcs_capacity_probe",
+            "run_synthetic_regression_combined_autogluon_spcs_worker_access_probe",
+            "run_synthetic_regression_combined_autogluon_spcs_evaluation",
+        ]
+        for procedure_name in procedure_names:
+            assert re.search(
+                rf"CREATE OR REPLACE PROCEDURE {procedure_name}\(\s*AUTOGLUON_SPCS_IMAGE STRING",
+                sql,
+            ), f"{procedure_name} must take AUTOGLUON_SPCS_IMAGE as its first argument"
+
+    def test_spcs_runbook_calls_pass_image_ref_first(self):
+        import re
+
+        sql = self._sql()
+        assert "CALL run_synthetic_regression_autogluon_spcs_import_probe('<image_ref>', 1);" in sql
+        assert "CALL run_synthetic_regression_autogluon_spcs_session_probe('<image_ref>', 1);" in sql
+        assert (
+            "CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('<image_ref>', 0, 1, 6);"
+            in sql
+        )
+        assert (
+            "CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe('<image_ref>', 0, 1, 6);"
+            in sql
+        )
+        assert re.search(
+            r"CALL run_synthetic_regression_combined_autogluon_spcs_evaluation\(\s*'<image_ref>'",
+            sql,
+        )
+        assert not re.search(
+            r"CALL run_synthetic_regression_[^(]*spcs[^(]*\(\s*'spcs_job'",
+            sql,
+        )
+        assert "\nALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE" not in sql
