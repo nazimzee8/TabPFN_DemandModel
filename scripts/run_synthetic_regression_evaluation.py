@@ -158,6 +158,13 @@ SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS = int(
 SYNREG_AUTOGLUON_SPCS_RAY_POLL_SECONDS = int(
     os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_POLL_SECONDS", "10")
 )
+SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS = int(
+    os.getenv("SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS", "0")
+)
+SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE = (
+    os.getenv("SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", "false").lower()
+    in ("1", "true", "yes")
+)
 
 SPCS_RAY_HEAD_RESOURCES = "ray_head"
 SPCS_RAY_DRIVER_RESOURCES = "ray_driver"
@@ -3719,11 +3726,30 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                     endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((w_label, w_job))
+                if SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS > 0:
+                    print(
+                        f"[INFO] worker submit stagger: run_id={run_id!r} "
+                        f"shard_index={shard_index} worker_index={w} "
+                        f"sleep_seconds={SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS}",
+                        flush=True,
+                    )
+                    time.sleep(SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS)
 
+        _eval_ok = False
         try:
             _wait_spcs_job_group(coordinator_jobs, session)
+            _eval_ok = True
         finally:
-            _cancel_spcs_job_group(support_jobs, session)
+            if not _eval_ok and SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE:
+                _keep_labels = [lbl for lbl, _ in support_jobs]
+                print(
+                    f"[WARNING] SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true: coordinator "
+                    f"jobs failed; support jobs left running for diagnostics: {_keep_labels}. "
+                    "Inspect logs then cancel manually.",
+                    flush=True,
+                )
+            else:
+                _cancel_spcs_job_group(support_jobs, session)
         return (
             f"{proc}: ok backend=spcs_job suite_id={COMBINED_SUITE_ID} "
             f"mode=ray_clusters cluster_shards={cluster_shards} "
@@ -3821,6 +3847,9 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
     cluster_shards=None,
     workers_per_shard=None,
     concurrent_clusters=None,
+    ray_ready_timeout_seconds=None,
+    worker_submit_stagger_seconds=None,
+    keep_support_jobs_on_failure=None,
 ) -> str:
     """SPCS backend capacity probe: verify that custom-image containers start and Ray imports.
 
@@ -3839,6 +3868,8 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
     )
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
     run_id = _spcs_run_id()
+    _stagger = worker_submit_stagger_seconds if worker_submit_stagger_seconds is not None else SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS
+    _keep = keep_support_jobs_on_failure if keep_support_jobs_on_failure is not None else SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE
 
     probe_count = plan.concurrent_units
     print(
@@ -3894,6 +3925,7 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                 "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
                 "CAPACITY_PROBE_SLEEP_SECONDS": "10",
                 **_spcs_ray_port_env_vars(),
+                **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
             }
             coord_job = _submit_spcs_synreg(
                 session=session,
@@ -3927,12 +3959,50 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
                     endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((worker_label, worker_job))
+                if _stagger > 0:
+                    print(
+                        f"[INFO] worker submit stagger: run_id={run_id!r} "
+                        f"shard_index={shard_index} worker_index={worker_index} "
+                        f"sleep_seconds={_stagger}",
+                        flush=True,
+                    )
+                    time.sleep(_stagger)
 
+        _cap_ok = False
         try:
             _wait_spcs_job_group(coordinator_jobs, session)
+            _cap_ok = True
         finally:
-            _cancel_spcs_job_group(support_jobs, session)
+            if not _cap_ok and _keep:
+                _keep_labels = [lbl for lbl, _ in support_jobs]
+                print(
+                    f"[WARNING] SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true: coordinator "
+                    f"jobs failed; support jobs left running for diagnostics: {_keep_labels}. "
+                    "Inspect logs then cancel manually.",
+                    flush=True,
+                )
+            else:
+                _cancel_spcs_job_group(support_jobs, session)
     return f"{proc}: ok backend=spcs_job probe_count={probe_count} mode={plan.mode}"
+
+
+def run_synthetic_regression_combined_autogluon_spcs_capacity_probe_default(
+    session,
+    ag_rt: str = "spcs_job",
+) -> str:
+    return run_synthetic_regression_combined_autogluon_spcs_capacity_probe(session, ag_rt)
+
+
+def run_synthetic_regression_combined_autogluon_spcs_capacity_probe_4arg(
+    session,
+    ag_rt: str,
+    cluster_shards: int,
+    workers_per_shard: int,
+    concurrent_clusters: int,
+) -> str:
+    return run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+        session, ag_rt, cluster_shards, workers_per_shard, concurrent_clusters
+    )
 
 
 def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
@@ -3941,6 +4011,8 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
     cluster_shards=None,
     workers_per_shard=None,
     concurrent_clusters=None,
+    worker_submit_stagger_seconds=None,
+    keep_support_jobs_on_failure=None,
 ) -> str:
     """SPCS backend worker dataset-access probe.
 
@@ -3959,6 +4031,8 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
     )
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
     run_id = _spcs_run_id()
+    _stagger = worker_submit_stagger_seconds if worker_submit_stagger_seconds is not None else SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS
+    _keep = keep_support_jobs_on_failure if keep_support_jobs_on_failure is not None else SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE
     worker_access_mode = os.getenv("SYNREG_WORKER_DATA_ACCESS_MODE", "driver_presigned_url")
     presigned_url_expiry_seconds = os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400")
     print(
@@ -4032,10 +4106,29 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
                     endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((worker_label, worker_job))
+                if _stagger > 0:
+                    print(
+                        f"[INFO] worker submit stagger: run_id={run_id!r} "
+                        f"shard_index={shard_index} worker_index={worker_index} "
+                        f"sleep_seconds={_stagger}",
+                        flush=True,
+                    )
+                    time.sleep(_stagger)
+        _probe_ok = False
         try:
             _wait_spcs_job_group(driver_jobs, session)
+            _probe_ok = True
         finally:
-            _cancel_spcs_job_group(support_jobs, session)
+            if not _probe_ok and _keep:
+                _keep_labels = [lbl for lbl, _ in support_jobs]
+                print(
+                    f"[WARNING] SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true: coordinator "
+                    f"jobs failed; support jobs left running for diagnostics: {_keep_labels}. "
+                    "Inspect logs then cancel manually.",
+                    flush=True,
+                )
+            else:
+                _cancel_spcs_job_group(support_jobs, session)
     else:
         jobs = []
         for shard_index in range(shard_count):
@@ -4066,6 +4159,13 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
         f"{proc}: ok backend=spcs_job mode={plan.mode} "
         f"concurrent_units={plan.concurrent_units} access_mode={worker_access_mode!r}"
     )
+
+
+def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe_default(
+    session,
+    ag_rt: str = "spcs_job",
+) -> str:
+    return run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(session, ag_rt)
 
 
 # Main (for direct invocation / stored proc driver entry)

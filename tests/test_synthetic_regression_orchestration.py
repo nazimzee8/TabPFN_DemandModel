@@ -2629,6 +2629,102 @@ class TestSPCSStaticAnalysis:
         assert "SYNREG_SPCS_RAY_MAX_WORKER_PORT" in env
         assert len(env) == 6
 
+    def test_capacity_probe_timeout_default_is_900(self):
+        src = (ROOT / "scripts" / "ray_capacity_probe.py").read_text()
+        assert '"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 900' in src, (
+            "ray_capacity_probe.py must default SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS to 900"
+        )
+
+    def test_capacity_probe_timeout_env_var_is_honoured(self):
+        """Env var name must still be SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS."""
+        src = (ROOT / "scripts" / "ray_capacity_probe.py").read_text()
+        assert "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS" in src
+        assert "_env_int(" in src  # uses override-aware helper
+
+    # Signal handling: worker
+    def test_spcs_ray_worker_registers_sigterm(self):
+        src = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "signal.SIGTERM" in src, "spcs_ray_worker.py must register a SIGTERM handler"
+
+    def test_spcs_ray_worker_registers_sigint(self):
+        src = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "signal.SIGINT" in src, "spcs_ray_worker.py must register a SIGINT handler"
+
+    def test_spcs_ray_worker_logs_signal_received(self):
+        src = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "spcs_ray_worker_signal_received" in src
+
+    def test_spcs_ray_worker_logs_exit_after_signal(self):
+        src = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "spcs_ray_worker_exit_after_signal" in src
+
+    def test_spcs_ray_worker_dumps_ray_logs_in_signal_handler(self):
+        src = (ROOT / "scripts" / "spcs_ray_worker.py").read_text()
+        assert "_dump_ray_logs" in src
+        assert "signal.SIGTERM" in src  # signal handler is registered
+
+    # Signal handling: coordinator
+    def test_spcs_ray_coordinator_registers_sigterm(self):
+        src = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "signal.SIGTERM" in src, "spcs_ray_coordinator.py must register a SIGTERM handler"
+
+    def test_spcs_ray_coordinator_registers_sigint(self):
+        src = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "signal.SIGINT" in src, "spcs_ray_coordinator.py must register a SIGINT handler"
+
+    def test_spcs_ray_coordinator_logs_signal_received(self):
+        src = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "spcs_ray_coordinator_signal_received" in src
+
+    def test_spcs_ray_coordinator_logs_exit_after_signal(self):
+        src = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "spcs_ray_coordinator_exit_after_signal" in src
+
+    # JSON logging: capacity probe
+    def test_ray_capacity_probe_uses_json_log_helper(self):
+        src = (ROOT / "scripts" / "ray_capacity_probe.py").read_text()
+        assert "import json" in src
+        assert "_log(" in src
+
+    def test_ray_capacity_probe_emits_readiness_event(self):
+        src = (ROOT / "scripts" / "ray_capacity_probe.py").read_text()
+        assert "ray_capacity_probe_readiness" in src
+
+    def test_ray_capacity_probe_emits_timeout_event(self):
+        src = (ROOT / "scripts" / "ray_capacity_probe.py").read_text()
+        assert "ray_capacity_probe_timeout" in src
+
+    # Lazy Torch import — AutoGluon/SPCS paths must not require torch
+    def test_evaluate_synreg_no_toplevel_torch_import(self):
+        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        import re
+        assert not re.search(r"^import torch", src, re.MULTILINE), (
+            "evaluate_synthetic_regression.py must not have a top-level 'import torch'. "
+            "Use _import_torch() inside DeepSet/checkpoint functions only."
+        )
+
+    def test_evaluate_synreg_has_import_torch_helper(self):
+        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        assert "_import_torch" in src, (
+            "evaluate_synthetic_regression.py must define _import_torch() lazy-import helper"
+        )
+
+    def test_evaluate_synreg_no_toplevel_deepset_inference_import(self):
+        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        import re
+        assert not re.search(r"^from deepset_inference import", src, re.MULTILINE), (
+            "evaluate_synthetic_regression.py must not have a top-level 'from deepset_inference import'. "
+            "Import lazily inside DeepSet functions."
+        )
+
+    def test_evaluate_synreg_no_toplevel_model_import(self):
+        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        import re
+        assert not re.search(r"^from model import", src, re.MULTILINE), (
+            "evaluate_synthetic_regression.py must not have a top-level 'from model import'. "
+            "Import lazily inside DeepSet/checkpoint functions."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: SPCS AutoGluon backend
@@ -3662,6 +3758,110 @@ class TestSPCSAutogluonBackend:
         )
         assert verify_calls, "_verify_spcs_image_in_repository must be called during SPCS evaluation"
         assert "img:1.0" in verify_calls
+
+    def test_worker_submit_stagger_defaults_to_zero(self):
+        import run_synthetic_regression_evaluation as mod
+        import os
+        if "SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS" not in os.environ:
+            assert mod.SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS == 0
+
+    def test_worker_submit_stagger_sleeps_between_workers(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+        sleep_calls = []
+
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS", 10)
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=3, concurrent_clusters=1,
+        )
+        stagger_sleeps = [s for s in sleep_calls if s == 10]
+        assert len(stagger_sleeps) == 3, (
+            f"Expected 3 stagger sleeps of 10s for 3 workers; got sleep_calls={sleep_calls}"
+        )
+
+    def test_default_failure_cleanup_cancels_support_jobs(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+        cancelled = []
+
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", False)
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        def _fail(*a, **k):
+            raise RuntimeError("simulated failure")
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", _fail)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+                object(), cluster_shards=1, workers_per_shard=1, concurrent_clusters=1,
+            )
+        assert any("worker" in lbl for lbl in cancelled), (
+            "Support workers must be cancelled on failure when keep flag is false"
+        )
+
+    def test_keep_support_jobs_on_failure_skips_cancel(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+        cancelled = []
+
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", True)
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+        def _fail(*a, **k):
+            raise RuntimeError("simulated failure")
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", _fail)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+                object(), cluster_shards=1, workers_per_shard=2, concurrent_clusters=1,
+            )
+        assert cancelled == [], (
+            "Support workers must NOT be cancelled when keep flag is true and coordinator fails"
+        )
+
+    def test_support_jobs_cancelled_on_success_even_with_keep_flag(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+        cancelled = []
+
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", True)
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(), cluster_shards=1, workers_per_shard=2, concurrent_clusters=1,
+        )
+        assert any("worker" in lbl for lbl in cancelled), (
+            "Support workers must still be cancelled after coordinator success, "
+            "even when keep flag is true"
+        )
 
 
 # ---------------------------------------------------------------------------

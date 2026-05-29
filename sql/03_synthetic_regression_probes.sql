@@ -236,6 +236,98 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_worker_a
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_worker_access_probe';
 
+-- ===========================================================================
+-- SPCS custom-image capacity and worker-access probes
+-- ===========================================================================
+-- Use these instead of the MLJob probes when SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job.
+-- The image reference is passed as AUTOGLUON_RUNTIME_ENVIRONMENT (or 'spcs_job' to use
+-- the SYNREG_AUTOGLUON_SPCS_IMAGE env var baked into the procedure at creation time).
+--
+-- Diagnostic parameters (full overload only):
+--   RAY_READY_TIMEOUT_SECONDS  — readiness timeout forwarded to ray_capacity_probe.py
+--                                 inside the coordinator container (default 900).
+--   WORKER_SUBMIT_STAGGER_SECONDS — sleep between successive worker job submissions
+--                                    (default 0; use 10 to reduce burst scheduling pressure).
+--   KEEP_SUPPORT_JOBS_ON_FAILURE  — when TRUE, worker jobs are not cancelled after a
+--                                    coordinator failure so their logs can be inspected.
+--                                    Must be cancelled manually after diagnostics.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe_default';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe_4arg';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  RAY_READY_TIMEOUT_SECONDS INTEGER,
+  WORKER_SUBMIT_STAGGER_SECONDS INTEGER,
+  KEEP_SUPPORT_JOBS_ON_FAILURE BOOLEAN
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe_default';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe';
+
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  WORKER_SUBMIT_STAGGER_SECONDS INTEGER,
+  KEEP_SUPPORT_JOBS_ON_FAILURE BOOLEAN
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_worker_access_probe';
+
 -- AutoGluon import timing probe — measures dependency bootstrap latency.
 --
 -- Stage the probe script before calling this procedure:
@@ -331,6 +423,36 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
 -- CALL run_synthetic_regression_combined_autogluon_evaluation(
 --   '2.5.0-py311', '2.5.0-py311',
 --   0, 1, 1, 30, 300, 'best_quality'
+-- );
+
+-- C. SPCS custom-image probe sequence (SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job):
+--    Pass the full OCI image reference as AUTOGLUON_RUNTIME_ENVIRONMENT, or 'spcs_job'
+--    to read from SYNREG_AUTOGLUON_SPCS_IMAGE baked in at procedure-creation time.
+--
+-- Capacity probe — default topology (reads SYNREG_AUTOGLUON_CLUSTER_SHARDS etc.):
+-- CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('spcs_job');
+--
+-- Capacity probe — explicit topology:
+-- CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe('spcs_job', 1, 4, 1);
+--
+-- Capacity probe — diagnostic overload (partial-join investigation):
+-- CALL run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+--   'spcs_job',
+--   1, 4, 1,
+--   900,   -- RAY_READY_TIMEOUT_SECONDS  (NULL → container default 900 s)
+--   10,    -- WORKER_SUBMIT_STAGGER_SECONDS  (0 = no stagger)
+--   TRUE   -- KEEP_SUPPORT_JOBS_ON_FAILURE  (FALSE = always cancel)
+-- );
+--
+-- Worker-access probe — default topology:
+-- CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe('spcs_job');
+--
+-- Worker-access probe — diagnostic overload:
+-- CALL run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
+--   'spcs_job',
+--   1, 4, 1,
+--   10,    -- WORKER_SUBMIT_STAGGER_SECONDS
+--   TRUE   -- KEEP_SUPPORT_JOBS_ON_FAILURE
 -- );
 
 -- ===========================================================================

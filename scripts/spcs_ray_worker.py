@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import time
+
+START_MONOTONIC = time.monotonic()
 
 _SENTINEL_FILE = "/tmp/spcs_ray_worker_done"
 
@@ -51,6 +54,8 @@ object_manager_port = int(os.getenv("SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT", "6381
 runtime_env_agent_port = int(os.getenv("SYNREG_SPCS_RAY_RUNTIME_ENV_AGENT_PORT", "6382"))
 min_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MIN_WORKER_PORT", "10002"))
 max_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MAX_WORKER_PORT", "10010"))
+
+_ray_proc: subprocess.Popen | None = None  # set to proc after Popen; read by signal handler
 
 _RAY_LOG_FILES = [
     "/tmp/ray/session_latest/logs/raylet.err",
@@ -97,6 +102,55 @@ _head_host = _parts[0]
 _head_port = int(_parts[1]) if len(_parts) == 2 else 6379
 
 
+def _handle_signal(signum: int, frame) -> None:  # noqa: ANN001
+    try:
+        sig_name = signal.Signals(signum).name
+    except (ValueError, AttributeError):
+        sig_name = str(signum)
+    uptime = round(time.monotonic() - START_MONOTONIC, 2)
+    extra: dict = {}
+    for _k, _e in (("run_id", "SPCS_RAY_RUN_ID"), ("shard_index", "SPCS_RAY_SHARD_INDEX"),
+                   ("worker_index", "SPCS_RAY_WORKER_INDEX")):
+        _v = os.getenv(_e)
+        if _v is not None:
+            extra[_k] = _v
+    _log(
+        "spcs_ray_worker_signal_received",
+        signal_number=signum,
+        signal_name=sig_name,
+        uptime_seconds=uptime,
+        ray_head_address=ray_head_address,
+        task_cpus=task_cpus,
+        obj_store_bytes=obj_store_bytes,
+        node_manager_port=node_manager_port,
+        object_manager_port=object_manager_port,
+        runtime_env_agent_port=runtime_env_agent_port,
+        min_worker_port=min_worker_port,
+        max_worker_port=max_worker_port,
+        ray_proc_pid=_ray_proc.pid if _ray_proc is not None else None,
+        ray_proc_returncode=_ray_proc.poll() if _ray_proc is not None else None,
+        **extra,
+    )
+    if os.path.isdir("/tmp/ray/session_latest/logs"):
+        _dump_ray_logs()
+    if _ray_proc is not None and _ray_proc.poll() is None:
+        _ray_proc.terminate()
+        try:
+            _ray_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _ray_proc.kill()
+    exit_code = 128 + signum
+    _log(
+        "spcs_ray_worker_exit_after_signal",
+        final_ray_returncode=_ray_proc.poll() if _ray_proc is not None else None,
+        exit_code=exit_code,
+    )
+    sys.exit(exit_code)
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
+
+
 def _wait_head_reachable(host: str, port: int, timeout_seconds: int) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -131,6 +185,7 @@ _log("spcs_ray_worker_cmd", cmd=cmd)
 
 try:
     proc = subprocess.Popen(cmd)
+    _ray_proc = proc
     _log("spcs_ray_worker_started", pid=proc.pid)
 except Exception as exc:
     _log("spcs_ray_worker_start_failed", error=str(exc))
@@ -144,7 +199,7 @@ while time.monotonic() < deadline:
         break
     ret = proc.poll()
     if ret is not None:
-        _log("spcs_ray_worker_ray_exited", returncode=ret)
+        _log("spcs_ray_worker_ray_exited", returncode=ret, uptime_seconds=round(time.monotonic() - START_MONOTONIC, 2))
         if ret != 0:
             _dump_ray_logs()
         sys.exit(ret if ret != 0 else 0)
@@ -157,4 +212,4 @@ try:
     proc.wait(timeout=15)
 except subprocess.TimeoutExpired:
     proc.kill()
-_log("spcs_ray_worker_done")
+_log("spcs_ray_worker_done", uptime_seconds=round(time.monotonic() - START_MONOTONIC, 2))

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+
+
+def _log(event: str, **fields) -> None:
+    print(json.dumps({"event": event, **fields}, default=str), flush=True)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -20,10 +25,13 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) -> tuple[int, int, dict]:
-    ready_timeout_seconds = _env_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 300)
+    ready_timeout_seconds = _env_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 900)
     poll_seconds = _env_int("SYNREG_RAY_CLUSTER_READY_POLL_SECONDS", 10)
     deadline = time.monotonic() + ready_timeout_seconds
     last_state: tuple[int, int] | None = None
+    live_nodes: list = []
+    available_cpus: int = 0
+    cluster_resources: dict = {}
 
     while True:
         live_nodes = [node for node in ray.nodes() if node.get("Alive")]
@@ -31,12 +39,13 @@ def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) 
         available_cpus = int(cluster_resources.get("CPU", 0))
         state = (len(live_nodes), available_cpus)
         if state != last_state:
-            print(
-                "[ray_capacity_probe] ray readiness: "
-                f"live_nodes={len(live_nodes)}/{expected_nodes} "
-                f"available_cpus={available_cpus}/{expected_cpus_min} "
-                f"resources={dict(cluster_resources)}",
-                flush=True,
+            _log(
+                "ray_capacity_probe_readiness",
+                live_nodes=len(live_nodes),
+                expected_nodes=expected_nodes,
+                available_cpus=available_cpus,
+                expected_cpus_min=expected_cpus_min,
+                resources=dict(cluster_resources),
             )
             last_state = state
 
@@ -44,14 +53,25 @@ def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) 
             return len(live_nodes), available_cpus, dict(cluster_resources)
 
         if time.monotonic() >= deadline:
+            _log(
+                "ray_capacity_probe_timeout",
+                expected_nodes=expected_nodes,
+                expected_cpus_min=expected_cpus_min,
+                live_nodes=len(live_nodes),
+                available_cpus=available_cpus,
+                timeout_seconds=ready_timeout_seconds,
+                poll_seconds=poll_seconds,
+                resources=dict(cluster_resources),
+                hint="set SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true to leave worker jobs running",
+            )
             raise RuntimeError(
-                "Ray cluster did not reach requested capacity before readiness timeout: "
+                "Ray cluster did not reach requested capacity before readiness timeout. "
                 f"live_nodes={len(live_nodes)}/{expected_nodes}, "
                 f"available_cpus={available_cpus}/{expected_cpus_min}, "
                 f"timeout_seconds={ready_timeout_seconds}, "
                 f"resources={dict(cluster_resources)}. "
-                "Snowflake may still be starting target_instances, or account/compute-pool "
-                "concurrency may be below the requested Ray capacity envelope."
+                "Hint: set SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true to leave worker jobs "
+                "running after a probe failure so their logs can be inspected manually."
             )
 
         time.sleep(poll_seconds)
@@ -76,11 +96,14 @@ else:
         "expected 'auto' or 'explicit'."
     )
 
-print(
-    f"[ray_capacity_probe] started: label={label!r} "
-    f"expected_nodes={expected_nodes} expected_cpus_min={expected_cpus_min} "
-    f"ray_address_mode={ray_address_mode!r}",
-    flush=True,
+_log(
+    "ray_capacity_probe_started",
+    label=label,
+    expected_nodes=expected_nodes,
+    expected_cpus_min=expected_cpus_min,
+    sleep_seconds=sleep_seconds,
+    ray_address=ray_address,
+    ready_timeout_seconds=_env_int("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS", 900),
 )
 
 try:
@@ -98,12 +121,14 @@ live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
     expected_cpus_min=expected_cpus_min,
 )
 
-print(
-    f"[ray_capacity_probe] ray ready: live_nodes={live_node_count} "
-    f"available_cpus={available_cpus} resources={dict(cluster_resources)}",
-    flush=True,
+_log(
+    "ray_capacity_probe_ready",
+    label=label,
+    live_nodes=live_node_count,
+    available_cpus=available_cpus,
+    resources=cluster_resources,
 )
 
-print(f"[ray_capacity_probe] sleeping {sleep_seconds}s to hold allocation", flush=True)
+_log("ray_capacity_probe_sleeping", label=label, sleep_seconds=sleep_seconds)
 time.sleep(sleep_seconds)
-print("[ray_capacity_probe] complete", flush=True)
+_log("ray_capacity_probe_complete", label=label)

@@ -48,10 +48,13 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
 import time
+
+START_MONOTONIC = time.monotonic()
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUTOGLUON_RAY_PY = os.path.join(_SCRIPT_DIR, "autogluon_ray.py")
@@ -70,6 +73,9 @@ max_worker_port = int(os.getenv("SYNREG_SPCS_RAY_MAX_WORKER_PORT", "10010"))
 
 _run_id = os.getenv("SPCS_RAY_RUN_ID", "")
 _shard_index = os.getenv("SPCS_RAY_SHARD_INDEX", "")
+
+ray_head_proc: subprocess.Popen | None = None
+_driver_proc: subprocess.Popen | None = None  # set after driver Popen; read by signal handler
 
 
 def _log(event: str, **fields) -> None:
@@ -101,6 +107,52 @@ def _dump_ray_logs() -> None:
             _log("ray_log_file", path=path, bytes=min(size, _RAY_LOG_TAIL_BYTES), content=tail)
         except Exception as exc:
             _log("ray_log_file_error", path=path, error=str(exc))
+
+
+def _handle_signal(signum: int, frame) -> None:  # noqa: ANN001
+    try:
+        sig_name = signal.Signals(signum).name
+    except (ValueError, AttributeError):
+        sig_name = str(signum)
+    _log(
+        "spcs_ray_coordinator_signal_received",
+        signal_number=signum,
+        signal_name=sig_name,
+        uptime_seconds=round(time.monotonic() - START_MONOTONIC, 2),
+        head_port=head_port,
+        obj_store_bytes=obj_store_bytes,
+        node_manager_port=node_manager_port,
+        object_manager_port=object_manager_port,
+        runtime_env_agent_port=runtime_env_agent_port,
+        min_worker_port=min_worker_port,
+        max_worker_port=max_worker_port,
+        run_id=_run_id,
+        shard_index=_shard_index,
+        ray_head_pid=ray_head_proc.pid if ray_head_proc is not None else None,
+        ray_head_returncode=ray_head_proc.poll() if ray_head_proc is not None else None,
+        driver_script=_DRIVER_SCRIPT,
+        driver_pid=_driver_proc.pid if _driver_proc is not None else None,
+    )
+    if os.path.isdir("/tmp/ray/session_latest/logs"):
+        _dump_ray_logs()
+    # Terminate driver first, then head
+    for _p in (_driver_proc, ray_head_proc):
+        if _p is not None and _p.poll() is None:
+            _p.terminate()
+            try:
+                _p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _p.kill()
+    exit_code = 128 + signum
+    _log(
+        "spcs_ray_coordinator_exit_after_signal",
+        final_ray_returncode=ray_head_proc.poll() if ray_head_proc is not None else None,
+        exit_code=exit_code,
+    )
+    sys.exit(exit_code)
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 
 _log(
@@ -147,7 +199,6 @@ if _cluster_id_resources:
 
 _log("spcs_ray_coordinator_head_cmd", cmd=ray_head_cmd)
 
-ray_head_proc: subprocess.Popen | None = None
 driver_rc = 1  # default to failure
 try:
     try:
@@ -195,8 +246,11 @@ try:
     driver_cmd = [sys.executable, _DRIVER_SCRIPT]
     _log("spcs_ray_coordinator_driver_starting", cmd=driver_cmd, driver_script=_DRIVER_SCRIPT)
 
-    driver_result = subprocess.run(driver_cmd, env=driver_env)
-    driver_rc = driver_result.returncode
+    driver_proc = subprocess.Popen(driver_cmd, env=driver_env)
+    _driver_proc = driver_proc
+    _log("spcs_ray_coordinator_driver_started", pid=driver_proc.pid, driver_script=_DRIVER_SCRIPT)
+    driver_proc.wait()
+    driver_rc = driver_proc.returncode
     _log("spcs_ray_coordinator_driver_finished", returncode=driver_rc)
 
 finally:

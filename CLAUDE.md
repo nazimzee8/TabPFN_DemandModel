@@ -845,6 +845,30 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   600s / 10s. The MLJob entrypoints receive them as
   `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` and
   `SYNREG_RAY_CLUSTER_READY_POLL_SECONDS`.
+- **SPCS probe diagnostic env vars:**
+  - `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` (default 900) — how long the capacity probe polls
+    Ray for full cluster readiness before timing out.
+  - `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS` (default 0) — sleep between SPCS worker job
+    submissions; use 10s to test whether bursty scheduling causes partial worker join.
+  - `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE` (default false) — when true, worker support jobs
+    are not cancelled after a coordinator failure, leaving them accessible for log inspection.
+    Must be cancelled manually after diagnostics.
+- **SPCS Ray cancellation diagnostics:** Worker and coordinator wrapper scripts register
+  SIGTERM/SIGINT handlers that emit structured JSON events (`spcs_ray_worker_signal_received`,
+  `spcs_ray_coordinator_signal_received`) before exiting. Events include uptime, Ray PID,
+  configured ports, run_id, shard_index. Ray log tails are dumped if present. Exit code is
+  `128 + signal_number`. `ray_capacity_probe.py` emits JSON readiness and timeout events
+  (`ray_capacity_probe_readiness`, `ray_capacity_probe_timeout`) via its `_log()` helper.
+  Cancelled workers with no logs at all were terminated before Python started; those with
+  signal logs were alive and cancelled externally.
+- **Lazy Torch import in `evaluate_synthetic_regression.py`:** `torch`, `deepset_inference`,
+  and `model` are imported lazily inside the DeepSet/checkpoint functions that need them
+  (`safe_torch_load_with_legacy_escape_hatch`, `normalize_checkpoint_cfg`,
+  `load_best_deepset_checkpoint`, `apply_deepset_feature_selection`,
+  `run_deepset_synthetic_regression`). AutoGluon, worker-access, sharding, and aggregation
+  paths are fully torch-free. Running a DeepSet path in a runtime without torch raises a
+  clear `RuntimeError` via `_import_torch()`. Do not re-add `import torch` or
+  `from deepset_inference import` / `from model import` at module level.
 
 ### HPO guardrails
 

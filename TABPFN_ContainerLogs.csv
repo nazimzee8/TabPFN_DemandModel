@@ -1,0 +1,49 @@
+WORKER,TIMESTAMP,INSTANCE_ID,CONTAINER_NAME,LOG,RECORD_ATTRIBUTES
+worker_0,2026-05-28 20:11:32.932,0,main,"{""event"": ""spcs_ray_worker_starting"", ""ray_head_address"": ""spcs-cap-ray-coord-23342579-0:6379"", ""task_cpus"": 1, ""obj_store_bytes"": 268435456, ""node_manager_port"": 6380, ""object_manager_port"": 6381, ""runtime_env_agent_port"": 6382, ""min_worker_port"": 10002, ""max_worker_port"": 10010}","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:32.932,0,main,"{""event"": ""spcs_ray_worker_waiting_for_head"", ""host"": ""spcs-cap-ray-coord-23342579-0"", ""port"": 6379}","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:37.940,0,main,"{""event"": ""spcs_ray_worker_head_reachable""}","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:37.940,0,main,"{""event"": ""spcs_ray_worker_cmd"", ""cmd"": [""ray"", ""start"", ""--address=spcs-cap-ray-coord-23342579-0:6379"", ""--node-manager-port=6380"", ""--object-manager-port=6381"", ""--runtime-env-agent-port=6382"", ""--min-worker-port=10002"", ""--max-worker-port=10010"", ""--num-cpus=1"", ""--object-store-memory=268435456"", ""--block""]}","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:37.940,0,main,"{""event"": ""spcs_ray_worker_started"", ""pid"": 7}","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:38.873,0,main,"2026-05-28 20:11:38,873	INFO scripts.py:945 -- Local node IP: 10.244.3.74","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:38.909,0,main,"2026-05-28 20:11:38,909	WARNING services.py:1996 -- WARNING: The object store is using /tmp instead of /dev/shm because /dev/shm has only 67108864 bytes available. This will harm performance! You may be able to free up space by deleting files in /dev/shm. If you are inside a Docker container, you can increase /dev/shm size by passing '--shm-size=0.28gb' to 'docker run' (or add it to the run_options list in a Ray cluster config). Make sure to set this to more than 30% of available RAM.","{
+  ""log.iostream"": ""stderr""
+}"
+worker_0,2026-05-28 20:11:38.950,0,main,"[2026-05-28 20:11:38,950 W 7 7] global_state_accessor.cc:465: Some processes that the driver needs to connect to have not registered with GCS, so retrying. Have you run 'ray start' on this node?","{
+  ""log.iostream"": ""stderr""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	SUCC scripts.py:958 -- --------------------","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	SUCC scripts.py:959 -- Ray runtime started.","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	SUCC scripts.py:960 -- --------------------","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	INFO scripts.py:962 -- To terminate the Ray runtime, run","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	INFO scripts.py:963 --   ray stop","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	INFO scripts.py:971 -- --block","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	INFO scripts.py:972 -- This command will now block forever until terminated by a signal.","{
+  ""log.iostream"": ""stdout""
+}"
+worker_0,2026-05-28 20:11:39.970,0,main,"2026-05-28 20:11:39,970	INFO scripts.py:975 -- Running subprocesses are monitored and a message will be printed if any of them terminate unexpectedly. Subprocesses exit with SIGTERM will be treated as graceful, thus NOT reported.","{
+  ""log.iostream"": ""stdout""
+}"

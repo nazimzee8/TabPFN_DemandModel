@@ -2856,6 +2856,59 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
 - **Raylet failure diagnostics:** If raylet exits, the coordinator/worker scripts now dump the last
   32 KB of `/tmp/ray/session_latest/logs/raylet.err`, `gcs_server.err`, and related log files as
   structured JSON log events for inspection in SPCS job service logs.
+
+### Capacity probe failure diagnostics
+
+When a capacity probe reports partial worker join (e.g. `live_nodes=2/5`), use this sequence:
+
+1. **Check timeout first** — The default readiness timeout is now 900 s. If the probe timed out
+   at 300 s, simply rerun: cold-start of a custom image can take 3–5 minutes.
+2. **Reduce burst pressure** — If partial join persists, rerun with
+   `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS=10` to stagger worker submission by 10 s per
+   worker and reduce simultaneous scheduling pressure.
+3. **Capture missing worker logs** — If workers still show no logs, rerun with
+   `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true`. On coordinator timeout the worker jobs are
+   left running so their logs can be retrieved via SPCS job service log inspection.
+4. **Cancel leftover jobs** — After inspection, manually cancel each leftover worker:
+   `SELECT <job_service_name>!SPCS_CANCEL_JOB();`
+
+Env vars summary:
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` | 900 | Capacity probe readiness timeout |
+| `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS` | 0 | Sleep (s) between worker submissions |
+| `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE` | false | Leave workers running on coordinator failure |
+
+### SPCS Ray cancellation diagnostics
+
+When Snowflake cancels a worker or coordinator (CANCELLED: Job was cancelled while running),
+the SPCS wrapper scripts now emit structured JSON log events before exiting:
+
+- **`spcs_ray_worker_signal_received`** — logged immediately on SIGTERM or SIGINT; includes
+  `signal_name`, `uptime_seconds`, `ray_head_address`, configured Ray ports, `run_id`,
+  `shard_index`, `ray_proc_pid`, and `ray_proc_returncode` (if Ray subprocess was running).
+- **`spcs_ray_worker_exit_after_signal`** — logged after graceful Ray subprocess termination;
+  includes `final_ray_returncode` and `exit_code` (128 + signal number).
+- **`spcs_ray_coordinator_signal_received`** / **`spcs_ray_coordinator_exit_after_signal`** —
+  equivalent events for the coordinator, adding `driver_pid` and `ray_head_pid`.
+- Ray log tails (`ray_log_file` events) are dumped on signal if `/tmp/ray/session_latest/logs`
+  exists at the time of cancellation.
+
+**Distinguishing cancellation causes:**
+- Signal log present → Python was running; Snowflake sent SIGTERM. Check `uptime_seconds` to
+  see if the worker was alive long enough to attempt Ray connection.
+- No signal log, no startup log → Snowflake terminated before Python started (cold-start race
+  or scheduling failure). Use `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS=10` to reduce burst.
+- `spcs_ray_worker_ray_exited` with non-zero returncode → Ray process crashed; check
+  `ray_log_file` events for raylet/GCS errors.
+
+**Capacity probe JSON logs:**
+`ray_capacity_probe.py` now emits structured JSON events (`ray_capacity_probe_started`,
+`ray_capacity_probe_readiness`, `ray_capacity_probe_ready`, `ray_capacity_probe_timeout`,
+`ray_capacity_probe_sleeping`, `ray_capacity_probe_complete`) that can be filtered alongside
+coordinator/worker events in SPCS job service logs.
+
 - **Coordinator merges head + driver:** `spcs_ray_coordinator.py` starts `ray start --head
   --num-cpus=0 --object-store-memory=<bytes>` as a subprocess, polls localhost until the
   port is reachable, then executes `autogluon_ray.py` with `SYNREG_RAY_ADDRESS_MODE=explicit`
@@ -2903,3 +2956,10 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
   requires re-authentication with `docker login`.
 - The `SYNREG_AUTOGLUON_SPCS_IMAGE` env var must be set to the full OCI image reference
   including the registry hostname, database, schema, repository, image name, and tag.
+
+**Module-level torch dependency removed:**
+`evaluate_synthetic_regression.py` no longer imports `torch`, `deepset_inference`, or `model`
+at module level. These are imported lazily inside DeepSet/checkpoint functions only. The SPCS
+AutoGluon custom image does not need torch for worker-access probes or distributed AutoGluon
+evaluation. If a DeepSet path is invoked in a torch-free runtime, `_import_torch()` raises a
+clear `RuntimeError` instead of a bare `ModuleNotFoundError`.

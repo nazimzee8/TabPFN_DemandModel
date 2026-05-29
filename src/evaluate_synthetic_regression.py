@@ -34,7 +34,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import torch
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
@@ -46,14 +45,6 @@ from autogluon_models import (
     predict_autogluon_timed,
 )
 from baseline_models import make_baseline_model, validate_baseline_dependencies
-from deepset_inference import (
-    deepset_gpu_memory_skip_reason,
-    deepset_inference_device,
-    predict_deepset_bounded_context_ensemble,
-    run_permutation_tests,
-    select_deepset_features_train_only,
-)
-from model import ModelConfig, _instantiate_model
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -197,6 +188,18 @@ REQUIRED_SYNREG_COLUMNS = {
 }
 
 
+def _import_torch():
+    """Lazy torch import — only needed in DeepSet/checkpoint-loading paths."""
+    try:
+        import torch
+        return torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "Torch is required for DeepSet/checkpoint-loading paths but is not installed "
+            "in this runtime. Use the benchmark/DeepSet runtime image or install torch."
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint loading
 # ---------------------------------------------------------------------------
@@ -206,6 +209,8 @@ def safe_torch_load_with_legacy_escape_hatch(local_path: str, device) -> dict:
     3-tier PyTorch load logic (mirrors evaluate.load_checkpoint_compat).
     TORCH_UNLOAD=true → sets ALLOW_UNSAFE_TORCH_LOAD=true.
     """
+    torch = _import_torch()
+    from model import ModelConfig
     if os.environ.get("TORCH_UNLOAD", "").lower() == "true":
         os.environ["ALLOW_UNSAFE_TORCH_LOAD"] = "true"
         print(
@@ -261,6 +266,7 @@ def normalize_checkpoint_cfg(payload: dict) -> "ModelConfig":
     Raises RuntimeError for retired model families (deepset, market_aware).
     Strips legacy-only cfg fields that are no longer in ModelConfig.
     """
+    from model import ModelConfig
     cfg_raw = payload.get("cfg", {})
     if isinstance(cfg_raw, ModelConfig):
         if cfg_raw.model_family in _RETIRED_FAMILIES:
@@ -393,6 +399,8 @@ def load_best_deepset_checkpoint():
     6. run_permutation_tests(model) — fail fast
     7. Return (model, payload)
     """
+    from deepset_inference import deepset_inference_device, run_permutation_tests
+    from model import _instantiate_model
     import glob as _glob
 
     session = create_snowpark_session()
@@ -1021,6 +1029,7 @@ def apply_deepset_feature_selection(
     Returns (X_train_sel, X_holdout_sel, meta_dict).
     selected_features <= feature_cap guaranteed.
     """
+    from deepset_inference import select_deepset_features_train_only
     raw_features = X_train_p.shape[1]
     meta = {
         "raw_features": raw_features,
@@ -1233,6 +1242,11 @@ def run_deepset_synthetic_regression() -> None:
     Run DeepSet bounded-context ensemble evaluation across all suite families.
     GPU mode; sharded.
     """
+    from deepset_inference import (
+        deepset_inference_device,
+        deepset_gpu_memory_skip_reason,
+        predict_deepset_bounded_context_ensemble,
+    )
     model, payload = load_best_deepset_checkpoint()
     device = deepset_inference_device()
 
