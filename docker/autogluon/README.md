@@ -66,7 +66,9 @@ SNOWFLAKE_IMAGE_VERSION=1.0.0
 ```
 
 Set `SNOWFLAKE_REGISTRY_PASSWORD` as a repository secret containing the Snowflake PAT
-`token_secret`. The workflow uses Snowflake's Docker registry PAT username `USER`.
+`token_secret`. The workflow authenticates Snowflake CLI as `GITHUB_ACTIONS_IMAGE_PUSHER`,
+then uses `snow spcs image-registry login` to log Docker in with a short-lived registry
+session token.
 
 The workflow can also be run manually with `workflow_dispatch` inputs for the registry host,
 image repository, and image version. This avoids committing free-trial account-specific

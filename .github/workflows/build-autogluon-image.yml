@@ -102,12 +102,29 @@ jobs:
           docker run --rm "${{ steps.tags.outputs.version_tag }}" \
             -c "import ray, autogluon.tabular, snowflake.snowpark, pandas, numpy, pyarrow; print('ok')"
 
-      - name: Log in to Snowflake image registry
-        uses: docker/login-action@v3
+      - name: Set up Snowflake CLI
+        uses: snowflakedb/snowflake-cli-action@v2
         with:
-          registry: ${{ steps.tags.outputs.registry_host }}
-          username: USER
-          password: ${{ secrets.SNOWFLAKE_REGISTRY_PASSWORD }}
+          cli-version: "3.16"
+
+      - name: Log in to Snowflake image registry
+        env:
+          REGISTRY_HOST: ${{ steps.tags.outputs.registry_host }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_REGISTRY_PASSWORD }}
+        run: |
+          account_identifier="${REGISTRY_HOST%.registry.snowflakecomputing.com}"
+          snow connection test \
+            --temporary-connection \
+            --account "${account_identifier}" \
+            --user GITHUB_ACTIONS_IMAGE_PUSHER \
+            --password "${SNOWFLAKE_PASSWORD}" \
+            --role TABPFN_IMAGE_PUSHER
+          snow spcs image-registry login \
+            --temporary-connection \
+            --account "${account_identifier}" \
+            --user GITHUB_ACTIONS_IMAGE_PUSHER \
+            --password "${SNOWFLAKE_PASSWORD}" \
+            --role TABPFN_IMAGE_PUSHER
 
       - name: Build and push image
         uses: docker/build-push-action@v6
