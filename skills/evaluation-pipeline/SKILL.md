@@ -170,11 +170,11 @@ Each MLJob:
 1. Starts Ray cluster (`ray.init()`; abort if fails)
 2. Driver opens Snowpark session and loads metadata only from `SYNTHETIC_REGRESSION_DATASET_INDEX`
 3. Driver expands work items, assigns shard via modulo, and builds small item dicts
-4. Driver enriches each item dict with `dataset_access.mode='scoped_file_url'` and
-   `dataset_access.scoped_url` derived from the stage path with `BUILD_SCOPED_FILE_URL`
+4. Driver enriches each item dict with `dataset_access.mode='driver_presigned_url'` and
+   `dataset_access.presigned_url` derived from the stage path with `GET_PRESIGNED_URL`
 5. Driver submits `_autogluon_work_item.remote(item)` and passes **only the small item dict**
 6. Each worker receives the small item dict as a Ray task argument and loads its own dataset
-   with `SnowflakeFile.open(scoped_url)` without creating a Snowpark session
+   via `urllib` using the presigned URL without creating a Snowpark session
 7. Workers apply dataset-size, feature, and matrix guards, then run AutoGluon fit/predict
 8. Bounded in-flight pool (size = `MAX_IN_FLIGHT`) bounds active worker-loaded fits
 9. Driver collects small result rows, writes **one CSV per cluster shard** (workers never write)
@@ -202,7 +202,7 @@ return to driver-side dataset downloads or worker-created Snowpark sessions.
 | `BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES` | 5368709120 (~5 GB) | /tmp guard |
 | `SYNREG_AUTOGLUON_DISTRIBUTED_MODE` | `ray_work_items` | Distribution mode |
 | `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | 6 | Must equal `CLUSTER_SHARDS` (single-wave) |
-| `SYNREG_WORKER_DATA_ACCESS_MODE` | `scoped_file_url` | Driver-derived scoped URL; workers do not create Snowpark sessions |
+| `SYNREG_WORKER_DATA_ACCESS_MODE` | `driver_presigned_url` | Driver-derived presigned URL; workers do not create Snowpark sessions |
 | `SYNREG_MAX_WORK_ITEM_BYTES` | 8192 | Compact Ray item metadata size guard |
 | `BENCHMARK_CPU_MAX_PROCESSED_FEATURES` | 512 | Skip work item if number of features exceeds threshold (note: baseline mode default is 2000) |
 | `BENCHMARK_CPU_MAX_MATRIX_BYTES` | 2,147,483,648 | Skip work item if feature matrix bytes exceed threshold (note: baseline mode default is 536,870,912) |
@@ -317,7 +317,7 @@ CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
   topology as the capacity probe and distributed evaluation.
 - The Ray driver loads one or more metadata rows from `SYNTHETIC_REGRESSION_DATASET_INDEX`,
   builds small item dicts, and passes those dicts to Ray workers as task arguments.
-- Workers verify they can receive the dict and resolve the same `scoped_file_url`
+- Workers verify they can receive the dict and resolve the same `driver_presigned_url`
   access mechanism used by production evaluation. The probe must remain lightweight: no AutoGluon training, no full-suite
   dataset fan-out, and no driver `ray.put(dataset)`.
 - Single-node mode uses the same single-instance topology as the single-node capacity

@@ -106,7 +106,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ steps.tags.outputs.registry_host }}
-          username: ${{ secrets.SNOWFLAKE_REGISTRY_USERNAME }}
+          username: USER
           password: ${{ secrets.SNOWFLAKE_REGISTRY_PASSWORD }}
 
       - name: Build and push image

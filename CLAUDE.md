@@ -528,6 +528,15 @@ CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
   Two sweeps: `nonlinear_meta` (warm-start) then `nonlinear_architecture` (d_phi/n_sab_feat tuning).
 - **Nonlinear cold-start guard:** `run_model_training_job.py` raises `RuntimeError` when nonlinear
   `best_config` has no `_meta.pretrain_checkpoint_stage_path`. Dev-only override: `ALLOW_NONLINEAR_COLD_START=true`.
+- **`_merge_sweep_configs()` checkpoint preservation:** The nonlinear architecture merge preserves
+  `_meta.pretrain_checkpoint_stage_path` and `_meta.pretrain_checkpoint_map` from the
+  `nonlinear_meta` baseline sweep when the `nonlinear_architecture` sweep produces an empty path.
+  Precedence: arch path wins if non-empty, else baseline path. Checkpoint maps are unioned with arch
+  keys overriding on collision.
+- **SPCS AutoGluon memory defaults:** Coordinator and worker both default to 256 MiB (268435456 bytes)
+  Ray object-store memory (override via `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES` /
+  `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES`). Applies to both linear production evaluation
+  and the capacity probe — the previous 500 MB/2 GB production defaults have been retired.
 - **Nonlinear evaluation suite (`nonlinear_v1`, regimes I–L):** 400 datasets (100/regime):
   Quadratic (I), Sinusoidal (J), Pairwise Interactions (K), ReLU/Threshold (L). Same `(n,p)`
   Poisson sampling as primary suite. Separate index table: `SYNTHETIC_NONLINEAR_DATASET_INDEX`.

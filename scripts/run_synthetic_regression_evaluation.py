@@ -4057,8 +4057,8 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
         driver_jobs = []
         head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
         dns_suffix = _spcs_dns_domain(session)
-        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "500000000")
-        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "2000000000")
+        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")   # 256 MiB
+        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")        # 256 MiB
         for shard_index in range(shard_count):
             coord_label = f"spcs_worker_probe_ray_coord_{run_id}_{shard_index}"
             safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()

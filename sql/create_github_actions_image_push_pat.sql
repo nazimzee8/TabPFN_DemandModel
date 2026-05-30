@@ -8,8 +8,7 @@
 --   2. The PAT token_secret is shown only once in the ALTER USER ... ADD PAT result.
 --      Copy it immediately into the GitHub repository secret:
 --        SNOWFLAKE_REGISTRY_PASSWORD
---   3. Use the service user name as:
---        SNOWFLAKE_REGISTRY_USERNAME = GITHUB_ACTIONS_IMAGE_PUSHER
+--   3. Docker registry PAT login uses the literal username USER.
 --
 -- If SECURITYADMIN cannot create authentication policies in TABPFN_SCHEMA, run
 -- this once with ACCOUNTADMIN or another schema owner:
@@ -69,7 +68,6 @@ ALTER USER GITHUB_ACTIONS_IMAGE_PUSHER
   COMMENT = 'GitHub Actions Docker login for Snowflake image registry';
 
 -- GitHub repository secrets:
---   SNOWFLAKE_REGISTRY_USERNAME = GITHUB_ACTIONS_IMAGE_PUSHER
 --   SNOWFLAKE_REGISTRY_PASSWORD = <token_secret from command above>
 
 -- Verify PAT metadata later. This does not reveal token_secret.

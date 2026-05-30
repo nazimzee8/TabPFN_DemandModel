@@ -174,6 +174,69 @@ def _validate_meta_dataset_index(session):
             ) from exc
 
 
+_NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
+
+
+def _validate_nonlinear_training_index(session) -> None:
+    """Pre-flight for META_NONLINEAR_DATASET_INDEX + @META_NONLINEAR_DATASET_STAGE."""
+    try:
+        rows = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_NONLINEAR_DATASET_INDEX GROUP BY split"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            "META_NONLINEAR_DATASET_INDEX does not exist or cannot be queried. "
+            "Run CALL build_meta_nonlinear_dataset_index(); first."
+        ) from exc
+    counts = {str(row[0]).lower(): int(row[1]) for row in rows}
+    mismatches = {
+        split: {"expected": exp, "actual": counts.get(split, 0)}
+        for split, exp in EXPECTED_INDEX_COUNTS.items()
+        if counts.get(split, 0) != exp
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"META_NONLINEAR_DATASET_INDEX has wrong split counts: {mismatches}. "
+            "Run CALL build_meta_nonlinear_dataset_index(); to rebuild."
+        )
+    print(
+        "META_NONLINEAR_DATASET_INDEX validated: "
+        + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
+    )
+    _REQUIRED_COLS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
+    try:
+        session.sql(
+            f"SELECT {_REQUIRED_COLS} FROM META_NONLINEAR_DATASET_INDEX LIMIT 1"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"META_NONLINEAR_DATASET_INDEX missing required columns ({_REQUIRED_COLS}): {exc}"
+        ) from exc
+    for _split in ("train", "val"):
+        try:
+            _files = session.sql(f"LIST @META_NONLINEAR_DATASET_STAGE/{_split}/").collect()
+            if not _files:
+                raise RuntimeError(
+                    f"No staged files in @META_NONLINEAR_DATASET_STAGE/{_split}/. "
+                    "Re-upload nonlinear training data before starting a GPU job."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"@META_NONLINEAR_DATASET_STAGE/{_split}/ inaccessible: {exc}"
+            ) from exc
+
+
+def _validate_training_index(session, training_data_family: str) -> None:
+    """Route to the correct index validation based on training_data_family."""
+    if training_data_family == _NONLINEAR_TRAINING_FAMILY:
+        _validate_nonlinear_training_index(session)
+    else:
+        _validate_meta_dataset_index(session)
+
+
 def _apply_nonlinear_cold_start_guard() -> None:
     """Raise RuntimeError unless ALLOW_NONLINEAR_COLD_START=true.
 
@@ -219,7 +282,7 @@ def _run_model_training_impl(
         best_config = json.load(f)
     print("Best config:", best_config)
 
-    _validate_meta_dataset_index(session)
+    _validate_training_index(session, training_data_family)
 
     # Pretrain load policy: architecture sweep allows cold-start on mismatch
     # (d_phi/n_sab_feat may differ from pretrain checkpoint); ridge_residual
@@ -241,6 +304,14 @@ def _run_model_training_impl(
     _meta = best_config.get("_meta", {})
     _meta_ckpt = str(_meta.get("pretrain_checkpoint_stage_path", "")).strip()
     gate_dim = int(best_config.get("gate_hidden_dim", 64))
+
+    _meta_family = str(_meta.get("training_data_family", "")).strip()
+    if _meta_family and _meta_family != training_data_family:
+        raise ValueError(
+            f"[run_model_training] Family mismatch: best_config._meta.training_data_family="
+            f"{_meta_family!r} but requested training_data_family={training_data_family!r}. "
+            "Rerun HPO with the same TRAINING_DATA_FAMILY, or confirm the intended family."
+        )
 
     pretrain_checkpoint_path = ""
     if _meta_ckpt:

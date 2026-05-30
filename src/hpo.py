@@ -175,6 +175,23 @@ def _merge_sweep_configs(baseline_config, arch_config):
         ],
         "best_val_mse": arch_meta.get("best_val_mse"),
     }
+
+    # Preserve pretrain checkpoint metadata through merge (precedence: arch > baseline)
+    _arch_ckpt = arch_meta.get("pretrain_checkpoint_stage_path", "")
+    _base_ckpt = baseline_meta.get("pretrain_checkpoint_stage_path", "")
+    merged["_meta"]["pretrain_checkpoint_stage_path"] = _arch_ckpt if _arch_ckpt else _base_ckpt
+
+    # Merge checkpoint maps: baseline as base, arch overrides on key collision
+    merged["_meta"]["pretrain_checkpoint_map"] = {
+        **baseline_meta.get("pretrain_checkpoint_map", {}),
+        **arch_meta.get("pretrain_checkpoint_map", {}),
+    }
+
+    # Propagate training_data_family if either sweep recorded it
+    merged["_meta"]["training_data_family"] = (
+        arch_meta.get("training_data_family") or baseline_meta.get("training_data_family") or ""
+    )
+
     return merged
 
 
@@ -1142,6 +1159,7 @@ def main():
                 else int(best_config_raw.get("gate_hidden_dim", 64)),
                 ""
             ),
+            "training_data_family": os.environ.get("TRAINING_DATA_FAMILY", ""),
         },
     }
 

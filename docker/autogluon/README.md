@@ -65,6 +65,9 @@ SNOWFLAKE_IMAGE_REPOSITORY=<account>.registry.snowflakecomputing.com/<db>/<schem
 SNOWFLAKE_IMAGE_VERSION=1.0.0
 ```
 
+Set `SNOWFLAKE_REGISTRY_PASSWORD` as a repository secret containing the Snowflake PAT
+`token_secret`. The workflow uses Snowflake's Docker registry PAT username `USER`.
+
 The workflow can also be run manually with `workflow_dispatch` inputs for the registry host,
 image repository, and image version. This avoids committing free-trial account-specific
 repository URLs.

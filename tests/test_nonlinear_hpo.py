@@ -130,3 +130,53 @@ def test_nonlinear_lambda_not_an_architecture_mismatch():
     )
     current = ModelConfig(**{**saved.__dict__, "latent_ridge_lambda": 10.0})
     assert hpo.checkpoint_architecture_mismatches(saved, current) == {}
+
+
+def test_merge_preserves_baseline_pretrain_checkpoint_when_arch_empty():
+    """baseline has checkpoint path, arch has empty → merged gets baseline path."""
+    baseline = {"hpo_sweep_mode": "nonlinear_meta", "_meta": {
+        "pretrain_checkpoint_stage_path": "@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt",
+        "pretrain_checkpoint_map": {"nonlinear": "@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt"},
+        "best_val_mse": 0.5,
+    }}
+    arch = {"hpo_sweep_mode": "nonlinear_architecture", "d_phi": 128, "_meta": {
+        "pretrain_checkpoint_stage_path": "",
+        "best_val_mse": 0.4,
+    }}
+    merged = hpo._merge_sweep_configs(baseline, arch)
+    assert merged["_meta"]["pretrain_checkpoint_stage_path"] == (
+        "@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt"
+    )
+
+
+def test_merge_arch_pretrain_checkpoint_takes_precedence():
+    """Both sweeps have paths → arch path wins."""
+    baseline = {"hpo_sweep_mode": "nonlinear_meta", "_meta": {
+        "pretrain_checkpoint_stage_path": "@MODEL_STAGE/checkpoints/pretrain_base.pt"}}
+    arch = {"hpo_sweep_mode": "nonlinear_architecture", "_meta": {
+        "pretrain_checkpoint_stage_path": "@MODEL_STAGE/checkpoints/pretrain_arch.pt"}}
+    merged = hpo._merge_sweep_configs(baseline, arch)
+    assert merged["_meta"]["pretrain_checkpoint_stage_path"] == (
+        "@MODEL_STAGE/checkpoints/pretrain_arch.pt"
+    )
+
+
+def test_merge_preserves_checkpoint_map():
+    """Merged _meta.pretrain_checkpoint_map is union of both maps."""
+    baseline = {"hpo_sweep_mode": "nonlinear_meta", "_meta": {
+        "pretrain_checkpoint_map": {"nonlinear": "@MODEL_STAGE/checkpoints/a.pt", "64": "@MODEL_STAGE/checkpoints/b.pt"}}}
+    arch = {"hpo_sweep_mode": "nonlinear_architecture", "_meta": {
+        "pretrain_checkpoint_map": {"nonlinear": "@MODEL_STAGE/checkpoints/c.pt"}}}
+    merged = hpo._merge_sweep_configs(baseline, arch)
+    cmap = merged["_meta"]["pretrain_checkpoint_map"]
+    assert cmap["nonlinear"] == "@MODEL_STAGE/checkpoints/c.pt"  # arch wins
+    assert cmap["64"] == "@MODEL_STAGE/checkpoints/b.pt"          # baseline preserved
+
+
+def test_merge_propagates_training_data_family():
+    """training_data_family from baseline _meta survives into merged _meta."""
+    baseline = {"hpo_sweep_mode": "nonlinear_meta", "_meta": {
+        "training_data_family": "synthetic_regression_nonlinear"}}
+    arch = {"hpo_sweep_mode": "nonlinear_architecture", "_meta": {}}
+    merged = hpo._merge_sweep_configs(baseline, arch)
+    assert merged["_meta"]["training_data_family"] == "synthetic_regression_nonlinear"

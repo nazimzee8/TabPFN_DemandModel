@@ -391,7 +391,7 @@ def run_pretrain_pipeline_nonlinear() -> str:
     return _run_pretrain_nonlinear_impl(
         session,
         DEFAULT_MODEL_FAMILY,
-        DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY,
+        NONLINEAR_TRAINING_DATA_FAMILY,   # hardcoded — not env-var chain
         DEFAULT_MODEL_DESIGN_PATTERN,
     )
 
@@ -410,6 +410,12 @@ def run_pretrain_pipeline_nonlinear_model(
             'inductive_forecasting'
         );
     """
+    if training_data_family != NONLINEAR_TRAINING_DATA_FAMILY:
+        raise ValueError(
+            f"run_pretrain_pipeline_nonlinear only supports "
+            f"training_data_family={NONLINEAR_TRAINING_DATA_FAMILY!r}. "
+            f"Got {training_data_family!r}. Use run_pretrain_pipeline() for other families."
+        )
     session = _get_session()
     return _run_pretrain_nonlinear_impl(
         session,

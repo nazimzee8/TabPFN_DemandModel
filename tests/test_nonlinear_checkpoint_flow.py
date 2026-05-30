@@ -353,3 +353,234 @@ class TestAutogluonRayImportability:
         assert ".options(num_cpus=TASK_CPUS).remote(item)" in text, (
             "autogluon_ray.py must use .options(num_cpus=TASK_CPUS).remote(item) at call sites"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — Family-aware index validation
+# ---------------------------------------------------------------------------
+
+class TestFamilyAwareIndexValidation:
+    """_validate_training_index routes to the correct index based on training_data_family."""
+
+    def _load_run_model_training_job(self, monkeypatch):
+        _add_scripts_to_path()
+        sfml = types.ModuleType("snowflake")
+        sfml.ml = types.ModuleType("snowflake.ml")
+        sfml.ml.jobs = types.ModuleType("snowflake.ml.jobs")
+        sfml.ml.jobs.submit_from_stage = MagicMock(return_value=_FakeJob())
+        sys.modules.setdefault("snowflake", sfml)
+        sys.modules.setdefault("snowflake.ml", sfml.ml)
+        sys.modules.setdefault("snowflake.ml.jobs", sfml.ml.jobs)
+        if "run_model_training_job" in sys.modules:
+            del sys.modules["run_model_training_job"]
+        import run_model_training_job
+        return run_model_training_job
+
+    def test_nonlinear_family_queries_nonlinear_index(self, monkeypatch):
+        """TRAINING_DATA_FAMILY=synthetic_regression_nonlinear → _validate_nonlinear_training_index called."""
+        mod = self._load_run_model_training_job(monkeypatch)
+
+        nonlinear_called = []
+        linear_called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_training_index",
+                            lambda session: nonlinear_called.append(True))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index",
+                            lambda session: linear_called.append(True))
+
+        mod._validate_training_index(_FakeSession(), "synthetic_regression_nonlinear")
+        assert nonlinear_called, "_validate_nonlinear_training_index was not called for nonlinear family"
+        assert not linear_called, "_validate_meta_dataset_index must not be called for nonlinear family"
+
+    def test_linear_family_does_not_query_nonlinear_index(self, monkeypatch):
+        """TRAINING_DATA_FAMILY=synthetic_regression_combined → _validate_meta_dataset_index called."""
+        mod = self._load_run_model_training_job(monkeypatch)
+
+        nonlinear_called = []
+        linear_called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_training_index",
+                            lambda session: nonlinear_called.append(True))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index",
+                            lambda session: linear_called.append(True))
+
+        mod._validate_training_index(_FakeSession(), "synthetic_regression_combined")
+        assert linear_called, "_validate_meta_dataset_index was not called for linear family"
+        assert not nonlinear_called, "_validate_nonlinear_training_index must not be called for linear family"
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — Family consistency guard
+# ---------------------------------------------------------------------------
+
+class TestFamilyConsistencyGuard:
+    """_run_model_training_impl raises ValueError on training_data_family mismatch with _meta."""
+
+    def _load_run_model_training_job(self, monkeypatch):
+        _add_scripts_to_path()
+        sfml = types.ModuleType("snowflake")
+        sfml.ml = types.ModuleType("snowflake.ml")
+        sfml.ml.jobs = types.ModuleType("snowflake.ml.jobs")
+        sfml.ml.jobs.submit_from_stage = MagicMock(return_value=_FakeJob())
+        sys.modules.setdefault("snowflake", sfml)
+        sys.modules.setdefault("snowflake.ml", sfml.ml)
+        sys.modules.setdefault("snowflake.ml.jobs", sfml.ml.jobs)
+        if "run_model_training_job" in sys.modules:
+            del sys.modules["run_model_training_job"]
+        import run_model_training_job
+        return run_model_training_job
+
+    def _patch_impl_dependencies(self, mod, monkeypatch, best_config: dict):
+        """Patch all dependencies before the family-check so the guard is reachable."""
+        import json, os
+        monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: True)
+        monkeypatch.setattr(mod, "_validate_training_index", lambda *a, **kw: None)
+        # Write best_config.json where the function will look for it
+        config_path = os.path.join(mod.LOCAL_TMP_DIR, "best_config.json")
+        with open(config_path, "w") as f:
+            json.dump(best_config, f)
+
+    def test_nonlinear_best_config_with_linear_final_family_raises(self, monkeypatch):
+        """_meta.training_data_family=nonlinear + linear requested → ValueError."""
+        mod = self._load_run_model_training_job(monkeypatch)
+        best_config = {
+            "gate_hidden_dim": 64,
+            "hpo_sweep_mode": "nonlinear_meta",
+            "use_latent_ridge_expert": True,
+            "_meta": {
+                "training_data_family": "synthetic_regression_nonlinear",
+                "pretrain_checkpoint_stage_path": "@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt",
+            },
+        }
+        self._patch_impl_dependencies(mod, monkeypatch, best_config)
+
+        with pytest.raises(ValueError, match="Family mismatch"):
+            mod._run_model_training_impl(
+                _FakeSession(),
+                model_family="market_exchangeable_icl",
+                training_data_family="synthetic_regression_combined",
+                model_design_pattern="inductive_forecasting",
+            )
+
+    def test_matching_families_pass(self, monkeypatch):
+        """Same family in _meta and requested → no ValueError from family guard."""
+        mod = self._load_run_model_training_job(monkeypatch)
+        best_config = {
+            "gate_hidden_dim": 64,
+            "hpo_sweep_mode": "nonlinear_meta",
+            "use_latent_ridge_expert": True,
+            "_meta": {
+                "training_data_family": "synthetic_regression_nonlinear",
+                "pretrain_checkpoint_stage_path": "@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt",
+            },
+        }
+        self._patch_impl_dependencies(mod, monkeypatch, best_config)
+        # Also patch _stage_file_exists to return False for checkpoint so we stop before job submit
+        monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: False)
+
+        with pytest.raises((FileNotFoundError, RuntimeError)):
+            # Raises on missing best_config stage file or checkpoint, NOT ValueError from family guard
+            mod._run_model_training_impl(
+                _FakeSession(),
+                model_family="market_exchangeable_icl",
+                training_data_family="synthetic_regression_nonlinear",
+                model_design_pattern="inductive_forecasting",
+            )
+
+    def test_absent_meta_family_is_backward_compatible(self, monkeypatch):
+        """No training_data_family key in _meta → passes (old best_config files)."""
+        mod = self._load_run_model_training_job(monkeypatch)
+        best_config = {
+            "gate_hidden_dim": 64,
+            "hpo_sweep_mode": "ridge_residual",
+            "use_latent_ridge_expert": False,
+            "_meta": {
+                # no training_data_family key — old format
+                "pretrain_checkpoint_stage_path": "",
+            },
+        }
+        self._patch_impl_dependencies(mod, monkeypatch, best_config)
+        # Patch _stage_file_exists: True for best_config.json presence check, False for checkpoint
+        call_count = [0]
+        def _fake_exists(*a, **kw):
+            call_count[0] += 1
+            return call_count[0] == 1  # True first call (best_config exists), False thereafter
+        monkeypatch.setattr(mod, "_stage_file_exists", _fake_exists)
+
+        # Should not raise ValueError about family mismatch; may raise FileNotFoundError for checkpoint
+        try:
+            mod._run_model_training_impl(
+                _FakeSession(),
+                model_family="market_exchangeable_icl",
+                training_data_family="synthetic_regression_combined",
+                model_design_pattern="inductive_forecasting",
+            )
+        except ValueError as exc:
+            assert "Family mismatch" not in str(exc), (
+                f"Old best_config without training_data_family should not trigger family guard: {exc}"
+            )
+        except (FileNotFoundError, RuntimeError):
+            pass  # Expected — guard passed, failed later on missing checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Fix 4 (second audit) — Nonlinear pretrain entrypoint enforcement
+# ---------------------------------------------------------------------------
+
+class TestNonlinearPretainEntrypoint:
+    """run_pretrain_pipeline_nonlinear_model enforces nonlinear-only family."""
+
+    def _load_run_pretrain_job(self, monkeypatch):
+        _add_scripts_to_path()
+        sfml = types.ModuleType("snowflake")
+        sfml.ml = types.ModuleType("snowflake.ml")
+        sfml.ml.jobs = types.ModuleType("snowflake.ml.jobs")
+        sfml.ml.jobs.submit_from_stage = MagicMock(return_value=_FakeJob())
+        sys.modules.setdefault("snowflake", sfml)
+        sys.modules.setdefault("snowflake.ml", sfml.ml)
+        sys.modules.setdefault("snowflake.ml.jobs", sfml.ml.jobs)
+        if "run_pretrain_job" in sys.modules:
+            del sys.modules["run_pretrain_job"]
+        import run_pretrain_job
+        return run_pretrain_job
+
+    def test_3arg_rejects_non_nonlinear_family(self, monkeypatch):
+        """ValueError raised when training_data_family != synthetic_regression_nonlinear."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        with pytest.raises(ValueError, match="run_pretrain_pipeline_nonlinear only supports"):
+            mod.run_pretrain_pipeline_nonlinear_model(
+                "market_exchangeable_icl",
+                "synthetic_regression_combined",  # wrong family
+                "inductive_forecasting",
+            )
+
+    def test_3arg_accepts_nonlinear_family(self, monkeypatch):
+        """Correct family → ValueError not raised; submission proceeds (or fails on session)."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        # Patch _get_session and _run_pretrain_nonlinear_impl to avoid real I/O
+        called_with = []
+        monkeypatch.setattr(mod, "_get_session", lambda: _FakeSession())
+        monkeypatch.setattr(
+            mod, "_run_pretrain_nonlinear_impl",
+            lambda session, mf, tdf, mdp: called_with.append(tdf) or "ok",
+        )
+        result = mod.run_pretrain_pipeline_nonlinear_model(
+            "market_exchangeable_icl",
+            "synthetic_regression_nonlinear",
+            "inductive_forecasting",
+        )
+        assert result == "ok"
+        assert called_with == ["synthetic_regression_nonlinear"]
+
+    def test_0arg_uses_nonlinear_family_regardless_of_env(self, monkeypatch):
+        """TRAINING_DATA_FAMILY=synthetic_regression_combined env var is ignored by 0-arg entrypoint."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
+        called_with = []
+        monkeypatch.setattr(mod, "_get_session", lambda: _FakeSession())
+        monkeypatch.setattr(
+            mod, "_run_pretrain_nonlinear_impl",
+            lambda session, mf, tdf, mdp: called_with.append(tdf) or "ok",
+        )
+        mod.run_pretrain_pipeline_nonlinear()
+        assert called_with == ["synthetic_regression_nonlinear"], (
+            f"0-arg entrypoint must hardcode NONLINEAR_TRAINING_DATA_FAMILY, got {called_with}"
+        )

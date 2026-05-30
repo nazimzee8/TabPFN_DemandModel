@@ -2863,8 +2863,8 @@ CALL run_synthetic_regression_combined_autogluon_evaluation(...);
   `--min-worker-port=10002 --max-worker-port=10010` on both head and worker `ray start` commands.
   SPCS specs must declare these as TCP endpoints — traffic to undeclared ports is silently dropped.
 - **Capacity probe uses reduced object-store memory:** The SPCS capacity probe defaults coordinator
-  and worker object-store to 256 MB each (vs 500 MB / 2 GB for production). `/dev/shm` in SPCS
-  containers is only 64 MiB; Ray falls back to `/tmp` but stays stable.
+  and worker object-store to 256 MiB each (same 256 MiB / 268435456 bytes as the production
+  default). `/dev/shm` in SPCS containers is only 64 MiB; Ray falls back to `/tmp` but stays stable.
 - **Raylet failure diagnostics:** If raylet exits, the coordinator/worker scripts now dump the last
   32 KB of `/tmp/ray/session_latest/logs/raylet.err`, `gcs_server.err`, and related log files as
   structured JSON log events for inspection in SPCS job service logs.
@@ -3027,8 +3027,9 @@ are redacted from `sample_item_metadata_sanitized`. Full dataset payloads are ne
 **SPCS Ray object-store memory defaults (256 MiB):**
 The SPCS distributed AutoGluon coordinator and worker now default to `268435456` bytes (256 MiB)
 Ray object-store memory. Datasets are fetched by workers via presigned HTTPS URLs and loaded
-locally — nothing is passed through the Ray object store. The previous 500 MB / 2 GB defaults
-created unnecessary `/tmp` pressure given SPCS `/dev/shm` is only 64 MiB.
+locally — nothing is passed through the Ray object store. The previous 500 MB coordinator /
+2 GB worker defaults (now retired) created unnecessary `/tmp` pressure given SPCS `/dev/shm`
+is only 64 MiB.
 Override only if diagnostics show object-store pressure:
 - `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES`
 - `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES`
@@ -3052,6 +3053,16 @@ Nonlinear HPO does not use the gate-specific `pretrain_gate<N>.pt` checkpoints
 from `ridge_residual`. For the intended warm-start path, pass
 `HPO_PRETRAIN_CHECKPOINT_STAGE_PATH=@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt`;
 incompatible nonlinear checkpoints are skipped and the trial cold-starts.
+
+**Checkpoint preservation through merge:** `_merge_sweep_configs()` preserves
+`_meta.pretrain_checkpoint_stage_path` from the `nonlinear_meta` baseline sweep when the
+`nonlinear_architecture` sweep produces an empty path. The merged `best_config.json` will
+always carry the correct pretrain checkpoint, preventing the cold-start guard in
+`run_model_training_job.py` from triggering spuriously.
+
+**Worker data access:** The coordinator creates a Snowpark session, queries the index, and
+generates presigned URLs for each task. Workers receive compact item dicts and download
+datasets via `urllib` — no Snowpark session is needed on worker nodes.
 
 ---
 
