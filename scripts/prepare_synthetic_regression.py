@@ -96,6 +96,18 @@ SYNREG_DEEPSET_FEATURE_CAP = int(os.getenv("SYNTHETIC_REGRESSION_DEEPSET_FEATURE
 REGIMES = ["A", "B", "C", "D"]
 PRIOR_NAME = "linear_poisson"
 PRIOR_VERSION = "v1"
+NONLINEAR_SUITE_ID = "synthetic_regression_nonlinear_v1"
+NONLINEAR_N_DATASETS = int(os.getenv("SYNTHETIC_REGRESSION_NONLINEAR_DATASETS", "200"))
+NONLINEAR_SPLIT_SEEDS = _parse_int_list(os.getenv("SYNTHETIC_REGRESSION_NONLINEAR_SPLIT_SEEDS", "0,1,2"))
+NONLINEAR_REGIMES = [
+    "NL_sine",
+    "NL_interaction",
+    "NL_threshold",
+    "NL_sparse_hd",
+    "NL_heteroscedastic",
+    "NL_market_demand",
+    "NL_ood_shift",
+]
 
 # Combined suite (index-level composition of primary in-distribution + OOD full datasets)
 COMBINED_SUITE_ID       = "linear_all_v1"
@@ -239,6 +251,80 @@ def generate_synthetic_dataset(
         "p_noise": p_noise,
         "p_total": p_total,
         "target_noise_scale": target_noise_scale,
+    }
+
+
+def _generate_nonlinear_signal(
+    rng: np.random.Generator,
+    X: np.ndarray,
+    regime: str,
+) -> np.ndarray:
+    p = X.shape[1]
+    w = rng.standard_normal(p)
+    w = w / max(np.linalg.norm(w), 1e-8)
+    lin = X @ w
+    x0 = X[:, 0]
+    x1 = X[:, 1] if p > 1 else x0
+    x2 = X[:, 2] if p > 2 else x0
+
+    if regime == "NL_sine":
+        return 2.0 * np.sin(lin) + 0.5 * np.cos(2.0 * x0)
+    if regime == "NL_interaction":
+        return lin + 1.5 * x0 * x1 + 0.75 * np.sin(x2)
+    if regime == "NL_threshold":
+        return lin + np.where(x0 > 0.0, 2.0 + x1, -1.5 * x1)
+    if regime == "NL_sparse_hd":
+        k = max(1, min(5, p))
+        active = rng.choice(p, size=k, replace=False)
+        return np.tanh(X[:, active] @ rng.normal(0, 1.5, k)) + 0.5 * lin
+    if regime == "NL_heteroscedastic":
+        return lin + np.sin(x0) * (1.0 + 0.5 * np.abs(x1))
+    if regime == "NL_market_demand":
+        price = x0
+        promo = (x1 > 0.25).astype(float)
+        substitute = x2
+        return 1.5 - 1.2 * price + 0.8 * promo - 0.6 * substitute + 0.4 * price * promo
+    if regime == "NL_ood_shift":
+        return 1.3 * np.sin(lin + 0.75) + 0.8 * np.maximum(x0, 0.0) ** 2 - 0.4 * x1
+    raise ValueError(f"Unknown nonlinear regime: {regime}")
+
+
+def generate_nonlinear_dataset(
+    rng: np.random.Generator,
+    regime: str,
+    suite_family: str,
+    n: int,
+    p_signal: int,
+    p_noise: int = 0,
+) -> dict:
+    p_total = p_signal + p_noise
+    if regime == "NL_ood_shift":
+        X_signal = rng.standard_t(df=4, size=(n, p_signal)) + rng.normal(0.35, 0.15, (n, p_signal))
+    else:
+        X_signal = rng.standard_normal((n, p_signal))
+    signal = _generate_nonlinear_signal(rng, X_signal, regime)
+    if regime == "NL_heteroscedastic":
+        noise_scale = 0.15 + 0.35 * np.abs(X_signal[:, 0])
+        eps = rng.standard_normal(n) * noise_scale
+    else:
+        eps = rng.standard_normal(n) * 0.35
+    y = signal + eps
+    if p_noise > 0:
+        X_noise = rng.standard_normal((n, p_noise))
+        X = np.concatenate([X_signal, X_noise], axis=1)
+    else:
+        X = X_signal
+    return {
+        "X": X.astype(np.float64),
+        "y": y.astype(np.float64),
+        "betaX": signal.astype(np.float64),
+        "suite_family": suite_family,
+        "prior_regime": regime,
+        "n_total": n,
+        "p_signal": p_signal,
+        "p_noise": p_noise,
+        "p_total": p_total,
+        "target_noise_scale": 0.35,
     }
 
 
@@ -880,6 +966,60 @@ def prepare_target_noise_suite(rng: np.random.Generator, local_dir: str, session
     return index_rows
 
 
+def prepare_nonlinear_suite(rng: np.random.Generator, local_dir: str, session) -> list[dict]:
+    """Generate the opt-in nonlinear synthetic regression suite."""
+    print(
+        f"[INFO] Preparing nonlinear suite: {NONLINEAR_N_DATASETS} datasets "
+        f"across {len(NONLINEAR_REGIMES)} regimes"
+    )
+    index_rows = []
+    stage_dir = f"{SYNREG_STAGE_PREFIX}/nonlinear"
+    os.makedirs(os.path.join(local_dir, "nonlinear"), exist_ok=True)
+
+    for global_idx in range(NONLINEAR_N_DATASETS):
+        regime = NONLINEAR_REGIMES[global_idx % len(NONLINEAR_REGIMES)]
+        dataset_id = global_idx
+        n, p = sample_params_primary(rng)
+        p_noise = int(rng.choice([0, 0, 5, 10])) if regime == "NL_sparse_hd" else 0
+        ds = generate_nonlinear_dataset(
+            rng=rng,
+            regime=regime,
+            suite_family="nonlinear",
+            n=n,
+            p_signal=p,
+            p_noise=p_noise,
+        )
+        outfile = os.path.join(local_dir, "nonlinear", f"dataset_{dataset_id:04d}.npz")
+        serialize_synthetic_npz(outfile, ds, noise_level=p_noise, is_anchor=False)
+        payload_bytes = os.path.getsize(outfile)
+        stage_path = upload_file_to_stage(session, outfile, stage_dir)
+        row = _make_index_row(
+            suite_family="nonlinear",
+            dataset_id=dataset_id,
+            dataset_seed=int(rng.integers(0, 2**31)),
+            stage_path=stage_path,
+            regime=regime,
+            split_seeds=NONLINEAR_SPLIT_SEEDS,
+            n_total=n,
+            p_signal=p,
+            p_noise=p_noise,
+            target_noise_scale=0.35,
+            noise_level=p_noise,
+            is_anchor=False,
+            payload_bytes=payload_bytes,
+        )
+        row["prior_name"] = "nonlinear_meta"
+        row["prior_version"] = "v1"
+        row["logical_dataset_key"] = f"{NONLINEAR_SUITE_ID}:{regime}:{dataset_id:04d}"
+        index_rows.append(row)
+        if (global_idx + 1) % 20 == 0:
+            print(f"[INFO]   nonlinear: {global_idx + 1}/{NONLINEAR_N_DATASETS} generated")
+        gc.collect()
+
+    print(f"[INFO] Nonlinear suite done: {len(index_rows)} index rows.")
+    return index_rows
+
+
 # ---------------------------------------------------------------------------
 # Idempotency + main orchestration
 # ---------------------------------------------------------------------------
@@ -891,6 +1031,7 @@ def _build_manifest(index_rows: list[dict]) -> dict:
     n_feature_noise = sum(1 for r in index_rows if r["suite_family"] == "feature_noise")
     n_training_size = sum(1 for r in index_rows if r["suite_family"] == "training_size")
     n_target_noise = sum(1 for r in index_rows if r["suite_family"] == "target_noise")
+    n_nonlinear = sum(1 for r in index_rows if r["suite_family"] == "nonlinear")
     return {
         "suite_id": SYNREG_SUITE_ID,
         "base_seed": SYNREG_BASE_SEED,
@@ -898,10 +1039,11 @@ def _build_manifest(index_rows: list[dict]) -> dict:
         "n_datasets_feature_noise": n_feature_noise,
         "n_datasets_training_size": n_training_size,
         "n_datasets_target_noise": n_target_noise,
+        "n_datasets_nonlinear": n_nonlinear,
         "stage_paths": stage_paths,
-        "regimes": REGIMES,
-        "prior_name": PRIOR_NAME,
-        "prior_version": PRIOR_VERSION,
+        "regimes": NONLINEAR_REGIMES if n_nonlinear else REGIMES,
+        "prior_name": "nonlinear_meta" if n_nonlinear else PRIOR_NAME,
+        "prior_version": "v1" if n_nonlinear else PRIOR_VERSION,
         "primary_split_seeds": PRIMARY_SPLIT_SEEDS,
         "feature_noise_levels": FEATURE_NOISE_LEVELS,
         "train_size_grid": TRAIN_SIZE_GRID,
@@ -1226,10 +1368,13 @@ def prepare_synthetic_regression(session=None) -> str:
         _truncate_synreg_index(session)
         create_synreg_index_table(session)
 
-        all_index_rows += prepare_primary_suite(rng, SYNREG_LOCAL_DIR, session)
-        all_index_rows += prepare_feature_noise_suite(rng, SYNREG_LOCAL_DIR, session)
-        all_index_rows += prepare_training_size_suite(rng, SYNREG_LOCAL_DIR, session)
-        all_index_rows += prepare_target_noise_suite(rng, SYNREG_LOCAL_DIR, session)
+        if SYNREG_SUITE_ID == NONLINEAR_SUITE_ID:
+            all_index_rows += prepare_nonlinear_suite(rng, SYNREG_LOCAL_DIR, session)
+        else:
+            all_index_rows += prepare_primary_suite(rng, SYNREG_LOCAL_DIR, session)
+            all_index_rows += prepare_feature_noise_suite(rng, SYNREG_LOCAL_DIR, session)
+            all_index_rows += prepare_training_size_suite(rng, SYNREG_LOCAL_DIR, session)
+            all_index_rows += prepare_target_noise_suite(rng, SYNREG_LOCAL_DIR, session)
 
         # --- Write manifest ---
         manifest = _build_manifest(all_index_rows)

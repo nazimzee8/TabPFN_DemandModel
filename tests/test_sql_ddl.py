@@ -395,17 +395,17 @@ class TestSPCSSQLDDL:
 
     def test_docs_mention_spcs_resource_profiles_and_container_counts(self):
         training_md = (ROOT / "docs" / "Snowflake_Training.md").read_text(encoding="utf-8")
-        assert "36 SPCS" in training_md
+        assert "30 containers" in training_md
         assert "24 worker" in training_md
-        assert "SYNREG_SPCS_RAY_HEAD_CPU" in training_md
-        assert "SYNREG_SPCS_RAY_DRIVER_CPU" in training_md
+        assert "SYNREG_SPCS_RAY_COORDINATOR_CPU" in training_md
+        assert "SYNREG_SPCS_RAY_WORKER_CPU" in training_md
 
     def test_sql_runbook_mentions_spcs_resource_profiles(self):
         sql = self._sql()
-        assert "36 containers" in sql
+        assert "30 containers" in sql
         assert "24 worker" in sql
-        assert "SYNREG_SPCS_RAY_HEAD_*" in sql
-        assert "SYNREG_SPCS_RAY_DRIVER_*" in sql
+        assert "SYNREG_SPCS_RAY_COORDINATOR_*" in sql
+        assert "SYNREG_SPCS_RAY_WORKER_*" in sql
 
 
 class TestCombined04SPCSSQLDDL:
@@ -455,3 +455,31 @@ class TestCombined04SPCSSQLDDL:
             sql,
         )
         assert "\nALTER SESSION SET SYNREG_AUTOGLUON_SPCS_IMAGE" not in sql
+
+    def test_spcs_evaluation_9arg_overload_exists(self):
+        sql = self._sql()
+        import re
+        matches = re.findall(
+            r"CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation\b[^;]+;",
+            sql,
+            re.DOTALL,
+        )
+        nine_arg = [m for m in matches if "RAY_READY_TIMEOUT_SECONDS" in m and "WORKER_SUBMIT_STAGGER_SECONDS" in m]
+        assert nine_arg, (
+            "Expected a 9-argument overload of run_synthetic_regression_combined_autogluon_spcs_evaluation "
+            "with RAY_READY_TIMEOUT_SECONDS and WORKER_SUBMIT_STAGGER_SECONDS in sql/04_..."
+        )
+
+    def test_production_spcs_evaluation_sql_does_not_expose_keep_support_jobs(self):
+        sql = self._sql()
+        import re
+        procs = re.findall(
+            r"CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation\b[^;]+;",
+            sql,
+            re.DOTALL,
+        )
+        for proc in procs:
+            assert "KEEP_SUPPORT_JOBS_ON_FAILURE" not in proc, (
+                "KEEP_SUPPORT_JOBS_ON_FAILURE must not appear in the production evaluation "
+                "procedure signature — it is an env-only diagnostic escape hatch."
+            )

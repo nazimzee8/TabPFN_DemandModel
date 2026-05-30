@@ -24,6 +24,7 @@ DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_fore
 # HPO sweep mode — selects search space in hpo.py.
 # ridge_residual: tunes optimizer/regularization/Ridge Expert; architecture fixed (default).
 # architecture:   tunes d_phi/n_sab_feat; allows cold-start on pretrain mismatch.
+# nonlinear_meta / nonlinear_architecture: opt-in latent nonlinear ridge HPO.
 DEFAULT_HPO_SWEEP_MODE = os.getenv("HPO_SWEEP_MODE", "ridge_residual")
 
 # Baseline config stage path for architecture sweep.
@@ -32,7 +33,12 @@ DEFAULT_HPO_BASELINE_CONFIG_STAGE_PATH = os.getenv(
     "HPO_BASELINE_CONFIG_STAGE_PATH", ""
 )
 
-_ALLOWED_HPO_SWEEP_MODES = {"ridge_residual", "architecture"}
+_ALLOWED_HPO_SWEEP_MODES = {
+    "ridge_residual",
+    "architecture",
+    "nonlinear_meta",
+    "nonlinear_architecture",
+}
 if DEFAULT_HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
     raise ValueError(
         f"Invalid HPO_SWEEP_MODE={DEFAULT_HPO_SWEEP_MODE!r}. "
@@ -87,6 +93,7 @@ def _run_hpo_impl(
     model_design_pattern: str,
     hpo_sweep_mode: str,
     hpo_baseline_config_stage_path: str = "",
+    hpo_pretrain_checkpoint_stage_path: str = "",
 ) -> str:
     target_instances = 5   # 5 nodes x 4 GPUs/node = 20 GPUs; Ray Tune schedules 1 GPU/trial → 20 concurrent trials
     print(
@@ -111,6 +118,8 @@ def _run_hpo_impl(
     }
     if hpo_baseline_config_stage_path:
         env_vars["HPO_BASELINE_CONFIG_STAGE_PATH"] = hpo_baseline_config_stage_path
+    if hpo_pretrain_checkpoint_stage_path:
+        env_vars["HPO_PRETRAIN_CHECKPOINT_STAGE_PATH"] = hpo_pretrain_checkpoint_stage_path
     hpo_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
@@ -249,4 +258,46 @@ def run_hpo_pipeline_model_sweep_with_baseline(
         model_design_pattern,
         _mode,
         hpo_baseline_config_stage_path.strip(),
+    )
+
+
+def run_hpo_pipeline_model_sweep_with_baseline_and_pretrain(
+    session,
+    model_family: str,
+    training_data_family: str,
+    model_design_pattern: str,
+    hpo_sweep_mode: str,
+    hpo_baseline_config_stage_path: str,
+    hpo_pretrain_checkpoint_stage_path: str,
+) -> str:
+    """Six-arg SQL-callable entrypoint: sweep mode + baseline config + pretrain checkpoint.
+
+    hpo_pretrain_checkpoint_stage_path: stage path to pretrain_nonlinear_meta.pt.
+      Required when HPO_SWEEP_MODE='nonlinear_meta' or 'nonlinear_architecture'.
+      Pass '' for linear sweeps.
+
+    Usage (nonlinear HPO with pretrain warm-start):
+        CALL run_hpo_pipeline(
+            'market_exchangeable_icl',
+            'synthetic_regression_nonlinear',
+            'inductive_forecasting',
+            'nonlinear_meta',
+            '',
+            '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+        );
+    """
+    _mode = str(hpo_sweep_mode).strip().lower()
+    if _mode not in _ALLOWED_HPO_SWEEP_MODES:
+        raise ValueError(
+            f"Invalid HPO_SWEEP_MODE={_mode!r}. "
+            f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
+        )
+    return _run_hpo_impl(
+        session,
+        model_family,
+        training_data_family,
+        model_design_pattern,
+        _mode,
+        hpo_baseline_config_stage_path.strip(),
+        hpo_pretrain_checkpoint_stage_path.strip(),
     )

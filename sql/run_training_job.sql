@@ -214,6 +214,23 @@ CREATE TRANSIENT TABLE IF NOT EXISTS META_DATASET_INDEX (
 DATA_RETENTION_TIME_IN_DAYS = 0
 CLUSTER BY (split, hpo_bucket, prior_regime, p, n_train);
 
+-- META_NONLINEAR_DATASET_INDEX: same schema as META_DATASET_INDEX but populated from
+-- @META_NONLINEAR_DATASET_STAGE by build_meta_nonlinear_dataset_index().
+-- Routing is controlled by TRAINING_DATA_FAMILY=synthetic_regression_nonlinear in snowflake_io.py.
+CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_DATASET_INDEX (
+  split        STRING NOT NULL,
+  task_id      STRING NOT NULL,
+  stage_path   STRING NOT NULL,
+  n            NUMBER,
+  p            NUMBER,
+  n_train      NUMBER,
+  n_test       NUMBER,
+  prior_regime STRING,
+  hpo_bucket   NUMBER
+)
+DATA_RETENTION_TIME_IN_DAYS = 0
+CLUSTER BY (split, hpo_bucket, prior_regime, p, n_train);
+
 -- Step 3b: Benchmark manifest metadata index
 -- BENCHMARK_DATASET_INDEX is rebuilt by prepare_benchmark_datasets() from
 -- benchmark_manifest.json metadata. It supports manifest completeness checks
@@ -1741,12 +1758,12 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
 --   Step 5. One-shard mini evaluation — verify end-to-end with 1 shard before full run.
 --   Step 6. Full distributed evaluation.
 --   Step 7. Aggregation.
--- Default separated Ray topology: 6 heads + 24 workers + 6 drivers = 36 containers.
--- Only the 24 worker containers advertise Ray CPUs for AutoGluon tasks.
--- Heads and drivers are intentionally downsized: head 0.5 CPU, 2Gi/4Gi memory;
--- driver 0.5/1 CPU, 2Gi/4Gi memory; worker/single-node 4 CPU, 16Gi memory.
--- Override with SYNREG_SPCS_RAY_HEAD_*, SYNREG_SPCS_RAY_DRIVER_*,
--- SYNREG_SPCS_RAY_WORKER_*, SYNREG_SPCS_SINGLE_NODE_*, or explicit
+-- Coordinator topology: 6 coordinators + 24 workers = 30 containers.
+-- Each coordinator merges Ray head (--num-cpus=0) + AutoGluon driver in one container.
+-- Only the 24 worker containers are schedulable AutoGluon workers; coordinators are downsized.
+-- Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 4 CPU, 16Gi memory.
+-- Override with SYNREG_SPCS_RAY_COORDINATOR_*, SYNREG_SPCS_RAY_WORKER_*,
+-- SYNREG_SPCS_SINGLE_NODE_*, or explicit
 -- *_CPU_REQUEST/*_CPU_LIMIT/*_MEMORY_REQUEST/*_MEMORY_LIMIT suffixes.
 -- Pass the full pushed image reference as AUTOGLUON_SPCS_IMAGE when calling.
 -- Legacy callers that still pass 'spcs_job' may optionally set:

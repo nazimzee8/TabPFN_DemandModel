@@ -372,6 +372,28 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_eva
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_evaluation';
 
+-- 9-argument overload — adds explicit Ray readiness timeout and worker submission stagger.
+-- RAY_READY_TIMEOUT_SECONDS: how long each coordinator waits for all Ray workers to join.
+-- WORKER_SUBMIT_STAGGER_SECONDS: sleep between worker job submissions (1s resolved the startup issue).
+-- KEEP_SUPPORT_JOBS_ON_FAILURE is intentionally not exposed here; use SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE env var for diagnostics.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  AUTOGLUON_SPCS_IMAGE STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_TASK_CPUS INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  AUTOGLUON_TIME_LIMIT INTEGER,
+  AUTOGLUON_PRESETS STRING,
+  RAY_READY_TIMEOUT_SECONDS INTEGER,
+  WORKER_SUBMIT_STAGGER_SECONDS INTEGER
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_evaluation';
+
 -- ===========================================================================
 -- SPCS runbook — hardened 7-step preflight + evaluation sequence.
 --
@@ -419,14 +441,22 @@ CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
 --   Each shard's Ray head gets a unique address derived from SPCS_RAY_HEAD_DNS_SUFFIX (set above).
 --   Head starts with --num-cpus=0; driver expects workers_per_shard+1 live nodes.
 --   Each driver verifies cluster identity via custom Ray resource before submitting work.
---   Separated topology: 6 heads + 24 workers + 6 drivers = 36 containers.
---   Only the 24 worker containers are schedulable AutoGluon workers; heads/drivers are downsized.
---   Default resources: head 0.5 CPU, 2Gi/4Gi memory; driver 0.5/1 CPU, 2Gi/4Gi memory;
---   worker and single-node AutoGluon 4 CPU, 16Gi memory.
---   Override with SYNREG_SPCS_RAY_HEAD_*, SYNREG_SPCS_RAY_DRIVER_*,
---   SYNREG_SPCS_RAY_WORKER_*, or SYNREG_SPCS_SINGLE_NODE_*.
+--   Coordinator topology: 6 coordinators + 24 workers = 30 containers.
+--   Each coordinator merges Ray head (--num-cpus=0) + AutoGluon driver in one container.
+--   Only the 24 worker containers are schedulable AutoGluon workers; coordinators are downsized.
+--   Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 4 CPU, 16Gi memory.
+--   Override with SYNREG_SPCS_RAY_COORDINATOR_*, SYNREG_SPCS_RAY_WORKER_*,
+--   or SYNREG_SPCS_SINGLE_NODE_*.
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
   '<image_ref>', 6, 4, 1, 6, 300, 'best_quality'
+);
+--
+-- Step 6c: Full evaluation with explicit Ray readiness timeout and worker stagger (recommended).
+--   RAY_READY_TIMEOUT_SECONDS=600: coordinators wait up to 10 minutes for all workers to join.
+--   WORKER_SUBMIT_STAGGER_SECONDS=1: 1s delay between worker submissions avoids bursty SPCS scheduling.
+--   KEEP_SUPPORT_JOBS_ON_FAILURE is intentionally not exposed; set env var for diagnostics only.
+CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  '<image_ref>', 6, 4, 1, 6, 300, 'best_quality', 600, 1
 );
 --
 -- Step 7: Aggregation (N=6 must match cluster_shards used in Step 6a or 6b):

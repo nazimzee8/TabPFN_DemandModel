@@ -133,6 +133,13 @@ class TestRunTrainingJobConstant:
         assert run_training_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_primary"
         importlib.reload(run_training_job)
 
+    def test_nonlinear_family_env_var_override(self, monkeypatch):
+        """TRAINING_DATA_FAMILY accepts the nonlinear lineage selector."""
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
+        importlib.reload(run_training_job)
+        assert run_training_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_nonlinear"
+        importlib.reload(run_training_job)
+
     def test_default_is_not_unknown(self, monkeypatch):
         """Production default must not be 'unknown'."""
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)

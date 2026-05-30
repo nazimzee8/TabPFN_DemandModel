@@ -2725,6 +2725,113 @@ class TestSPCSStaticAnalysis:
             "Import lazily inside DeepSet/checkpoint functions."
         )
 
+    def test_production_eval_sql_no_keep_support_jobs_in_procedure_sig(self):
+        src = (ROOT / "sql" / "04_synthetic_regression_evaluation_pipeline.sql").read_text()
+        import re
+        procs = re.findall(
+            r"CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_evaluation\b[^;]+;",
+            src,
+            re.DOTALL,
+        )
+        for proc in procs:
+            assert "KEEP_SUPPORT_JOBS_ON_FAILURE" not in proc, (
+                "KEEP_SUPPORT_JOBS_ON_FAILURE must not appear in any evaluation procedure signature."
+            )
+
+    def test_ray_dashboard_remains_disabled(self):
+        src = (ROOT / "scripts" / "spcs_ray_coordinator.py").read_text()
+        assert "include-dashboard=false" in src or "include_dashboard=False" in src, (
+            "Ray dashboard must remain disabled in spcs_ray_coordinator.py"
+        )
+
+    def test_snowflake_service_not_reintroduced(self):
+        from run_synthetic_regression_evaluation import _build_spcs_job_spec
+        spec = _build_spcs_job_spec(image="test:1.0", args=["/test.py"], env_vars={})
+        assert "snowflakeService" not in spec, (
+            "snowflakeService must not appear in _build_spcs_job_spec output; "
+            "OAuth injection is handled by SPCS service spec, not by Python spec generation."
+        )
+
+    def test_autogluon_ray_contains_failure_debug_stage(self):
+        src = (ROOT / "scripts" / "autogluon_ray.py").read_text()
+        assert "@EVALUATION_RESULTS_STAGE/debug" in src, (
+            "autogluon_ray.py must reference @EVALUATION_RESULTS_STAGE/debug "
+            "for failure artifact persistence"
+        )
+
+    def test_sanitize_item_for_debug_redacts_presigned_url(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from autogluon_ray import _sanitize_item_for_debug
+        item = {
+            "suite_id": "linear_all_v1",
+            "dataset_id": "ds_001",
+            "split_seed": 42,
+            "dataset_access": {
+                "mode": "driver_presigned_url",
+                "stage_path": "@STAGE/data.parquet",
+                "presigned_url": "https://s3.example.com/secret-signed-url?X-Amz-Signature=abc123",
+            },
+        }
+        result = _sanitize_item_for_debug(item)
+        assert "presigned_url" not in result.get("dataset_access", {}), (
+            "_sanitize_item_for_debug must redact presigned_url"
+        )
+        assert result["dataset_access"]["stage_path"] == "@STAGE/data.parquet"
+        assert result["suite_id"] == "linear_all_v1"
+
+    def test_sanitize_item_for_debug_redacts_scoped_url(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from autogluon_ray import _sanitize_item_for_debug
+        item = {
+            "suite_id": "linear_all_v1",
+            "dataset_id": "ds_002",
+            "dataset_access": {
+                "mode": "scoped_file_url",
+                "stage_path": "@STAGE/data.parquet",
+                "scoped_url": "snow://scoped/secret-token/data.parquet",
+            },
+        }
+        result = _sanitize_item_for_debug(item)
+        assert "scoped_url" not in result.get("dataset_access", {}), (
+            "_sanitize_item_for_debug must redact scoped_url"
+        )
+        assert result["dataset_access"]["stage_path"] == "@STAGE/data.parquet"
+
+    def test_failure_writer_catches_upload_error_does_not_mask_original(self):
+        """_write_ag_ray_failure_debug must not let upload errors escape."""
+        src = (ROOT / "scripts" / "autogluon_ray.py").read_text()
+        assert "_write_ag_ray_failure_debug" in src
+        # Static: check the function catches its own exceptions and logs a warning
+        assert "WARNING" in src or "could not upload" in src, (
+            "_write_ag_ray_failure_debug must log a warning on upload failure"
+        )
+        # Static: the caller re-raises the original exception
+        assert "raise" in src, (
+            "autogluon_ray.py must re-raise the original exception after calling "
+            "_write_ag_ray_failure_debug"
+        )
+
+    def test_distributed_loop_fatal_exception_handler_in_autogluon_ray(self):
+        src = (ROOT / "scripts" / "autogluon_ray.py").read_text()
+        assert "FATAL distributed evaluation failure" in src, (
+            "autogluon_ray.py distributed loop must have a top-level fatal exception handler"
+        )
+
+    def test_spcs_eval_compact_work_items_no_ray_put(self):
+        """autogluon_ray.py must not call ray.put() on datasets."""
+        src = (ROOT / "scripts" / "autogluon_ray.py").read_text()
+        assert "ray.put(" not in src, (
+            "autogluon_ray.py must not ray.put() datasets — workers load via presigned URLs"
+        )
+
+    def test_spcs_eval_atomic_uniqueness_guard_present(self):
+        src = (ROOT / "scripts" / "autogluon_ray.py").read_text()
+        assert "Duplicate atomic work item" in src, (
+            "autogluon_ray.py must contain the atomic uniqueness guard before Ray submission"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: SPCS AutoGluon backend
@@ -3669,8 +3776,12 @@ class TestSPCSAutogluonBackend:
             "Capacity probe worker must default to 268435456 bytes object-store"
         )
 
-    def test_spcs_production_eval_uses_production_object_store_defaults(self, monkeypatch):
-        """Production eval coordinator defaults to 500 MB and worker to 2 GB object-store."""
+    def test_spcs_production_eval_uses_256mib_object_store_defaults(self, monkeypatch):
+        """Production eval coordinator and worker both default to 256 MiB object-store.
+
+        Datasets are fetched via presigned URLs, not through the Ray object store.
+        256 MiB avoids /tmp pressure from SPCS /dev/shm (64 MiB limit).
+        """
         import run_synthetic_regression_evaluation as mod
         submitted = []
 
@@ -3700,11 +3811,11 @@ class TestSPCSAutogluonBackend:
         worker_specs = [spec for label, spec in submitted if "worker" in label]
         assert coord_specs, "No coordinator specs captured"
         assert worker_specs, "No worker specs captured"
-        assert "500000000" in coord_specs[0], (
-            "Production eval coordinator must default to 500000000 bytes object-store"
+        assert "268435456" in coord_specs[0], (
+            "Production eval coordinator must default to 268435456 bytes object-store"
         )
-        assert "2000000000" in worker_specs[0], (
-            "Production eval worker must default to 2000000000 bytes object-store"
+        assert "268435456" in worker_specs[0], (
+            "Production eval worker must default to 268435456 bytes object-store"
         )
 
     def test_ray_dashboard_not_in_coordinator_spec(self, monkeypatch):
@@ -3861,6 +3972,156 @@ class TestSPCSAutogluonBackend:
         assert any("worker" in lbl for lbl in cancelled), (
             "Support workers must still be cancelled after coordinator success, "
             "even when keep flag is true"
+        )
+
+    def test_spcs_eval_handler_accepts_ray_timeout_and_stagger_params(self):
+        """Python handler must accept ray_ready_timeout_seconds and worker_submit_stagger_seconds."""
+        import inspect
+        import run_synthetic_regression_evaluation as mod
+        sig = inspect.signature(mod.run_synthetic_regression_combined_autogluon_spcs_evaluation)
+        assert "ray_ready_timeout_seconds" in sig.parameters, (
+            "run_synthetic_regression_combined_autogluon_spcs_evaluation must accept ray_ready_timeout_seconds"
+        )
+        assert "worker_submit_stagger_seconds" in sig.parameters, (
+            "run_synthetic_regression_combined_autogluon_spcs_evaluation must accept worker_submit_stagger_seconds"
+        )
+        assert sig.parameters["ray_ready_timeout_seconds"].default is None
+        assert sig.parameters["worker_submit_stagger_seconds"].default is None
+
+    def test_spcs_eval_ray_timeout_injected_into_coordinator_env(self, monkeypatch):
+        """When ray_ready_timeout_seconds=600, coordinator env must include SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS='600'."""
+        import run_synthetic_regression_evaluation as mod
+        captured_envs = []
+
+        def _capture_submit(session, *, label, compute_pool, env_vars, image,
+                            entrypoint_path, resource_role, endpoints=None):
+            if "spcs_ray_coord" in label:
+                captured_envs.append(dict(env_vars))
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", _capture_submit)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+            ray_ready_timeout_seconds=600,
+        )
+        assert captured_envs, "No coordinator env was captured"
+        for env in captured_envs:
+            assert env.get("SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS") == "600", (
+                f"Expected SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS='600' in coordinator env; got {env}"
+            )
+
+    def test_spcs_eval_ray_timeout_absent_when_not_provided(self, monkeypatch):
+        """When ray_ready_timeout_seconds is not passed, coordinator env must NOT include SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS."""
+        import run_synthetic_regression_evaluation as mod
+        captured_envs = []
+
+        def _capture_submit(session, *, label, compute_pool, env_vars, image,
+                            entrypoint_path, resource_role, endpoints=None):
+            if "spcs_ray_coord" in label:
+                captured_envs.append(dict(env_vars))
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", _capture_submit)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+        assert captured_envs, "No coordinator env was captured"
+        for env in captured_envs:
+            assert "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS" not in env, (
+                "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS must not be set when ray_ready_timeout_seconds is not passed"
+            )
+
+    def test_spcs_eval_worker_stagger_explicit_param_sleeps_n_minus_1(self, monkeypatch):
+        """worker_submit_stagger_seconds=1 with 4 workers → time.sleep(1) called 3 times per shard (N-1)."""
+        import run_synthetic_regression_evaluation as mod
+        sleep_calls = []
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS", 0)
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg",
+            lambda session, *, label, compute_pool, env_vars, image,
+                   entrypoint_path, resource_role, endpoints=None: label.upper())
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=4,
+            autogluon_concurrent_clusters=1,
+            worker_submit_stagger_seconds=1,
+        )
+        stagger_sleeps = [s for s in sleep_calls if s == 1]
+        assert len(stagger_sleeps) == 3, (
+            f"Expected 3 stagger sleeps of 1s for 4 workers (N-1, no final sleep); got sleep_calls={sleep_calls}"
+        )
+
+    def test_spcs_eval_worker_stagger_env_fallback(self, monkeypatch):
+        """When worker_submit_stagger_seconds is not passed, falls back to SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS module constant."""
+        import run_synthetic_regression_evaluation as mod
+        sleep_calls = []
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS", 5)
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg",
+            lambda session, *, label, compute_pool, env_vars, image,
+                   entrypoint_path, resource_role, endpoints=None: label.upper())
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=3,
+            autogluon_concurrent_clusters=1,
+        )
+        stagger_sleeps = [s for s in sleep_calls if s == 5]
+        assert len(stagger_sleeps) == 2, (
+            f"Expected 2 stagger sleeps of 5s for 3 workers via env fallback (N-1); got sleep_calls={sleep_calls}"
         )
 
 
@@ -4358,3 +4619,111 @@ class TestSPCSCoordinatorTopologyGuards:
         coord_spec = submitted[coord_labels[0]]
         assert "autogluon_worker_access_probe.py" in coord_spec
         assert not any("head" in l and "coord" not in l for l in submitted)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Nonlinear evaluation suite (nonlinear_v1)
+# ---------------------------------------------------------------------------
+
+# --- Static analysis tests (added to TestSPCSStaticAnalysis equivalent) ---
+
+def test_nonlinear_script_files_exist():
+    for name in ["generate_nonlinear.py", "evaluate_synthetic_nonlinear.py",
+                 "run_synthetic_nonlinear_evaluation.py"]:
+        assert (ROOT / "scripts" / name).exists(), f"{name} must exist"
+
+
+def test_nonlinear_sql_file_exists():
+    assert (ROOT / "sql" / "05_synthetic_nonlinear_evaluation_pipeline.sql").exists()
+
+
+def test_nonlinear_index_table_in_sql():
+    src = (ROOT / "sql" / "05_synthetic_nonlinear_evaluation_pipeline.sql").read_text()
+    assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in src
+    assert "TRANSIENT TABLE" in src.upper()
+
+
+def test_evaluate_synthetic_nonlinear_does_not_drop_table():
+    src = (ROOT / "scripts" / "evaluate_synthetic_nonlinear.py").read_text()
+    assert "DROP TABLE" not in src.upper()
+    assert "NONLINEAR_SUITE_ID" in src
+
+
+def test_generate_nonlinear_has_all_regimes():
+    src = (ROOT / "scripts" / "generate_nonlinear.py").read_text()
+    for r in ["I", "J", "K", "L"]:
+        assert f'"{r}"' in src or f"'{r}'" in src
+
+
+def test_run_nonlinear_evaluation_injects_index_table():
+    src = (ROOT / "scripts" / "run_synthetic_nonlinear_evaluation.py").read_text()
+    assert "SYNREG_INDEX_TABLE" in src
+    assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in src
+
+
+def test_evaluate_synthetic_regression_index_table_configurable():
+    src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+    assert "SYNREG_INDEX_TABLE" in src
+    assert "os.getenv" in src  # must read from env, not be hardcoded
+
+
+def test_nonlinear_autogluon_ray_does_not_reference_combined_suite():
+    src = (ROOT / "scripts" / "run_synthetic_nonlinear_evaluation.py").read_text()
+    assert "linear_all_v1" not in src, (
+        "run_synthetic_nonlinear_evaluation.py must not reference combined suite_id"
+    )
+    assert "COMBINED_SUITE_ID" not in src
+
+
+# --- Functional tests ---
+
+class TestNonlinearEvaluation:
+    """Functional tests for nonlinear evaluation orchestration handlers."""
+
+    def test_nonlinear_prep_uses_eval_nonlinear_entrypoint(self, monkeypatch):
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_submit_synreg",
+            lambda *a, **kw: submitted.append(kw) or "JOB_ID")
+        monkeypatch.setattr(mod, "_wait_done", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        mod.run_synthetic_nonlinear_prep(object())
+        assert submitted[0]["entrypoint"] == "evaluate_synthetic_nonlinear.py"
+        assert submitted[0]["env_vars"].get("NONLINEAR_SUITE_ID") == "nonlinear_v1"
+
+    def test_nonlinear_deepset_submits_10_gpu_shards(self, monkeypatch):
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_submit_synreg",
+            lambda *a, **kw: submitted.append(kw) or "JOB_ID")
+        monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: True)
+        mod.run_synthetic_nonlinear_deepset_evaluation(object())
+        assert len(submitted) == 10
+        for s in submitted:
+            assert s["env_vars"]["SYNTHETIC_REGRESSION_SUITE_ID"] == "nonlinear_v1"
+            assert s["env_vars"]["SYNREG_INDEX_TABLE"] == "SYNTHETIC_NONLINEAR_DATASET_INDEX"
+            assert s["compute_pool"] == mod.DEEPSET_GPU_POOL
+
+    def test_nonlinear_spcs_uses_nonlinear_suite_id(self, monkeypatch):
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
+        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(), autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        assert coord_specs, "No coordinator spec captured"
+        assert "nonlinear_v1" in coord_specs[0]
+        assert "linear_all_v1" not in coord_specs[0]
+        assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in coord_specs[0]

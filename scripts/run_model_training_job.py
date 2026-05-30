@@ -202,9 +202,12 @@ def _run_model_training_impl(
     # (d_phi/n_sab_feat may differ from pretrain checkpoint); ridge_residual
     # requires exact match because gate-specific checkpoints are built to match.
     hpo_sweep_mode = best_config.get("hpo_sweep_mode", "ridge_residual")
+    is_nonlinear_config = bool(best_config.get("use_latent_ridge_expert", False)) or (
+        str(hpo_sweep_mode).startswith("nonlinear_")
+    )
     pretrain_policy = (
         "allow_cold_start_on_arch_mismatch"
-        if hpo_sweep_mode == "architecture"
+        if hpo_sweep_mode in ("architecture", "nonlinear_meta", "nonlinear_architecture")
         else "require_match"
     )
 
@@ -216,6 +219,7 @@ def _run_model_training_impl(
     _meta_ckpt = str(_meta.get("pretrain_checkpoint_stage_path", "")).strip()
     gate_dim = int(best_config.get("gate_hidden_dim", 64))
 
+    pretrain_checkpoint_path = ""
     if _meta_ckpt:
         _ckpt_filename = _meta_ckpt.rsplit("/", 1)[-1]
         if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", _ckpt_filename):
@@ -231,6 +235,16 @@ def _run_model_training_impl(
             f"{pretrain_checkpoint_path!r}",
             flush=True,
         )
+    elif is_nonlinear_config:
+        allow_cold_start = os.getenv("ALLOW_NONLINEAR_COLD_START", "").lower() == "true"
+        if not allow_cold_start:
+            raise RuntimeError(
+                "[run_model_training] Nonlinear config has no pretrain checkpoint in "
+                "best_config._meta.pretrain_checkpoint_stage_path. "
+                "Run CALL run_pretrain_pipeline_nonlinear(...) then rerun HPO, "
+                "or set ALLOW_NONLINEAR_COLD_START=true to override (dev only)."
+            )
+        print("[run_model_training] ALLOW_NONLINEAR_COLD_START=true: cold-starting.", flush=True)
     else:
         _gate_ckpt_name = f"pretrain_gate{gate_dim}.pt"
         _gate_ckpt_path = f"{MODEL_STAGE}/checkpoints/{_gate_ckpt_name}"
@@ -259,9 +273,10 @@ def _run_model_training_impl(
         "MODEL_FAMILY":               model_family,
         "TRAINING_DATA_FAMILY":       training_data_family,
         "MODEL_DESIGN_PATTERN":      model_design_pattern,
-        "PRETRAIN_CHECKPOINT_PATH":  pretrain_checkpoint_path,
         "PRETRAIN_LOAD_POLICY":      pretrain_policy,
     }
+    if pretrain_checkpoint_path:
+        env_vars["PRETRAIN_CHECKPOINT_PATH"] = pretrain_checkpoint_path
 
     # Topology preflight: EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES × 4.
     _expected_ws = int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"])

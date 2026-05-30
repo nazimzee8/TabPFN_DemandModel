@@ -2880,6 +2880,14 @@ Env vars summary:
 | `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS` | 0 | Sleep (s) between worker submissions |
 | `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE` | false | Leave workers running on coordinator failure |
 
+**SPCS coordinator topology (6×4):** Each Ray shard uses a coordinator container (merges Ray
+head (`--num-cpus=0`) + AutoGluon driver in one container) plus N worker containers. For
+6 shards × 4 workers this is **6 coordinators + 24 workers = 30 containers** submitted to
+`AUTOGLUON_CPU_POOL`. Resource sizing: coordinators default to 1/2 CPU, 4Gi/8Gi memory
+(override via `SYNREG_SPCS_RAY_COORDINATOR_CPU` / `SYNREG_SPCS_RAY_COORDINATOR_MEMORY_*`);
+workers default to 4 CPU, 16Gi memory (override via `SYNREG_SPCS_RAY_WORKER_CPU` /
+`SYNREG_SPCS_RAY_WORKER_MEMORY_*`).
+
 ### SPCS Ray cancellation diagnostics
 
 When Snowflake cancels a worker or coordinator (CANCELLED: Job was cancelled while running),
@@ -2963,3 +2971,203 @@ at module level. These are imported lazily inside DeepSet/checkpoint functions o
 AutoGluon custom image does not need torch for worker-access probes or distributed AutoGluon
 evaluation. If a DeepSet path is invoked in a torch-free runtime, `_import_torch()` raises a
 clear `RuntimeError` instead of a bare `ModuleNotFoundError`.
+
+**Production SPCS evaluation with explicit Ray timeout and worker stagger:**
+```sql
+CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
+  $AUTOGLUON_IMAGE_REF,   -- full OCI image reference
+  6,                       -- AUTOGLUON_CLUSTER_SHARDS (6 Ray clusters)
+  4,                       -- AUTOGLUON_WORKERS_PER_SHARD (4 workers per coordinator)
+  1,                       -- AUTOGLUON_TASK_CPUS
+  6,                       -- AUTOGLUON_CONCURRENT_CLUSTERS (must equal CLUSTER_SHARDS)
+  300,                     -- AUTOGLUON_TIME_LIMIT (seconds)
+  'best_quality',          -- AUTOGLUON_PRESETS
+  600,                     -- RAY_READY_TIMEOUT_SECONDS (how long coordinator waits for workers)
+  1                        -- WORKER_SUBMIT_STAGGER_SECONDS (1s between worker submissions)
+);
+```
+`RAY_READY_TIMEOUT_SECONDS` is passed as `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` in each
+coordinator's environment. `WORKER_SUBMIT_STAGGER_SECONDS=1` resolved the SPCS scheduling burst
+that caused worker join failures. `KEEP_SUPPORT_JOBS_ON_FAILURE` is intentionally not exposed
+on this production call; set `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true` in the environment
+for diagnostics only.
+
+**Distributed AutoGluon failure diagnostics (`@EVALUATION_RESULTS_STAGE/debug`):**
+Ray scheduling is validated separately by the capacity and worker-access probes. If the
+distributed AutoGluon evaluation fails **after** Ray cluster readiness (i.e., during task
+submission, result collection, completeness checks, or CSV write), the coordinator driver now
+persists a JSON failure artifact to:
+
+  `@EVALUATION_RESULTS_STAGE/debug/ag_ray_failure_run_<run_id>_shard_<shard_index>_<ts>.json`
+
+Retrieve with:
+```sql
+LIST @EVALUATION_RESULTS_STAGE/debug;
+GET @EVALUATION_RESULTS_STAGE/debug/ag_ray_failure_run_<filename>.json file:///tmp/;
+```
+
+Artifact fields include: `event`, `run_id`, `shard_index`, `num_shards`, `suite_id`,
+`exception_type`, `exception_message`, `traceback`, `submitted`, `completed`, `pending_count`,
+`output_rows_count`, `expected_work_items`, `compact_items_count`, `cluster_resources`,
+`available_resources`, and `sample_item_metadata_sanitized`. Presigned URLs and scoped URLs
+are redacted from `sample_item_metadata_sanitized`. Full dataset payloads are never included.
+
+**SPCS Ray object-store memory defaults (256 MiB):**
+The SPCS distributed AutoGluon coordinator and worker now default to `268435456` bytes (256 MiB)
+Ray object-store memory. Datasets are fetched by workers via presigned HTTPS URLs and loaded
+locally — nothing is passed through the Ray object store. The previous 500 MB / 2 GB defaults
+created unnecessary `/tmp` pressure given SPCS `/dev/shm` is only 64 MiB.
+Override only if diagnostics show object-store pressure:
+- `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES`
+- `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES`
+### Nonlinear MODEL3 Meta-Learning
+
+The nonlinear synthetic regression path is opt-in and keeps the existing MODEL3
+family selector:
+
+- `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`
+- `MODEL_FAMILY=market_exchangeable_icl`
+- `MODEL_DESIGN_PATTERN=inductive_forecasting`
+- `HPO_SWEEP_MODE=nonlinear_meta`
+- Optional second sweep: `HPO_SWEEP_MODE=nonlinear_architecture` with
+  `HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_nonlinear_meta.json`
+
+Nonlinear HPO cold-starts by default. It does not require the gate-specific
+`pretrain_gate<N>.pt` checkpoints used by `ridge_residual`. If an exact nonlinear
+pretrain is intentionally available, pass it through
+`HPO_PRETRAIN_CHECKPOINT_STAGE_PATH`; incompatible nonlinear checkpoints are skipped
+and the trial cold-starts.
+
+---
+
+## Nonlinear Suite Evaluation (nonlinear_v1)
+
+The nonlinear suite (`nonlinear_v1`, regimes I–L) benchmarks model generalisation when the
+linear prior is misspecified. It uses the same Poisson `(n, p)` sampling and evaluation
+infrastructure as the primary linear suite, but with four nonlinear DGPs:
+
+| Regime | Name | Signal formula |
+|--------|------|----------------|
+| I | Quadratic | `betaX = (X**2) @ beta_sq` |
+| J | Sinusoidal | `betaX = sin(2π * (X @ beta_norm)) * sqrt(p)` |
+| K | Pairwise Interactions | `betaX = Σ c_k * x_i * x_j` (p//2 pairs) |
+| L | ReLU / Threshold | `betaX = Σ relu(x_i * beta_i) - mean` |
+
+### Step 1 — Generate local evaluation datasets
+
+```bash
+python scripts/generate_nonlinear.py --n-datasets 400 --out-dir data/nonlinear_regression/
+```
+
+Output: `data/nonlinear_regression/{I,J,K,L}/` (100 datasets per regime) plus
+`data/nonlinear_regression/nonlinear_manifest.json`.
+
+### Step 2 — Stage datasets to Snowflake
+
+```sql
+PUT file://data/nonlinear_regression/I/*.parquet
+    @EVALUATION_DATASET_STAGE/nonlinear/I/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear_regression/J/*.parquet
+    @EVALUATION_DATASET_STAGE/nonlinear/J/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear_regression/K/*.parquet
+    @EVALUATION_DATASET_STAGE/nonlinear/K/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear_regression/L/*.parquet
+    @EVALUATION_DATASET_STAGE/nonlinear/L/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear_regression/nonlinear_manifest.json
+    @EVALUATION_DATASET_STAGE/nonlinear/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+### Step 3 — Stage updated scripts
+
+```sql
+PUT file://src/evaluate_synthetic_regression.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/evaluate_synthetic_nonlinear.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/run_synthetic_nonlinear_evaluation.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://scripts/run_synthetic_regression_evaluation.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+### Step 4 — Create index table and register stored procedures
+
+Execute `sql/05_synthetic_nonlinear_evaluation_pipeline.sql` in Snowflake. This creates
+`SYNTHETIC_NONLINEAR_DATASET_INDEX` (transient, zero-retention, identical schema to
+`SYNTHETIC_REGRESSION_DATASET_INDEX`) and registers all stored procedures:
+`run_synthetic_nonlinear_prep`, `run_synthetic_nonlinear_deepset_evaluation`,
+`run_synthetic_nonlinear_baseline_evaluation` (3 overloads),
+`run_synthetic_nonlinear_autogluon_spcs_evaluation` (2 overloads),
+`run_synthetic_nonlinear_aggregation` (2 overloads).
+
+Verify after creation (expect 100 rows per regime):
+
+```sql
+SELECT prior_regime, COUNT(*) AS n
+FROM SYNTHETIC_NONLINEAR_DATASET_INDEX
+WHERE suite_id = 'nonlinear_v1'
+GROUP BY prior_regime ORDER BY prior_regime;
+```
+
+### Step 5 — Run the evaluation pipeline
+
+```sql
+-- Phase 1: Index the 400 nonlinear datasets into SYNTHETIC_NONLINEAR_DATASET_INDEX
+CALL run_synthetic_nonlinear_prep('2.5.0-py311');
+
+-- Phase 2: DeepSet GPU evaluation (10 shards on DEEPSET_GPU_POOL)
+CALL run_synthetic_nonlinear_deepset_evaluation('2.5.0-py311');
+
+-- Phase 3: Baseline CPU evaluation
+CALL run_synthetic_nonlinear_baseline_evaluation('2.5.0-py311');
+
+-- Phase 4: AutoGluon SPCS evaluation (Ray distributed, 6 cluster shards)
+CALL run_synthetic_nonlinear_autogluon_spcs_evaluation(
+    '<AG_IMAGE>', 6, 4, 1, 6, 300, 'best_quality', 600, 1);
+
+-- Phase 5: Aggregate results
+CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
+```
+
+For single-node AutoGluon (no Ray, simpler debugging):
+
+```sql
+CALL run_synthetic_nonlinear_autogluon_spcs_evaluation('<AG_IMAGE>', 0, 1, 4);
+```
+
+### SYNREG_INDEX_TABLE routing
+
+The `SYNREG_INDEX_TABLE` env var controls which index table evaluation jobs query for work
+items. All nonlinear orchestration procedures inject this automatically:
+
+```
+SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX
+```
+
+This env var is read by both `evaluate_synthetic_regression.py` and `autogluon_ray.py` (via
+its import of `evaluate_synthetic_regression`). Existing linear evaluation jobs are unaffected
+because `SYNREG_INDEX_TABLE` defaults to `SYNTHETIC_REGRESSION_DATASET_INDEX` when unset.
+
+### Verify outputs
+
+```sql
+LIST @EVALUATION_RESULTS_STAGE/nonlinear/;
+```
+
+Results are written to `@EVALUATION_RESULTS_STAGE/nonlinear/` by the aggregation phase.
+
+### Nonlinear training data (DeepSet pre-training)
+
+To generate nonlinear training data for DeepSet pre-training (separate from evaluation):
+
+```bash
+python src/generate_nonlinear_dgp.py --n_datasets 1000 --out_dir data/nonlinear/
+```
+
+Output:
+- `data/nonlinear/train/` — 800 datasets
+- `data/nonlinear/val/`   — 100 datasets
+- `data/nonlinear/test/`  — 100 datasets
+
+Schema is identical to linear training data (`X_train`, `y_train`, `X_test`, `betaX_test`,
+plus metadata columns `prior_regime`, `n`, `p`, `n_train`, `n_test`).

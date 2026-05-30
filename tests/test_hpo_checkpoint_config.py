@@ -223,7 +223,12 @@ def test_checkpoint_architecture_mismatches_detects_gate_hidden_dim_change():
 def test_hpo_sweep_mode_constant_exists():
     """HPO_SWEEP_MODE constant exists on the hpo module."""
     assert hasattr(hpo, "HPO_SWEEP_MODE")
-    assert hpo.HPO_SWEEP_MODE in {"ridge_residual", "architecture"}
+    assert hpo.HPO_SWEEP_MODE in {
+        "ridge_residual",
+        "architecture",
+        "nonlinear_meta",
+        "nonlinear_architecture",
+    }
 
 
 def test_hpo_sweep_mode_defaults_to_ridge_residual(monkeypatch):

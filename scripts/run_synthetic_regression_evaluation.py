@@ -3511,6 +3511,8 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
     autogluon_concurrent_clusters=None,
     autogluon_time_limit=None,
     autogluon_presets=None,
+    ray_ready_timeout_seconds=None,
+    worker_submit_stagger_seconds=None,
 ) -> str:
     """AutoGluon evaluation using SPCS custom image backend.
 
@@ -3570,6 +3572,11 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
     _verify_spcs_image_in_repository(session, image)
     run_id = _spcs_run_id()
+    _stagger = (
+        worker_submit_stagger_seconds
+        if worker_submit_stagger_seconds is not None
+        else SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS
+    )
 
     if plan.mode == "single_node_shards":
         output_shards = plan.output_shards
@@ -3636,8 +3643,8 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
         # calls SYSTEM$GET_SERVICE_DNS_DOMAIN to auto-resolve the current schema's domain.
         dns_suffix = _spcs_dns_domain(session)
         # Object store memory limits: explicit caps prevent Ray from over-allocating.
-        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "500000000")
-        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "2000000000")
+        coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")
+        worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")
 
         for shard_index in range(cluster_shards):
             coord_label = f"spcs_ray_coord_{run_id}_{shard_index}"
@@ -3689,6 +3696,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                     "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
                     "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
                     "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
+                    **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
                     **_spcs_ray_port_env_vars(),
                 },
             )
@@ -3726,14 +3734,14 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                     endpoints=_spcs_ray_worker_endpoints(),
                 )
                 support_jobs.append((w_label, w_job))
-                if SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS > 0:
+                if _stagger > 0 and w < workers_per_shard - 1:
                     print(
                         f"[INFO] worker submit stagger: run_id={run_id!r} "
                         f"shard_index={shard_index} worker_index={w} "
-                        f"sleep_seconds={SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS}",
+                        f"sleep_seconds={_stagger}",
                         flush=True,
                     )
-                    time.sleep(SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS)
+                    time.sleep(_stagger)
 
         _eval_ok = False
         try:

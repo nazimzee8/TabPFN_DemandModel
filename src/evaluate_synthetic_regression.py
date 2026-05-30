@@ -63,7 +63,7 @@ SYNREG_RESULTS_STAGE = os.getenv(
     "@EVALUATION_RESULTS_STAGE/regression",
 )
 SYNREG_OUTPUT_STAGE = os.getenv("SYNREG_OUTPUT_STAGE", "@EVALUATION_RESULTS_STAGE")
-SYNREG_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
+SYNREG_INDEX_TABLE = os.getenv("SYNREG_INDEX_TABLE", "SYNTHETIC_REGRESSION_DATASET_INDEX")
 SYNREG_WORKER_DATA_ACCESS_MODE = os.getenv(
     "SYNREG_WORKER_DATA_ACCESS_MODE",
     "driver_presigned_url",
@@ -177,6 +177,7 @@ SYNREG_EXPECTED_OUTPUTS = [
 SYNREG_CONDITIONAL_OUTPUTS = [
     "synthetic_regression_summary_by_feature_noise.csv",
     "synthetic_regression_summary_by_training_size.csv",
+    "synthetic_regression_summary_by_regime_n_train_p.csv",
     "synthetic_regression_chart_data_noise_features.csv",
     "synthetic_regression_chart_data_training_size.csv",
 ]
@@ -1094,6 +1095,14 @@ def compute_regression_metrics(
     rmse_b = float(math.sqrt(mse_b))
     mae_b = float(mean_absolute_error(betaX_holdout, y_pred))
     r2_b = float(r2_score(betaX_holdout, y_pred))
+    prediction_std = float(np.std(y_pred))
+    target_std = float(np.std(betaX_holdout))
+    variance_ratio = prediction_std / target_std if target_std > 0 else float("nan")
+    mean_bias = float(np.mean(y_pred - betaX_holdout))
+    if target_std > 0 and len(betaX_holdout) > 1:
+        slope = float(np.polyfit(betaX_holdout, y_pred, 1)[0])
+    else:
+        slope = float("nan")
 
     if y_observed is not None:
         mse_y = float(mean_squared_error(y_observed, y_pred))
@@ -1104,14 +1113,83 @@ def compute_regression_metrics(
         mse_y = rmse_y = mae_y = r2_y = float("nan")
 
     return {
+        "mse": mse_b,
+        "rmse": rmse_b,
+        "mae": mae_b,
+        "r2": r2_b,
         "mse_betaX": mse_b,
         "rmse_betaX": rmse_b,
         "mae_betaX": mae_b,
         "r2_betaX": r2_b,
+        "prediction_std": prediction_std,
+        "target_std": target_std,
+        "variance_ratio": variance_ratio,
+        "mean_bias": mean_bias,
+        "slope_y_pred_vs_y_true": slope,
         "mse_y_observed": mse_y,
         "rmse_y_observed": rmse_y,
         "mae_y_observed": mae_y,
         "r2_y_observed": r2_y,
+    }
+
+
+def compute_deepset_debug_metrics(
+    model,
+    X_train_np: np.ndarray,
+    y_train_np: np.ndarray,
+    X_test_np: np.ndarray,
+    betaX_holdout: np.ndarray,
+    device,
+    test_batch_size: int,
+) -> dict:
+    cfg = getattr(model, "cfg", None)
+    if not bool(getattr(cfg, "use_latent_ridge_expert", False)):
+        return {}
+    torch = _import_torch()
+    Xtr = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
+    ytr = torch.as_tensor(y_train_np, dtype=torch.float32, device=device)
+    y_mean = ytr.mean()
+    y_std = ytr.std(unbiased=False).clamp(min=1e-8)
+    target = np.asarray(betaX_holdout, dtype=np.float64)
+    gates = []
+    latent_preds = []
+    neural_preds = []
+    hybrid_preds = []
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, X_test_np.shape[0], test_batch_size):
+                end = min(start + test_batch_size, X_test_np.shape[0])
+                Xte = torch.as_tensor(X_test_np[start:end], dtype=torch.float32, device=device)
+                _, debug = model(Xtr, ytr, Xte, return_debug=True)
+                if "gate" in debug:
+                    gates.append(debug["gate"].detach().float().cpu().numpy())
+                if "latent_ridge_prediction" in debug:
+                    latent = debug["latent_ridge_prediction"].detach().float()
+                    latent_preds.append((latent * y_std + y_mean).cpu().numpy())
+                if "neural_prediction" in debug:
+                    neural = debug["neural_prediction"].detach().float()
+                    neural_preds.append((neural * y_std + y_mean).cpu().numpy())
+                if "final_normalized_prediction" in debug:
+                    hybrid = debug["final_normalized_prediction"].detach().float()
+                    hybrid_preds.append((hybrid * y_std + y_mean).cpu().numpy())
+    finally:
+        model.train(was_training)
+
+    def _mse(parts):
+        if not parts:
+            return float("nan")
+        pred = np.concatenate(parts).astype(np.float64)
+        return float(mean_squared_error(target[: pred.shape[0]], pred))
+
+    gate_arr = np.concatenate(gates).astype(np.float64) if gates else np.array([], dtype=np.float64)
+    return {
+        "gate_mean": float(np.mean(gate_arr)) if gate_arr.size else float("nan"),
+        "gate_std": float(np.std(gate_arr)) if gate_arr.size else float("nan"),
+        "latent_ridge_mse": _mse(latent_preds),
+        "neural_mse": _mse(neural_preds),
+        "hybrid_mse": _mse(hybrid_preds),
     }
 
 
@@ -1131,7 +1209,11 @@ _CANONICAL_COLUMNS = [
     "selected_features", "feature_selector", "feature_cap", "d_phi", "d_rho",
     "pool", "context_windows", "context_window_size", "test_chunk_size", "mc_k",
     # Metrics
+    "mse", "rmse", "mae", "r2",
     "mse_betaX", "rmse_betaX", "mae_betaX", "r2_betaX",
+    "prediction_std", "target_std", "variance_ratio", "mean_bias",
+    "slope_y_pred_vs_y_true",
+    "gate_mean", "gate_std", "latent_ridge_mse", "neural_mse", "hybrid_mse",
     "mse_y_observed", "rmse_y_observed", "mae_y_observed", "r2_y_observed",
     # Timing
     "fit_time_s", "predict_time_s", "total_time_s",
@@ -1441,6 +1523,20 @@ def run_deepset_synthetic_regression() -> None:
         predict_time = time.perf_counter() - t0
 
         metrics = compute_regression_metrics(y_pred, betaX_holdout, y_observed=y_holdout)
+        try:
+            metrics.update(
+                compute_deepset_debug_metrics(
+                    model,
+                    X_train_sel,
+                    y_train,
+                    X_holdout_sel,
+                    betaX_holdout,
+                    device,
+                    SYNREG_TEST_BATCH_SIZE,
+                )
+            )
+        except Exception as debug_exc:
+            print(f"[WARN] DeepSet debug metrics unavailable: {debug_exc}", flush=True)
 
         row_out = _empty_row()
         row_out.update(base)
@@ -2365,6 +2461,15 @@ def _run_synthetic_regression_aggregation_inner(
             "median_mae_betaX": grp_v["mae_betaX"].median(),
             "mean_r2_betaX": grp_v["r2_betaX"].mean(),
             "median_r2_betaX": grp_v["r2_betaX"].median(),
+            "mean_prediction_std": grp_v["prediction_std"].mean() if "prediction_std" in grp_v.columns else float("nan"),
+            "mean_target_std": grp_v["target_std"].mean() if "target_std" in grp_v.columns else float("nan"),
+            "mean_variance_ratio": grp_v["variance_ratio"].mean() if "variance_ratio" in grp_v.columns else float("nan"),
+            "mean_bias": grp_v["mean_bias"].mean() if "mean_bias" in grp_v.columns else float("nan"),
+            "mean_slope_y_pred_vs_y_true": grp_v["slope_y_pred_vs_y_true"].mean() if "slope_y_pred_vs_y_true" in grp_v.columns else float("nan"),
+            "mean_gate": grp_v["gate_mean"].mean() if "gate_mean" in grp_v.columns else float("nan"),
+            "mean_latent_ridge_mse": grp_v["latent_ridge_mse"].mean() if "latent_ridge_mse" in grp_v.columns else float("nan"),
+            "mean_neural_mse": grp_v["neural_mse"].mean() if "neural_mse" in grp_v.columns else float("nan"),
+            "mean_hybrid_mse": grp_v["hybrid_mse"].mean() if "hybrid_mse" in grp_v.columns else float("nan"),
             "mean_rank_mse_betaX": grp_v["rank_mse_betaX"].mean(),
             "median_rank_mse_betaX": grp_v["rank_mse_betaX"].median(),
             "win_rate_mse": wins / total_valid if total_valid > 0 else float("nan"),
@@ -2401,12 +2506,44 @@ def _run_synthetic_regression_aggregation_inner(
             mean_mae_betaX=("mae_betaX", "mean"),
             mean_r2_betaX=("r2_betaX", "mean"),
             median_r2_betaX=("r2_betaX", "median"),
+            mean_prediction_std=("prediction_std", "mean"),
+            mean_target_std=("target_std", "mean"),
+            mean_variance_ratio=("variance_ratio", "mean"),
+            mean_bias=("mean_bias", "mean"),
+            mean_slope_y_pred_vs_y_true=("slope_y_pred_vs_y_true", "mean"),
+            mean_gate=("gate_mean", "mean"),
+            mean_latent_ridge_mse=("latent_ridge_mse", "mean"),
+            mean_neural_mse=("neural_mse", "mean"),
+            mean_hybrid_mse=("hybrid_mse", "mean"),
             mean_rank_mse_betaX=("rank_mse_betaX", "mean"),
             median_rank_mse_betaX=("rank_mse_betaX", "median"),
         ).reset_index()
         regime_path = os.path.join(agg_local_dir, "synthetic_regression_summary_by_regime.csv")
         df_regime.to_csv(regime_path, index=False)
         _upload_csv(session, regime_path, results_stage)
+
+    rnp_cols = ["prior_regime", "method", "n_train", "p_total"]
+    rnp_cols = [c for c in rnp_cols if c in df_v.columns]
+    if len(rnp_cols) == 4:
+        df_rnp = df_v.groupby(rnp_cols, dropna=False).agg(
+            valid_count=("mse_betaX", "count"),
+            mean_mse_betaX=("mse_betaX", "mean"),
+            mean_rmse_betaX=("rmse_betaX", "mean"),
+            mean_r2_betaX=("r2_betaX", "mean"),
+            mean_prediction_std=("prediction_std", "mean"),
+            mean_target_std=("target_std", "mean"),
+            mean_variance_ratio=("variance_ratio", "mean"),
+            mean_bias=("mean_bias", "mean"),
+            mean_slope_y_pred_vs_y_true=("slope_y_pred_vs_y_true", "mean"),
+            mean_gate=("gate_mean", "mean"),
+            mean_latent_ridge_mse=("latent_ridge_mse", "mean"),
+            mean_neural_mse=("neural_mse", "mean"),
+            mean_hybrid_mse=("hybrid_mse", "mean"),
+        ).reset_index()
+        rnp_path = os.path.join(agg_local_dir, "synthetic_regression_summary_by_regime_n_train_p.csv")
+        if not df_rnp.empty:
+            df_rnp.to_csv(rnp_path, index=False)
+            _upload_csv(session, rnp_path, results_stage)
 
     # --- summary_by_feature_noise ---
     fn_cols = ["feature_noise_level", "prior_regime", "method"]

@@ -46,9 +46,16 @@ MODEL_DESIGN_PATTERN = os.environ.get("MODEL_DESIGN_PATTERN", "inductive_forecas
 # HPO sweep mode — controls which search space is used.
 # ridge_residual (default): tunes optimizer/regularization/Ridge Expert; architecture fixed.
 # architecture: tunes d_phi/n_sab_feat with Ridge Expert fixed; cold-start allowed on mismatch.
+# nonlinear_meta: tunes latent nonlinear ridge/head/pooling behavior with fixed base dimensions.
+# nonlinear_architecture: tunes nonlinear architecture fields using nonlinear_meta baseline.
 HPO_SWEEP_MODE = os.environ.get("HPO_SWEEP_MODE", "ridge_residual").strip().lower()
 
-_ALLOWED_HPO_SWEEP_MODES = {"ridge_residual", "architecture"}
+_ALLOWED_HPO_SWEEP_MODES = {
+    "ridge_residual",
+    "architecture",
+    "nonlinear_meta",
+    "nonlinear_architecture",
+}
 if HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
     raise ValueError(
         f"Invalid HPO_SWEEP_MODE={HPO_SWEEP_MODE!r}. "
@@ -57,6 +64,9 @@ if HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
 
 HPO_BASELINE_CONFIG_STAGE_PATH = os.environ.get(
     "HPO_BASELINE_CONFIG_STAGE_PATH", ""
+).strip()
+HPO_PRETRAIN_CHECKPOINT_STAGE_PATH = os.environ.get(
+    "HPO_PRETRAIN_CHECKPOINT_STAGE_PATH", ""
 ).strip()
 
 
@@ -123,30 +133,45 @@ def _merge_sweep_configs(baseline_config, arch_config):
     """
     merged = {**baseline_config}
     # Override architecture-specific keys from arch sweep
-    for key in ("d_phi", "n_sab_feat", "hpo_sweep_mode"):
+    for key in (
+        "d_phi",
+        "n_sab_feat",
+        "hpo_sweep_mode",
+        "latent_ridge_dim",
+        "icl_pool_mode",
+        "feature_pool_mode",
+        "use_query_context_attention",
+        "query_context_heads",
+    ):
         if key in arch_config:
             merged[key] = arch_config[key]
 
     baseline_meta = baseline_config.get("_meta", {})
     arch_meta = arch_config.get("_meta", {})
+    baseline_sweep_name = baseline_config.get("hpo_sweep_mode", "ridge_residual")
+    arch_sweep_name = arch_config.get("hpo_sweep_mode", "architecture")
     merged["_meta"] = {
         "sweeps": {
-            "ridge_residual": {
-                "stage_path": "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
+            baseline_sweep_name: {
+                "stage_path": f"@MODEL_STAGE/hpo/best_config_{baseline_sweep_name}.json",
                 "best_val_mse": baseline_meta.get("best_val_mse"),
                 "pretrain_warm_start_policy": baseline_meta.get("pretrain_warm_start_policy"),
             },
-            "architecture": {
-                "stage_path": "@MODEL_STAGE/hpo/best_config_architecture.json",
+            arch_sweep_name: {
+                "stage_path": f"@MODEL_STAGE/hpo/best_config_{arch_sweep_name}.json",
                 "best_val_mse": arch_meta.get("best_val_mse"),
                 "pretrain_warm_start_policy": arch_meta.get("pretrain_warm_start_policy"),
                 "d_phi": arch_config.get("d_phi"),
                 "n_sab_feat": arch_config.get("n_sab_feat"),
+                "latent_ridge_dim": arch_config.get("latent_ridge_dim"),
+                "icl_pool_mode": arch_config.get("icl_pool_mode"),
+                "feature_pool_mode": arch_config.get("feature_pool_mode"),
+                "use_query_context_attention": arch_config.get("use_query_context_attention"),
             },
         },
         "merged_from": [
-            "@MODEL_STAGE/hpo/best_config_ridge_residual.json",
-            "@MODEL_STAGE/hpo/best_config_architecture.json",
+            f"@MODEL_STAGE/hpo/best_config_{baseline_sweep_name}.json",
+            f"@MODEL_STAGE/hpo/best_config_{arch_sweep_name}.json",
         ],
         "best_val_mse": arch_meta.get("best_val_mse"),
     }
@@ -286,6 +311,15 @@ def checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "model_family",
         "use_ridge_expert",
         "gate_hidden_dim",
+        "use_latent_ridge_expert",
+        "latent_ridge_dim",
+        "latent_ridge_use_bias",
+        "use_query_context_attention",
+        "query_context_heads",
+        "icl_pool_mode",
+        "feature_pool_mode",
+        "ridge_mixture_mode",
+        "nonlinear_head_hidden_mult",
     )
     return {
         field: {
@@ -582,12 +616,72 @@ def build_hpo_search_space(tune, baseline_config=None) -> dict:
             "model_design_pattern": MODEL_DESIGN_PATTERN,
             "hpo_sweep_mode":       HPO_SWEEP_MODE,
         }
+    if HPO_SWEEP_MODE == "nonlinear_meta":
+        return {
+            "lr":                   tune.loguniform(1e-4, 3e-3),
+            "weight_decay":         tune.loguniform(1e-6, 1e-3),
+            "dropout":              tune.uniform(0.0, 0.25),
+            "use_ridge_expert":     False,
+            "ridge_lambda":         1.0,
+            "gate_hidden_dim":      64,
+            "use_latent_ridge_expert": True,
+            "latent_ridge_dim":     64,
+            "latent_ridge_lambda":  tune.loguniform(1e-3, 1e2),
+            "latent_ridge_jitter":  tune.choice([1e-8, 1e-6, 1e-4]),
+            "latent_ridge_use_bias": tune.choice([True, False]),
+            "use_query_context_attention": tune.choice([False, True]),
+            "query_context_heads":  4,
+            "icl_pool_mode":        tune.choice(["mean", "pna", "multipool"]),
+            "feature_pool_mode":    tune.choice(["mean", "pna", "attn"]),
+            "ridge_mixture_mode":   tune.choice(["residual", "convex"]),
+            "nonlinear_head_hidden_mult": tune.choice([1, 2, 4]),
+            "use_huber":            tune.choice([False, True]),
+            "huber_delta":          tune.choice([0.5, 1.0, 2.0]),
+            "lambda_l1":            tune.choice([0.0, 1e-6, 1e-5, 1e-4]),
+            "d_phi":                FIXED_D_PHI,
+            "n_sab_feat":           FIXED_N_SAB_FEAT,
+            "d_rho":                FIXED_D_RHO,
+            "pool":                 FIXED_POOL,
+            "model_family":         MODEL_FAMILY,
+            "model_design_pattern": MODEL_DESIGN_PATTERN,
+            "hpo_sweep_mode":       HPO_SWEEP_MODE,
+        }
     # architecture sweep: freeze optimizer/regularization from ridge_residual baseline
     if baseline_config is None:
         raise ValueError(
-            "architecture HPO requires HPO_BASELINE_CONFIG_STAGE_PATH. Run ridge_residual HPO "
-            "first, then pass HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_ridge_residual.json"
+            f"{HPO_SWEEP_MODE} HPO requires HPO_BASELINE_CONFIG_STAGE_PATH. Run the baseline HPO "
+            "first, then pass the matching best_config stage path."
         )
+    if HPO_SWEEP_MODE == "nonlinear_architecture":
+        return {
+            "lr":               float(baseline_config["lr"]),
+            "weight_decay":     float(baseline_config["weight_decay"]),
+            "dropout":          float(baseline_config["dropout"]),
+            "use_ridge_expert": bool(baseline_config.get("use_ridge_expert", False)),
+            "ridge_lambda":     float(baseline_config.get("ridge_lambda", 1.0)),
+            "gate_hidden_dim":  int(baseline_config.get("gate_hidden_dim", 64)),
+            "use_latent_ridge_expert": True,
+            "latent_ridge_dim": tune.choice([32, 64, 128]),
+            "latent_ridge_lambda": float(baseline_config.get("latent_ridge_lambda", 1.0)),
+            "latent_ridge_jitter": float(baseline_config.get("latent_ridge_jitter", 1e-6)),
+            "latent_ridge_use_bias": bool(baseline_config.get("latent_ridge_use_bias", True)),
+            "use_query_context_attention": tune.choice([False, True]),
+            "query_context_heads": int(baseline_config.get("query_context_heads", 4)),
+            "icl_pool_mode": tune.choice(["mean", "pna", "multipool"]),
+            "feature_pool_mode": tune.choice(["mean", "pna", "attn"]),
+            "ridge_mixture_mode": baseline_config.get("ridge_mixture_mode", "residual"),
+            "nonlinear_head_hidden_mult": int(baseline_config.get("nonlinear_head_hidden_mult", 2)),
+            "use_huber":        bool(baseline_config.get("use_huber", False)),
+            "huber_delta":      float(baseline_config.get("huber_delta", 1.0)),
+            "lambda_l1":        float(baseline_config.get("lambda_l1", 0.0)),
+            "d_rho":            FIXED_D_RHO,
+            "pool":             FIXED_POOL,
+            "model_family":     MODEL_FAMILY,
+            "model_design_pattern": MODEL_DESIGN_PATTERN,
+            "hpo_sweep_mode":   HPO_SWEEP_MODE,
+            "d_phi":            tune.choice(ARCH_D_PHI_CANDIDATES),
+            "n_sab_feat":       tune.choice(ARCH_N_SAB_FEAT_CANDIDATES),
+        }
     return {
         "lr":               float(baseline_config["lr"]),
         "weight_decay":     float(baseline_config["weight_decay"]),
@@ -646,6 +740,17 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_map_ref):
         use_huber        = bool(config.get("use_huber",        False))
         huber_delta      = float(config.get("huber_delta",    1.0))
         lambda_l1        = float(config.get("lambda_l1",      0.0))
+        use_latent_ridge_expert = bool(config.get("use_latent_ridge_expert", False))
+        latent_ridge_dim        = int(config.get("latent_ridge_dim", 64))
+        latent_ridge_lambda     = float(config.get("latent_ridge_lambda", 1.0))
+        latent_ridge_jitter     = float(config.get("latent_ridge_jitter", 1e-6))
+        latent_ridge_use_bias   = bool(config.get("latent_ridge_use_bias", True))
+        use_query_context_attention = bool(config.get("use_query_context_attention", False))
+        query_context_heads     = int(config.get("query_context_heads", 4))
+        icl_pool_mode           = config.get("icl_pool_mode", "mean")
+        feature_pool_mode       = config.get("feature_pool_mode", "mean")
+        ridge_mixture_mode      = config.get("ridge_mixture_mode", "residual")
+        nonlinear_head_hidden_mult = int(config.get("nonlinear_head_hidden_mult", 2))
 
         device  = "cuda" if torch.cuda.is_available() else "cpu"
         use_amp = device == "cuda"
@@ -676,15 +781,6 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_map_ref):
                 f"found {record_counts}"
             )
 
-        # Select the pretrain checkpoint matching this trial's gate_hidden_dim
-        if gate_hidden_dim not in pretrain_ckpt_map:
-            raise RuntimeError(
-                f"[HPO trial] No pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}. "
-                f"Available gate dims: {sorted(pretrain_ckpt_map.keys())}. "
-                "Run CALL run_pretrain_pipeline(..., gate_hidden_dim) for all candidates."
-            )
-        pretrain_ckpt = pretrain_ckpt_map[gate_hidden_dim]
-
         cfg = ModelConfig(
             d_phi=d_phi, d_rho=d_rho, pool=pool,
             n_heads=N_HEADS, n_sab_feat=n_sab_feat,
@@ -695,28 +791,64 @@ def _build_ray_trainable(hpo_data_ref, pretrain_ckpt_map_ref):
             use_ridge_expert=use_ridge_expert,
             ridge_lambda=ridge_lambda,
             gate_hidden_dim=gate_hidden_dim,
+            use_latent_ridge_expert=use_latent_ridge_expert,
+            latent_ridge_dim=latent_ridge_dim,
+            latent_ridge_lambda=latent_ridge_lambda,
+            latent_ridge_jitter=latent_ridge_jitter,
+            latent_ridge_use_bias=latent_ridge_use_bias,
+            use_query_context_attention=use_query_context_attention,
+            query_context_heads=query_context_heads,
+            icl_pool_mode=icl_pool_mode,
+            feature_pool_mode=feature_pool_mode,
+            ridge_mixture_mode=ridge_mixture_mode,
+            nonlinear_head_hidden_mult=nonlinear_head_hidden_mult,
         )
         model = _instantiate_model(cfg).to(device)
 
-        if not pretrain_ckpt:
-            raise RuntimeError(
-                f"[HPO trial] Missing mandatory pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}"
+        pretrain_ckpt = None
+        if use_latent_ridge_expert:
+            pretrain_ckpt = pretrain_ckpt_map.get("nonlinear")
+            if pretrain_ckpt:
+                _saved_cfg = pretrain_ckpt.get("cfg")
+                _arch_mismatches = checkpoint_architecture_mismatches(_saved_cfg, cfg)
+                if _arch_mismatches:
+                    print(
+                        f"[HPO nonlinear] Exact nonlinear pretrain mismatch; cold-starting trial: "
+                        f"{_arch_mismatches}",
+                        flush=True,
+                    )
+                    pretrain_ckpt = None
+            else:
+                print("[HPO nonlinear] No explicit nonlinear pretrain checkpoint; cold-starting.", flush=True)
+        else:
+            # Select the pretrain checkpoint matching this trial's gate_hidden_dim.
+            if gate_hidden_dim not in pretrain_ckpt_map:
+                raise RuntimeError(
+                    f"[HPO trial] No pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}. "
+                    f"Available gate dims: {sorted(pretrain_ckpt_map.keys())}. "
+                    "Run CALL run_pretrain_pipeline(..., gate_hidden_dim) for all candidates."
+                )
+            pretrain_ckpt = pretrain_ckpt_map[gate_hidden_dim]
+            if not pretrain_ckpt:
+                raise RuntimeError(
+                    f"[HPO trial] Missing mandatory pretrain checkpoint for gate_hidden_dim={gate_hidden_dim}"
+                )
+            _saved_cfg = pretrain_ckpt.get("cfg")
+            _arch_mismatches = checkpoint_architecture_mismatches(_saved_cfg, cfg)
+            if _arch_mismatches:
+                raise RuntimeError(
+                    f"[HPO trial] Pretrain checkpoint architecture mismatch for "
+                    f"gate_hidden_dim={gate_hidden_dim}: {_arch_mismatches}; "
+                    f"saved={_saved_cfg}, current={cfg}. "
+                    f"The pretrain_gate{gate_hidden_dim}.pt checkpoint must exactly "
+                    "match the trial architecture (d_phi, gate_hidden_dim, etc.)."
+                )
+        if pretrain_ckpt:
+            model.load_state_dict(pretrain_ckpt["state_dict"])
+            print(
+                f"[HPO trial] Loaded pretrain checkpoint from Ray object store.",
+                flush=True,
             )
-        _saved_cfg = pretrain_ckpt.get("cfg")
-        _arch_mismatches = checkpoint_architecture_mismatches(_saved_cfg, cfg)
-        if _arch_mismatches:
-            raise RuntimeError(
-                f"[HPO trial] Pretrain checkpoint architecture mismatch for "
-                f"gate_hidden_dim={gate_hidden_dim}: {_arch_mismatches}; "
-                f"saved={_saved_cfg}, current={cfg}. "
-                f"The pretrain_gate{gate_hidden_dim}.pt checkpoint must exactly "
-                "match the trial architecture (d_phi, gate_hidden_dim, etc.)."
-            )
-        model.load_state_dict(pretrain_ckpt["state_dict"])
-        print(
-            f"[HPO trial] Loaded pretrain_gate{gate_hidden_dim}.pt from Ray object store.",
-            flush=True,
-        )
 
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
         scaler    = torch.cuda.amp.GradScaler(enabled=False)   # BF16 needs no loss scaling
@@ -787,11 +919,11 @@ def main():
 
     # ── Ray cluster initialization ────────────────────────────────────────────
     # Gate-specific pretrain checkpoints are required for ridge_residual mode.
-    # Architecture sweep uses cold-start (allow_cold_start_on_arch_mismatch) so
-    # gate-specific checkpoints are optional; an empty map means all trials cold-start.
+    # Nonlinear modes cold-start by default; they only use an explicitly supplied
+    # exact-match nonlinear checkpoint.
     if HPO_SWEEP_MODE == "ridge_residual":
         checkpoint_map = _check_pretrain_checkpoints()
-    else:
+    elif HPO_SWEEP_MODE == "architecture":
         # architecture sweep: gate checkpoints optional; cold-start on mismatch
         try:
             checkpoint_map = _check_pretrain_checkpoints()
@@ -802,6 +934,15 @@ def main():
                 "all trials will cold-start (PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch).",
                 flush=True,
             )
+    else:
+        checkpoint_map = {}
+        if HPO_PRETRAIN_CHECKPOINT_STAGE_PATH:
+            checkpoint_map["nonlinear"] = HPO_PRETRAIN_CHECKPOINT_STAGE_PATH
+            print(
+                "[HPO nonlinear] Using explicit nonlinear pretrain candidate: "
+                f"{HPO_PRETRAIN_CHECKPOINT_STAGE_PATH}",
+                flush=True,
+            )
 
     # ── metadata selection ────────────────────────────────────────────────────
     hpo_rows           = select_hpo_index_rows()
@@ -809,7 +950,7 @@ def main():
     selected_train_rows = sum(1 for row in hpo_rows if row["split"] == "train")
     selected_val_rows   = sum(1 for row in hpo_rows if row["split"] == "val")
 
-    if HPO_SWEEP_MODE == "ridge_residual":
+    if HPO_SWEEP_MODE in ("ridge_residual", "nonlinear_meta"):
         enforce_fixed_architecture_cardinality(max_p, max_n_train)
         print(
             "Fixed HPO architecture:",
@@ -841,7 +982,7 @@ def main():
 
     # Load baseline config for architecture sweep (driver only, before Ray init)
     baseline_config = None
-    if HPO_SWEEP_MODE == "architecture":
+    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture"):
         baseline_config = _load_baseline_config_from_stage(HPO_BASELINE_CONFIG_STAGE_PATH)
         print("[HPO driver] loaded baseline config from", HPO_BASELINE_CONFIG_STAGE_PATH, flush=True)
 
@@ -885,19 +1026,25 @@ def main():
 
     # ── Ray Tune search space ─────────────────────────────────────────────────
     search_space = build_hpo_search_space(tune, baseline_config=baseline_config)
-    _arch_info = (
-        {
+    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture"):
+        _arch_info = {
             "d_phi_candidates":      ARCH_D_PHI_CANDIDATES,
             "n_sab_feat_candidates": ARCH_N_SAB_FEAT_CANDIDATES,
             "pretrain_mismatch_policy": "cold_start",
         }
-        if HPO_SWEEP_MODE == "architecture"
-        else {
+    elif HPO_SWEEP_MODE == "nonlinear_meta":
+        _arch_info = {
+            "d_phi":       FIXED_D_PHI,
+            "n_sab_feat":  FIXED_N_SAB_FEAT,
+            "pretrain_mismatch_policy": "cold_start",
+            "latent_ridge_dim": 64,
+        }
+    else:
+        _arch_info = {
             "d_phi":       FIXED_D_PHI,
             "n_sab_feat":  FIXED_N_SAB_FEAT,
             "pretrain_mismatch_policy": "fail_trial",
         }
-    )
     print(
         "HPO Ray Tune config:",
         {
@@ -956,6 +1103,17 @@ def main():
         "use_ridge_expert":     bool(best_config_raw.get("use_ridge_expert", True)),
         "ridge_lambda":         float(best_config_raw.get("ridge_lambda",    1.0)),
         "gate_hidden_dim":      int(best_config_raw.get("gate_hidden_dim",   64)),
+        "use_latent_ridge_expert": bool(best_config_raw.get("use_latent_ridge_expert", False)),
+        "latent_ridge_dim":     int(best_config_raw.get("latent_ridge_dim", 64)),
+        "latent_ridge_lambda":  float(best_config_raw.get("latent_ridge_lambda", 1.0)),
+        "latent_ridge_jitter":  float(best_config_raw.get("latent_ridge_jitter", 1e-6)),
+        "latent_ridge_use_bias": bool(best_config_raw.get("latent_ridge_use_bias", True)),
+        "use_query_context_attention": bool(best_config_raw.get("use_query_context_attention", False)),
+        "query_context_heads":  int(best_config_raw.get("query_context_heads", 4)),
+        "icl_pool_mode":        best_config_raw.get("icl_pool_mode", "mean"),
+        "feature_pool_mode":    best_config_raw.get("feature_pool_mode", "mean"),
+        "ridge_mixture_mode":   best_config_raw.get("ridge_mixture_mode", "residual"),
+        "nonlinear_head_hidden_mult": int(best_config_raw.get("nonlinear_head_hidden_mult", 2)),
 
         "use_huber":            bool(best_config_raw.get("use_huber",    False)),
         "huber_delta":          float(best_config_raw.get("huber_delta", 1.0)),
@@ -970,12 +1128,19 @@ def main():
             "best_val_mse":               float(best_val_mse) if best_val_mse is not None else None,
             "num_trials":                 NUM_TRIALS,
             "trial_max_epochs":           TRIAL_MAX_EPOCHS,
-            "pretrain_warm_start_policy": "fail_on_mismatch",
+            "pretrain_warm_start_policy": (
+                "cold_start_default_exact_match_optional"
+                if bool(best_config_raw.get("use_latent_ridge_expert", False))
+                else "fail_on_mismatch"
+            ),
             "pretrain_checkpoint_map": {
                 str(gate_dim): path for gate_dim, path in checkpoint_map.items()
             },
             "pretrain_checkpoint_stage_path": checkpoint_map.get(
-                int(best_config_raw.get("gate_hidden_dim", 64)), ""
+                "nonlinear"
+                if bool(best_config_raw.get("use_latent_ridge_expert", False))
+                else int(best_config_raw.get("gate_hidden_dim", 64)),
+                ""
             ),
         },
     }
@@ -984,7 +1149,7 @@ def main():
     _upload_json_to_hpo(sweep_filename, best_config)
     print(f"Uploaded {sweep_filename} to @MODEL_STAGE/hpo/", flush=True)
 
-    if HPO_SWEEP_MODE == "architecture" and baseline_config is not None:
+    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture") and baseline_config is not None:
         merged = _merge_sweep_configs(baseline_config, best_config)
         _upload_json_to_hpo("best_config.json", merged)
         print("Uploaded merged best_config.json to @MODEL_STAGE/hpo/", flush=True)

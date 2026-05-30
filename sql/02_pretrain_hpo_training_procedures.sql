@@ -189,6 +189,87 @@ CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
   IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
   HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep_with_baseline';
 
+-- Six-arg overload: sweep mode + baseline config + pretrain checkpoint.
+-- Required for nonlinear HPO sweeps that need a nonlinear pretrain warm-start.
+-- HPO_PRETRAIN_CHECKPOINT_STAGE_PATH: path to pretrain_nonlinear_meta.pt.
+-- Pass '' for linear sweeps where no explicit pretrain checkpoint is needed.
+--
+-- Nonlinear HPO two-sweep sequence:
+--   -- Sweep 1: nonlinear_meta (warm-start from pretrain_nonlinear_meta.pt)
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_nonlinear',
+--       'inductive_forecasting', 'nonlinear_meta', '',
+--       '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+--   );
+--   -- Sweep 2: nonlinear_architecture (baseline from sweep 1 + pretrain checkpoint)
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl', 'synthetic_regression_nonlinear',
+--       'inductive_forecasting', 'nonlinear_architecture',
+--       '@MODEL_STAGE/hpo/best_config_nonlinear_meta.json',
+--       '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+--   );
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING,
+  HPO_SWEEP_MODE STRING,
+  HPO_BASELINE_CONFIG_STAGE_PATH STRING,
+  HPO_PRETRAIN_CHECKPOINT_STAGE_PATH STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep_with_baseline_and_pretrain';
+
+-- build_meta_nonlinear_dataset_index() lists @META_NONLINEAR_DATASET_STAGE/{train,val,test}/,
+-- reads scalar parquet metadata, truncates/rebuilds META_NONLINEAR_DATASET_INDEX,
+-- and validates 800/100/100 split counts.
+-- Run after uploading nonlinear training parquets to @META_NONLINEAR_DATASET_STAGE.
+CREATE OR REPLACE PROCEDURE build_meta_nonlinear_dataset_index()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/build_meta_nonlinear_dataset_index.py')
+  HANDLER = 'build_meta_nonlinear_dataset_index.main';
+
+-- run_pretrain_pipeline_nonlinear() — nonlinear pretrain entrypoints.
+--
+-- Writes @MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt with
+-- use_latent_ridge_expert=True and latent_ridge_dim=64.
+-- Validates META_NONLINEAR_DATASET_INDEX before submitting.
+-- Run this before any nonlinear HPO sweep.
+--
+-- 0-arg form (env-var defaults):
+--   CALL run_pretrain_pipeline_nonlinear();
+-- 3-arg form (explicit model selectors — recommended):
+--   CALL run_pretrain_pipeline_nonlinear(
+--       'market_exchangeable_icl',
+--       'synthetic_regression_nonlinear',
+--       'inductive_forecasting'
+--   );
+CREATE OR REPLACE PROCEDURE run_pretrain_pipeline_nonlinear()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_nonlinear';
+
+CREATE OR REPLACE PROCEDURE run_pretrain_pipeline_nonlinear(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_nonlinear_model';
+
 -- run_model_training() reads @MODEL_STAGE/hpo/best_config.json, passes it to
 -- train.py as BEST_CONFIG, and produces @MODEL_STAGE/checkpoints/best.pt.
 -- Checkpoint metadata includes: model_family, task_type, training_data_family,

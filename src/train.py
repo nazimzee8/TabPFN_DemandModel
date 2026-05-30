@@ -75,6 +75,7 @@ _TRAINING_DATA_FAMILY_ALLOWED = frozenset({
     "synthetic_regression_primary",
     "synthetic_regression_ood",
     "synthetic_regression_combined",
+    "synthetic_regression_nonlinear",
     "market_mental_model",
     "unknown",
 })
@@ -266,6 +267,15 @@ def _checkpoint_architecture_mismatches(saved_cfg, current_cfg):
         "model_family",
         "use_ridge_expert",
         "gate_hidden_dim",
+        "use_latent_ridge_expert",
+        "latent_ridge_dim",
+        "latent_ridge_use_bias",
+        "use_query_context_attention",
+        "query_context_heads",
+        "icl_pool_mode",
+        "feature_pool_mode",
+        "ridge_mixture_mode",
+        "nonlinear_head_hidden_mult",
     )
     return {
         field: {
@@ -524,6 +534,17 @@ def train_fn():
     ridge_lambda     = float(hyper_params.get("ridge_lambda",    1.0))
     gate_hidden_dim  = int(hyper_params.get("gate_hidden_dim",   DEFAULT_GATE_HIDDEN_DIM))
     n_sab_feat       = int(hyper_params.get("n_sab_feat",        N_SAB_FEAT))
+    use_latent_ridge_expert = bool(hyper_params.get("use_latent_ridge_expert", False))
+    latent_ridge_dim        = int(hyper_params.get("latent_ridge_dim", 64))
+    latent_ridge_lambda     = float(hyper_params.get("latent_ridge_lambda", 1.0))
+    latent_ridge_jitter     = float(hyper_params.get("latent_ridge_jitter", 1e-6))
+    latent_ridge_use_bias   = bool(hyper_params.get("latent_ridge_use_bias", True))
+    use_query_context_attention = bool(hyper_params.get("use_query_context_attention", False))
+    query_context_heads     = int(hyper_params.get("query_context_heads", 4))
+    icl_pool_mode           = hyper_params.get("icl_pool_mode", "mean")
+    feature_pool_mode       = hyper_params.get("feature_pool_mode", "mean")
+    ridge_mixture_mode      = hyper_params.get("ridge_mixture_mode", "residual")
+    nonlinear_head_hidden_mult = int(hyper_params.get("nonlinear_head_hidden_mult", 2))
 
     _huber_loss = nn.HuberLoss(delta=huber_delta) if use_huber else None
     loss_fn     = (lambda y_hat, y: _huber_loss(y_hat, y)) if use_huber else None
@@ -610,7 +631,18 @@ def train_fn():
                         model_design_pattern=_design_pattern,
                         use_ridge_expert=use_ridge_expert,
                         ridge_lambda=ridge_lambda,
-                        gate_hidden_dim=gate_hidden_dim)
+                        gate_hidden_dim=gate_hidden_dim,
+                        use_latent_ridge_expert=use_latent_ridge_expert,
+                        latent_ridge_dim=latent_ridge_dim,
+                        latent_ridge_lambda=latent_ridge_lambda,
+                        latent_ridge_jitter=latent_ridge_jitter,
+                        latent_ridge_use_bias=latent_ridge_use_bias,
+                        use_query_context_attention=use_query_context_attention,
+                        query_context_heads=query_context_heads,
+                        icl_pool_mode=icl_pool_mode,
+                        feature_pool_mode=feature_pool_mode,
+                        ridge_mixture_mode=ridge_mixture_mode,
+                        nonlinear_head_hidden_mult=nonlinear_head_hidden_mult)
     print(
         f"[train_fn] model_family={cfg.model_family} "
         f"training_data_family={TRAINING_DATA_FAMILY} "
@@ -681,6 +713,15 @@ def train_fn():
                 _metadata["ridge_lambda"]     = cfg.ridge_lambda
                 _metadata["gate_hidden_dim"]  = cfg.gate_hidden_dim
                 _metadata["n_sab_feat"]       = cfg.n_sab_feat
+                _metadata["use_latent_ridge_expert"] = cfg.use_latent_ridge_expert
+                _metadata["latent_ridge_dim"] = cfg.latent_ridge_dim
+                _metadata["latent_ridge_lambda"] = cfg.latent_ridge_lambda
+                _metadata["latent_ridge_use_bias"] = cfg.latent_ridge_use_bias
+                _metadata["use_query_context_attention"] = cfg.use_query_context_attention
+                _metadata["query_context_heads"] = cfg.query_context_heads
+                _metadata["icl_pool_mode"] = cfg.icl_pool_mode
+                _metadata["feature_pool_mode"] = cfg.feature_pool_mode
+                _metadata["ridge_mixture_mode"] = cfg.ridge_mixture_mode
                 if hyper_params.get("hpo_sweep_mode"):
                     _metadata["hpo_sweep_mode"] = hyper_params["hpo_sweep_mode"]
                 # Pretrain load policy tracking

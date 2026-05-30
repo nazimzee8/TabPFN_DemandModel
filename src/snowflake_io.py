@@ -6,9 +6,20 @@ import posixpath
 
 META_DATASET_STAGE = "@META_DATASET_STAGE"
 META_DATASET_INDEX = "META_DATASET_INDEX"
+META_NONLINEAR_DATASET_STAGE = "@META_NONLINEAR_DATASET_STAGE"
+META_NONLINEAR_DATASET_INDEX = "META_NONLINEAR_DATASET_INDEX"
+NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
 DEFAULT_SPLITS = ("train", "val", "test")
 RUNTIME_INDEX_COLUMNS = ("split", "task_id", "stage_path", "p", "n_train")
 HPO_INDEX_COLUMNS = RUNTIME_INDEX_COLUMNS + ("hpo_bucket", "prior_regime")
+
+
+def _resolve_index_table_and_stage(training_data_family=None):
+    """Return (index_table, stage) based on TRAINING_DATA_FAMILY env var or explicit arg."""
+    family = training_data_family or os.getenv("TRAINING_DATA_FAMILY", "")
+    if family == NONLINEAR_TRAINING_FAMILY:
+        return META_NONLINEAR_DATASET_INDEX, META_NONLINEAR_DATASET_STAGE
+    return META_DATASET_INDEX, META_DATASET_STAGE
 
 
 def _get_active_session_or_none():
@@ -29,20 +40,23 @@ def materialize_meta_dataset_stage(local_root="/tmp/data", splits=DEFAULT_SPLITS
     Materialize staged meta-dataset parquet splits inside a Snowflake MLJob.
 
     This intentionally does nothing outside Snowflake. It must not be used to pull
-    @META_DATASET_STAGE contents onto a developer workstation.
+    stage contents onto a developer workstation.
+
+    Routes to META_NONLINEAR_DATASET_STAGE when TRAINING_DATA_FAMILY=synthetic_regression_nonlinear.
     """
+    _index_table, _stage = _resolve_index_table_and_stage()
     session = _get_active_session_or_none()
     if session is None:
         print(
             "[INFO] No active Snowflake session; not downloading "
-            f"{META_DATASET_STAGE}. Using existing local files under {local_root}."
+            f"{_stage}. Using existing local files under {local_root}."
         )
         return local_root
 
     for split in splits:
         split_dir = os.path.join(local_root, split)
         os.makedirs(split_dir, exist_ok=True)
-        session.file.get(f"{META_DATASET_STAGE}/{split}/", split_dir)
+        session.file.get(f"{_stage}/{split}/", split_dir)
         parquet_files = [
             name for name in os.listdir(split_dir)
             if name.endswith(".parquet")
@@ -180,11 +194,13 @@ def select_meta_dataset_index_rows(
     session=None,
 ):
     """
-    Select deterministic runtime rows from META_DATASET_INDEX.
+    Select deterministic runtime rows from META_DATASET_INDEX (or META_NONLINEAR_DATASET_INDEX
+    when TRAINING_DATA_FAMILY=synthetic_regression_nonlinear).
 
     Outside Snowflake, returns synthetic rows for existing local parquet files so
     developer runs never download stage contents to the workstation.
     """
+    _index_table, _stage = _resolve_index_table_and_stage()
     session = session or _get_active_session_or_none()
     split_limits = dict(split_limits or {})
     splits = tuple(splits)
@@ -209,7 +225,7 @@ WITH ranked AS (
                PARTITION BY split, hpo_bucket
                ORDER BY prior_regime, p, n_train, task_id
            ) AS bucket_rank
-    FROM {META_DATASET_INDEX}
+    FROM {_index_table}
     WHERE split IN ({split_sql})
 ),
 ordered AS (
@@ -228,7 +244,7 @@ ORDER BY split, split_rank
     else:
         sql = f"""
 SELECT {columns_sql}
-FROM {META_DATASET_INDEX}
+FROM {_index_table}
 WHERE split IN ({split_sql})
 ORDER BY split, task_id
 """
@@ -237,7 +253,7 @@ ORDER BY split, task_id
         rows = [_row_to_dict(row) for row in session.sql(sql).collect()]
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to query {META_DATASET_INDEX}; create and populate the index "
+            f"Failed to query {_index_table}; create and populate the index "
             "before launching Snowflake training jobs."
         ) from exc
 

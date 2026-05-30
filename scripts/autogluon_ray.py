@@ -39,7 +39,7 @@ import traceback
 print("[ag_ray] entered Python", flush=True)
 
 # ---------------------------------------------------------------------------
-# Environment resolution
+# Pure helpers — importable without any env vars set
 # ---------------------------------------------------------------------------
 
 def _require_env(name: str, description: str = "") -> str:
@@ -72,92 +72,177 @@ def _env_positive_int(name: str, default: int) -> int:
     return value
 
 
-SUITE_ID = _require_env(
-    "SYNTHETIC_REGRESSION_SUITE_ID",
-    "Set to 'linear_all_v1' for combined suite.",
-)
-NUM_SHARDS = _env_int("SYNTHETIC_REGRESSION_NUM_SHARDS", 6)
-SHARD_INDEX = _env_int("SYNTHETIC_REGRESSION_SHARD_INDEX", 0)
-RESULTS_STAGE = _require_env(
-    "SYNREG_RESULTS_STAGE",
-    "Example: @EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
-)
-DISTRIBUTED_MODE = os.getenv("SYNREG_AUTOGLUON_DISTRIBUTED_MODE", "ray_work_items")
-CLUSTER_SHARDS = _env_int("SYNREG_AUTOGLUON_CLUSTER_SHARDS", NUM_SHARDS)
-WORKERS_PER_SHARD = _env_int("SYNREG_AUTOGLUON_WORKERS_PER_SHARD", 1)
-TASK_CPUS = _env_int("AUTOGLUON_TASK_CPUS", 1)
-TIME_LIMIT = _env_int("AUTOGLUON_TIME_LIMIT", 300)
-PRESETS = os.getenv("AUTOGLUON_PRESETS", "best_quality")
-MIN_TMP_FREE_BYTES = _env_int("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", 5368709120)
-MAX_DATASET_BYTES = _env_int("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", 2147483648)
-LOCAL_CACHE = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
-WORKER_DATA_ACCESS_MODE = os.getenv(
-    "SYNREG_WORKER_DATA_ACCESS_MODE",
-    "driver_presigned_url",
-)
-MAX_WORK_ITEM_BYTES = _env_int("SYNREG_MAX_WORK_ITEM_BYTES", 8192)
-RAY_READY_TIMEOUT_SECONDS = _env_positive_int(
-    "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS",
-    600,
-)
-RAY_READY_POLL_SECONDS = _env_positive_int(
-    "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
-    10,
-)
-RAY_ADDRESS_MODE = os.getenv("SYNREG_RAY_ADDRESS_MODE", "auto")
-RAY_HEAD_ADDRESS = os.getenv("RAY_HEAD_ADDRESS", "auto")
-# Cluster identity (Finding 6): set by orchestrator to verify driver joined the right shard's head
-SPCS_RAY_RUN_ID = os.getenv("SPCS_RAY_RUN_ID", "")
-SPCS_RAY_SHARD_INDEX = os.getenv("SPCS_RAY_SHARD_INDEX", "")
+def _sanitize_item_for_debug(item: dict) -> dict:
+    """Return a copy of item_meta safe for debug artifacts.
 
-print(
-    f"[ag_ray] resolved env: suite_id={SUITE_ID} shard={SHARD_INDEX}/{NUM_SHARDS} "
-    f"cluster_shards={CLUSTER_SHARDS} workers_per_shard={WORKERS_PER_SHARD} "
-    f"task_cpus={TASK_CPUS} time_limit={TIME_LIMIT} presets={PRESETS!r} "
-    f"distributed_mode={DISTRIBUTED_MODE!r} results_stage={RESULTS_STAGE!r} "
-    f"worker_data_access_mode={WORKER_DATA_ACCESS_MODE!r} "
-    f"max_work_item_bytes={MAX_WORK_ITEM_BYTES} "
-    f"ray_ready_timeout_seconds={RAY_READY_TIMEOUT_SECONDS}",
-    flush=True,
-)
+    Retains condition metadata (suite_id, dataset_id, stage_path, split_seed,
+    n_train_override, n_total, p_signal, p_noise, etc.).
+    Redacts presigned_url and scoped_url from dataset_access.
+    Does not include dataset payload arrays.
+    """
+    safe = {k: v for k, v in item.items() if k != "dataset_access"}
+    if "dataset_access" in item:
+        access = item["dataset_access"]
+        safe_access = {
+            k: v for k, v in access.items()
+            if k not in ("presigned_url", "scoped_url")
+        }
+        safe["dataset_access"] = safe_access
+    return safe
+
+
+def _write_ag_ray_failure_debug(session, payload: dict) -> None:
+    """Persist a failure JSON artifact to DEBUG_STAGE.
+
+    Uses the driver's existing Snowpark session. If the upload fails,
+    logs a warning but does NOT suppress the original exception — callers
+    must re-raise after calling this.
+    """
+    run_id = payload.get("run_id") or "unknown"
+    shard_index = payload.get("shard_index", 0)
+    ts = int(time.time())
+    filename = f"ag_ray_failure_run_{run_id}_shard_{shard_index}_{ts}.json"
+    local_path = os.path.join(tempfile.gettempdir(), filename)
+    try:
+        with open(local_path, "w") as _f:
+            json.dump(payload, _f, default=str, indent=2)
+        session.file.put(local_path, DEBUG_STAGE, auto_compress=False, overwrite=True)
+        print(
+            f"[ag_ray] failure artifact written: {DEBUG_STAGE}/{filename}",
+            flush=True,
+        )
+    except Exception as _upload_exc:
+        print(
+            f"[ag_ray] WARNING: could not upload failure artifact to {DEBUG_STAGE}: "
+            f"{_upload_exc}",
+            flush=True,
+        )
+
 
 # ---------------------------------------------------------------------------
-# Validation
+# Module-level constants — safe defaults (resolved at runtime via _resolve_runtime_globals)
 # ---------------------------------------------------------------------------
 
-if DISTRIBUTED_MODE != "ray_work_items":
-    raise RuntimeError(
-        f"[ag_ray] SYNREG_AUTOGLUON_DISTRIBUTED_MODE={DISTRIBUTED_MODE!r} but this "
-        "entrypoint only implements 'ray_work_items'. "
-        "Use evaluate_synthetic_regression.py for single-node mode."
+SUITE_ID: str = ""
+NUM_SHARDS: int = 6
+SHARD_INDEX: int = 0
+RESULTS_STAGE: str = ""
+DEBUG_STAGE: str = "@EVALUATION_RESULTS_STAGE/debug"
+DISTRIBUTED_MODE: str = "ray_work_items"
+CLUSTER_SHARDS: int = 6
+WORKERS_PER_SHARD: int = 1
+TASK_CPUS: int = 1
+TIME_LIMIT: int = 300
+PRESETS: str = "best_quality"
+MIN_TMP_FREE_BYTES: int = 5368709120
+MAX_DATASET_BYTES: int = 2147483648
+LOCAL_CACHE: str = "/tmp/synreg_cache"
+WORKER_DATA_ACCESS_MODE: str = "driver_presigned_url"
+MAX_WORK_ITEM_BYTES: int = 8192
+RAY_READY_TIMEOUT_SECONDS: int = 600
+RAY_READY_POLL_SECONDS: int = 10
+RAY_ADDRESS_MODE: str = "auto"
+RAY_HEAD_ADDRESS: str = "auto"
+SPCS_RAY_RUN_ID: str = ""
+SPCS_RAY_SHARD_INDEX: str = ""
+
+
+def _resolve_runtime_globals() -> None:
+    """Resolve all module-level constants from environment variables.
+
+    Must be called before main(). Raises RuntimeError for missing required vars.
+    """
+    global SUITE_ID, NUM_SHARDS, SHARD_INDEX, RESULTS_STAGE, DISTRIBUTED_MODE
+    global CLUSTER_SHARDS, WORKERS_PER_SHARD, TASK_CPUS, TIME_LIMIT, PRESETS
+    global MIN_TMP_FREE_BYTES, MAX_DATASET_BYTES, LOCAL_CACHE, WORKER_DATA_ACCESS_MODE
+    global MAX_WORK_ITEM_BYTES, RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS
+    global RAY_ADDRESS_MODE, RAY_HEAD_ADDRESS, SPCS_RAY_RUN_ID, SPCS_RAY_SHARD_INDEX
+
+    SUITE_ID = _require_env(
+        "SYNTHETIC_REGRESSION_SUITE_ID",
+        "Set to 'linear_all_v1' for combined suite.",
+    )
+    NUM_SHARDS = _env_int("SYNTHETIC_REGRESSION_NUM_SHARDS", 6)
+    SHARD_INDEX = _env_int("SYNTHETIC_REGRESSION_SHARD_INDEX", 0)
+    RESULTS_STAGE = _require_env(
+        "SYNREG_RESULTS_STAGE",
+        "Example: @EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
+    )
+    DISTRIBUTED_MODE = os.getenv("SYNREG_AUTOGLUON_DISTRIBUTED_MODE", "ray_work_items")
+    CLUSTER_SHARDS = _env_int("SYNREG_AUTOGLUON_CLUSTER_SHARDS", NUM_SHARDS)
+    WORKERS_PER_SHARD = _env_int("SYNREG_AUTOGLUON_WORKERS_PER_SHARD", 1)
+    TASK_CPUS = _env_int("AUTOGLUON_TASK_CPUS", 1)
+    TIME_LIMIT = _env_int("AUTOGLUON_TIME_LIMIT", 300)
+    PRESETS = os.getenv("AUTOGLUON_PRESETS", "best_quality")
+    MIN_TMP_FREE_BYTES = _env_int("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", 5368709120)
+    MAX_DATASET_BYTES = _env_int("BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES", 2147483648)
+    LOCAL_CACHE = os.getenv("SYNTHETIC_REGRESSION_LOCAL_CACHE", "/tmp/synreg_cache")
+    WORKER_DATA_ACCESS_MODE = os.getenv(
+        "SYNREG_WORKER_DATA_ACCESS_MODE",
+        "driver_presigned_url",
+    )
+    MAX_WORK_ITEM_BYTES = _env_int("SYNREG_MAX_WORK_ITEM_BYTES", 8192)
+    RAY_READY_TIMEOUT_SECONDS = _env_positive_int(
+        "SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS",
+        600,
+    )
+    RAY_READY_POLL_SECONDS = _env_positive_int(
+        "SYNREG_RAY_CLUSTER_READY_POLL_SECONDS",
+        10,
+    )
+    RAY_ADDRESS_MODE = os.getenv("SYNREG_RAY_ADDRESS_MODE", "auto")
+    RAY_HEAD_ADDRESS = os.getenv("RAY_HEAD_ADDRESS", "auto")
+    SPCS_RAY_RUN_ID = os.getenv("SPCS_RAY_RUN_ID", "")
+    SPCS_RAY_SHARD_INDEX = os.getenv("SPCS_RAY_SHARD_INDEX", "")
+
+    print(
+        f"[ag_ray] resolved env: suite_id={SUITE_ID} shard={SHARD_INDEX}/{NUM_SHARDS} "
+        f"cluster_shards={CLUSTER_SHARDS} workers_per_shard={WORKERS_PER_SHARD} "
+        f"task_cpus={TASK_CPUS} time_limit={TIME_LIMIT} presets={PRESETS!r} "
+        f"distributed_mode={DISTRIBUTED_MODE!r} results_stage={RESULTS_STAGE!r} "
+        f"worker_data_access_mode={WORKER_DATA_ACCESS_MODE!r} "
+        f"max_work_item_bytes={MAX_WORK_ITEM_BYTES} "
+        f"ray_ready_timeout_seconds={RAY_READY_TIMEOUT_SECONDS}",
+        flush=True,
     )
 
-if NUM_SHARDS != CLUSTER_SHARDS:
-    raise RuntimeError(
-        f"[ag_ray] SYNTHETIC_REGRESSION_NUM_SHARDS={NUM_SHARDS} != "
-        f"SYNREG_AUTOGLUON_CLUSTER_SHARDS={CLUSTER_SHARDS}. "
-        "These must match for distributed work-item assignment to be consistent."
-    )
 
-if not (0 <= SHARD_INDEX < NUM_SHARDS):
-    raise RuntimeError(
-        f"[ag_ray] SYNTHETIC_REGRESSION_SHARD_INDEX={SHARD_INDEX} out of range "
-        f"[0, {NUM_SHARDS}). Check orchestration env vars."
-    )
+def _validate_runtime_globals() -> None:
+    """Validate resolved module-level constants. Call after _resolve_runtime_globals()."""
+    if DISTRIBUTED_MODE != "ray_work_items":
+        raise RuntimeError(
+            f"[ag_ray] SYNREG_AUTOGLUON_DISTRIBUTED_MODE={DISTRIBUTED_MODE!r} but this "
+            "entrypoint only implements 'ray_work_items'. "
+            "Use evaluate_synthetic_regression.py for single-node mode."
+        )
 
-if TASK_CPUS < 1:
-    raise RuntimeError(f"[ag_ray] AUTOGLUON_TASK_CPUS={TASK_CPUS} must be >= 1.")
+    if NUM_SHARDS != CLUSTER_SHARDS:
+        raise RuntimeError(
+            f"[ag_ray] SYNTHETIC_REGRESSION_NUM_SHARDS={NUM_SHARDS} != "
+            f"SYNREG_AUTOGLUON_CLUSTER_SHARDS={CLUSTER_SHARDS}. "
+            "These must match for distributed work-item assignment to be consistent."
+        )
 
-if TIME_LIMIT < 1:
-    raise RuntimeError(f"[ag_ray] AUTOGLUON_TIME_LIMIT={TIME_LIMIT} must be >= 1.")
+    if not (0 <= SHARD_INDEX < NUM_SHARDS):
+        raise RuntimeError(
+            f"[ag_ray] SYNTHETIC_REGRESSION_SHARD_INDEX={SHARD_INDEX} out of range "
+            f"[0, {NUM_SHARDS}). Check orchestration env vars."
+        )
 
-if WORKERS_PER_SHARD < 1:
-    raise RuntimeError(
-        f"[ag_ray] SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD} must be >= 1."
-    )
+    if TASK_CPUS < 1:
+        raise RuntimeError(f"[ag_ray] AUTOGLUON_TASK_CPUS={TASK_CPUS} must be >= 1.")
+
+    if TIME_LIMIT < 1:
+        raise RuntimeError(f"[ag_ray] AUTOGLUON_TIME_LIMIT={TIME_LIMIT} must be >= 1.")
+
+    if WORKERS_PER_SHARD < 1:
+        raise RuntimeError(
+            f"[ag_ray] SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD} must be >= 1."
+        )
+
 
 # ---------------------------------------------------------------------------
-# Imports (after env validation to surface env errors first)
+# Imports (after function definitions; these are importable without env vars)
 # ---------------------------------------------------------------------------
 
 import numpy as np
@@ -190,7 +275,7 @@ from autogluon_models import (
 print("[ag_ray] imports complete", flush=True)
 
 # ---------------------------------------------------------------------------
-# Ray initialisation — fail fast, no single-node fallback
+# Ray import
 # ---------------------------------------------------------------------------
 
 try:
@@ -202,6 +287,10 @@ except ImportError as exc:
         "Install it or use evaluate_synthetic_regression.py for single-node mode."
     ) from exc
 
+
+# ---------------------------------------------------------------------------
+# Ray helpers
+# ---------------------------------------------------------------------------
 
 def _wait_for_ray_capacity(*, expected_nodes: int, expected_cpus_min: int) -> tuple[int, int, dict]:
     deadline = time.monotonic() + RAY_READY_TIMEOUT_SECONDS
@@ -239,196 +328,11 @@ def _wait_for_ray_capacity(*, expected_nodes: int, expected_cpus_min: int) -> tu
         time.sleep(RAY_READY_POLL_SECONDS)
 
 
-# Resolve Ray address based on mode
-if RAY_ADDRESS_MODE == "explicit":
-    _ray_address = RAY_HEAD_ADDRESS
-    if not _ray_address or _ray_address == "auto":
-        raise RuntimeError(
-            "[ag_ray] SYNREG_RAY_ADDRESS_MODE=explicit requires RAY_HEAD_ADDRESS "
-            "to be set to the head node address (e.g. 'host:6379'). "
-            "In SPCS, this is the SPCS service DNS name of the Ray head container."
-        )
-elif RAY_ADDRESS_MODE == "auto":
-    _ray_address = "auto"
-else:
-    raise RuntimeError(
-        f"[ag_ray] SYNREG_RAY_ADDRESS_MODE={RAY_ADDRESS_MODE!r} is not supported. "
-        "Supported modes: 'auto' (Snowflake MLJob), 'explicit' (SPCS self-managed Ray)."
-    )
-
-print(
-    f"[ag_ray] ray init starting: address_mode={RAY_ADDRESS_MODE!r} address={_ray_address!r}",
-    flush=True,
-)
-try:
-    ray.init(
-        address=_ray_address,
-        ignore_reinit_error=True,
-        log_to_driver=True,
-        include_dashboard=False,
-    )
-    # Finding 5: In SPCS (explicit) mode, the Ray head starts with --num-cpus=0, so the
-    # head is a live node that contributes zero CPUs. Expected topology:
-    #   live_nodes  = workers_per_shard + 1  (head + workers)
-    #   available_cpus = workers_per_shard * TASK_CPUS  (only workers have CPUs)
-    # In MLJob (auto) mode, Snowflake manages Ray and the head is not separately counted,
-    # so expected_nodes = WORKERS_PER_SHARD and expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD).
-    if RAY_ADDRESS_MODE == "explicit":
-        expected_nodes = WORKERS_PER_SHARD + 1
-        expected_cpus_min = WORKERS_PER_SHARD * TASK_CPUS
-    else:
-        expected_nodes = WORKERS_PER_SHARD
-        expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD)
-    live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
-        expected_nodes=expected_nodes,
-        expected_cpus_min=expected_cpus_min,
-    )
-    print(
-        f"[ag_ray] ray ready  cluster_cpus={available_cpus} "
-        f"live_nodes={live_node_count} cluster_resources={dict(cluster_resources)} "
-        f"address_mode={RAY_ADDRESS_MODE!r} expected_nodes={expected_nodes} "
-        f"expected_cpus_min={expected_cpus_min}",
-        flush=True,
-    )
-    # Finding 6: Cluster identity check — verify this driver connected to its own shard's head.
-    # The head injects a custom resource "spcs_cluster_id_<run_id>_<shard_index>": 1 at startup.
-    if RAY_ADDRESS_MODE == "explicit" and SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX != "":
-        cluster_id_key = f"spcs_cluster_id_{SPCS_RAY_RUN_ID}_{SPCS_RAY_SHARD_INDEX}"
-        if cluster_id_key not in cluster_resources:
-            raise RuntimeError(
-                f"[ag_ray] Cluster identity check FAILED: expected custom resource "
-                f"{cluster_id_key!r} not found in cluster resources {dict(cluster_resources)}. "
-                f"Driver (shard={SHARD_INDEX}) may be connected to the wrong Ray head. "
-                "Check SPCS_RAY_HEAD_DNS_SUFFIX configuration and confirm each shard's "
-                "head container started successfully."
-            )
-        print(
-            f"[ag_ray] cluster identity verified: {cluster_id_key!r} present in cluster resources.",
-            flush=True,
-        )
-except Exception as exc:
-    raise RuntimeError(
-        "AutoGluon distributed work-item mode requires a Ray-backed cluster. "
-        "Ray initialization failed before any output CSV was written. "
-        "Falling back to single-node mode is disabled for this entrypoint because it can "
-        "create duplicate shard files."
-    ) from exc
-
-print(f"[ag_ray] driver owns shard {SHARD_INDEX}/{NUM_SHARDS}", flush=True)
-print(
-    f"[ag_ray] dataset loading mode={WORKER_DATA_ACCESS_MODE} "
-    "driver_metadata_only=true no_driver_ray_put=true",
-    flush=True,
-)
-
 # ---------------------------------------------------------------------------
-# Snowpark session (driver only)
+# Ray remote task — @ray.remote without num_cpus; call sites use .options(num_cpus=TASK_CPUS)
 # ---------------------------------------------------------------------------
 
-session = create_snowpark_session()
-
-# ---------------------------------------------------------------------------
-# Work-item assignment
-# ---------------------------------------------------------------------------
-
-print(f"[ag_ray] loading index suite_id={SUITE_ID!r} …", flush=True)
-all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
-all_work_items = expand_synreg_work_items(all_rows_index, train_size_grid=None)
-assigned_work_items = assign_synthetic_regression_shard(all_work_items, SHARD_INDEX, NUM_SHARDS)
-dataset_url_cache: dict[str, str] = {}
-my_work_items = [
-    build_compact_synreg_work_item(
-        row,
-        session=session,
-        access_mode=WORKER_DATA_ACCESS_MODE,
-        max_item_bytes=MAX_WORK_ITEM_BYTES,
-        dataset_url_cache=dataset_url_cache,
-    )
-    for row in assigned_work_items
-]
-items_total_bytes, items_max_bytes = compact_work_items_serialized_bytes(my_work_items)
-
-print(
-    f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS}: "
-    f"{len(all_rows_index)} index rows → {len(all_work_items)} work items → "
-    f"{len(my_work_items)} compact items assigned to this shard "
-    f"unique_dataset_access_urls={len(dataset_url_cache)} "
-    f"serialized_total_bytes={items_total_bytes} "
-    f"serialized_max_item_bytes={items_max_bytes}",
-    flush=True,
-)
-
-# Atomic work-item uniqueness guard: detect duplicates before submitting to Ray.
-# Each (suite_id, stage_path, split_seed, n_train_override) must be unique within this shard.
-_seen_keys: set[tuple] = set()
-for _item in my_work_items:
-    _key = (
-        _item.get("suite_id"),
-        _item.get("stage_path") or _item.get("dataset_id"),
-        _item.get("split_seed"),
-        _item.get("n_train_override"),
-    )
-    if _key in _seen_keys:
-        raise RuntimeError(
-            f"[ag_ray] Duplicate atomic work item detected before Ray submission: "
-            f"{_key!r}. This indicates a bug in shard assignment or work-item expansion. "
-            f"Aborting to prevent double-evaluation."
-        )
-    _seen_keys.add(_key)
-del _seen_keys
-
-if not my_work_items:
-    raise RuntimeError(
-        f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} has zero work items. "
-        f"Check that SYNTHETIC_REGRESSION_DATASET_INDEX has rows for suite_id={SUITE_ID!r}."
-    )
-
-# Finding 7: Presigned URL expiry validation.
-# Strict by default so late workers do not silently hit expired URLs.
-if WORKER_DATA_ACCESS_MODE == "driver_presigned_url":
-    _expiry_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400"))
-    # Conservative upper bound: all items run sequentially at max time_limit.
-    _estimated_max_shard_seconds = len(my_work_items) * TIME_LIMIT
-    _buffer_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS", "3600"))
-    _policy = os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_POLICY", "strict").strip().lower()
-    if _policy not in {"strict", "warn"}:
-        raise RuntimeError(
-            "[ag_ray] SYNREG_PRESIGNED_URL_EXPIRY_POLICY must be 'strict' or 'warn'; "
-            f"got {_policy!r}."
-        )
-    if _expiry_seconds < _estimated_max_shard_seconds + _buffer_seconds:
-        if _policy == "strict":
-            raise RuntimeError(
-                f"[ag_ray] presigned URL expiry={_expiry_seconds}s may be insufficient: "
-                f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
-                f"for {len(my_work_items)} items at {TIME_LIMIT}s plus buffer={_buffer_seconds}s. "
-                "Increase SYNREG_PRESIGNED_URL_EXPIRY_SECONDS or set "
-                "SYNREG_PRESIGNED_URL_EXPIRY_POLICY=warn to accept late-worker HTTP 403 risk."
-            )
-        print(
-            f"[ag_ray] WARNING presigned URL expiry={_expiry_seconds}s may be insufficient: "
-            f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
-            f"({len(my_work_items)} items × {TIME_LIMIT}s) + buffer={_buffer_seconds}s. "
-            "Consider increasing SYNREG_PRESIGNED_URL_EXPIRY_SECONDS to avoid "
-            "HTTP 403 errors on late-running workers.",
-            flush=True,
-        )
-    else:
-        print(
-            f"[ag_ray] presigned URL expiry ok: expiry={_expiry_seconds}s "
-            f">= estimated_max={_estimated_max_shard_seconds}s + buffer={_buffer_seconds}s.",
-            flush=True,
-        )
-
-# Pre-fetch AutoGluon predictor class to trigger import errors early.
-get_tabular_predictor_class()
-
-
-# ---------------------------------------------------------------------------
-# Ray remote task
-# ---------------------------------------------------------------------------
-
-@ray.remote(num_cpus=TASK_CPUS)
+@ray.remote
 def _autogluon_work_item(item_meta: dict) -> dict:
     """Execute one AutoGluon fit+predict for a single (dataset, seed, condition) triple.
 
@@ -614,137 +518,379 @@ def _autogluon_work_item(item_meta: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main distributed evaluation loop
+# Main — all executable logic (Ray init + work assignment + evaluation loop)
 # ---------------------------------------------------------------------------
 
-MAX_IN_FLIGHT = _env_int("SYNREG_AUTOGLUON_MAX_IN_FLIGHT", WORKERS_PER_SHARD)
-if MAX_IN_FLIGHT < 1:
-    raise RuntimeError(
-        f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} must be >= 1."
-    )
-if MAX_IN_FLIGHT > WORKERS_PER_SHARD:
-    raise RuntimeError(
-        f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} exceeds "
-        f"SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD}. "
-        f"MAX_IN_FLIGHT must not exceed WORKERS_PER_SHARD to avoid scheduling "
-        f"starvation (more in-flight futures than available workers). "
-        f"Reduce SYNREG_AUTOGLUON_MAX_IN_FLIGHT or increase SYNREG_AUTOGLUON_WORKERS_PER_SHARD."
-    )
+def main() -> None:
+    """Run the distributed AutoGluon evaluation for one shard."""
 
-print(
-    f"[ag_ray] starting distributed evaluation: "
-    f"{len(my_work_items)} work items "
-    f"max_in_flight={MAX_IN_FLIGHT} task_cpus={TASK_CPUS}",
-    flush=True,
-)
-
-expected_work_items = len(my_work_items)
-output_rows: list[dict] = []
-pending: list[ray.ObjectRef] = []  # futures only; workers load datasets independently
-future_to_item: dict[ray.ObjectRef, dict] = {}
-item_iter = iter(my_work_items)
-items_exhausted = False
-submitted = 0
-completed = 0
-
-while True:
-    # Refill the pending pool up to MAX_IN_FLIGHT
-    while not items_exhausted and len(pending) < MAX_IN_FLIGHT:
-        item = next(item_iter, None)
-        if item is None:
-            items_exhausted = True
-            break
-        # Workers load their own datasets; driver passes only small item metadata
-        future = _autogluon_work_item.remote(item)
-        pending.append(future)
-        future_to_item[future] = item
-        submitted += 1
-
-    if not pending:
-        break  # all work done
-
-    # Collect one completed result (blocking)
-    done_futures, _ = ray.wait(pending, num_returns=1, timeout=None)
-    if done_futures:
-        done_future = done_futures[0]
-        pending.remove(done_future)
-        item_meta = future_to_item.pop(done_future)
-        try:
-            row = ray.get(done_future)
-            output_rows.append(row)
-        except Exception as exc:
-            # Ray task raised unexpectedly outside the worker's handled path.
-            print(f"[ag_ray] unexpected Ray task error; emitting failed row: {exc}", flush=True)
-            output_rows.append(
-                _failed_row(
-                    _base_autogluon_row(item_meta),
-                    type(exc).__name__,
-                    str(exc)[:500],
-                )
+    # Resolve Ray address based on mode
+    if RAY_ADDRESS_MODE == "explicit":
+        _ray_address = RAY_HEAD_ADDRESS
+        if not _ray_address or _ray_address == "auto":
+            raise RuntimeError(
+                "[ag_ray] SYNREG_RAY_ADDRESS_MODE=explicit requires RAY_HEAD_ADDRESS "
+                "to be set to the head node address (e.g. 'host:6379'). "
+                "In SPCS, this is the SPCS service DNS name of the Ray head container."
             )
-        del done_future
-        completed += 1
-        gc.collect()
-        if completed % 10 == 0:
+    elif RAY_ADDRESS_MODE == "auto":
+        _ray_address = "auto"
+    else:
+        raise RuntimeError(
+            f"[ag_ray] SYNREG_RAY_ADDRESS_MODE={RAY_ADDRESS_MODE!r} is not supported. "
+            "Supported modes: 'auto' (Snowflake MLJob), 'explicit' (SPCS self-managed Ray)."
+        )
+
+    print(
+        f"[ag_ray] ray init starting: address_mode={RAY_ADDRESS_MODE!r} address={_ray_address!r}",
+        flush=True,
+    )
+    try:
+        ray.init(
+            address=_ray_address,
+            ignore_reinit_error=True,
+            log_to_driver=True,
+            include_dashboard=False,
+        )
+        # Finding 5: In SPCS (explicit) mode, the Ray head starts with --num-cpus=0, so the
+        # head is a live node that contributes zero CPUs. Expected topology:
+        #   live_nodes  = workers_per_shard + 1  (head + workers)
+        #   available_cpus = workers_per_shard * TASK_CPUS  (only workers have CPUs)
+        # In MLJob (auto) mode, Snowflake manages Ray and the head is not separately counted,
+        # so expected_nodes = WORKERS_PER_SHARD and expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD).
+        if RAY_ADDRESS_MODE == "explicit":
+            expected_nodes = WORKERS_PER_SHARD + 1
+            expected_cpus_min = WORKERS_PER_SHARD * TASK_CPUS
+        else:
+            expected_nodes = WORKERS_PER_SHARD
+            expected_cpus_min = max(TASK_CPUS, WORKERS_PER_SHARD)
+        live_node_count, available_cpus, cluster_resources = _wait_for_ray_capacity(
+            expected_nodes=expected_nodes,
+            expected_cpus_min=expected_cpus_min,
+        )
+        print(
+            f"[ag_ray] ray ready  cluster_cpus={available_cpus} "
+            f"live_nodes={live_node_count} cluster_resources={dict(cluster_resources)} "
+            f"address_mode={RAY_ADDRESS_MODE!r} expected_nodes={expected_nodes} "
+            f"expected_cpus_min={expected_cpus_min}",
+            flush=True,
+        )
+        # Finding 6: Cluster identity check — verify this driver connected to its own shard's head.
+        # The head injects a custom resource "spcs_cluster_id_<run_id>_<shard_index>": 1 at startup.
+        if RAY_ADDRESS_MODE == "explicit" and SPCS_RAY_RUN_ID and SPCS_RAY_SHARD_INDEX != "":
+            cluster_id_key = f"spcs_cluster_id_{SPCS_RAY_RUN_ID}_{SPCS_RAY_SHARD_INDEX}"
+            if cluster_id_key not in cluster_resources:
+                raise RuntimeError(
+                    f"[ag_ray] Cluster identity check FAILED: expected custom resource "
+                    f"{cluster_id_key!r} not found in cluster resources {dict(cluster_resources)}. "
+                    f"Driver (shard={SHARD_INDEX}) may be connected to the wrong Ray head. "
+                    "Check SPCS_RAY_HEAD_DNS_SUFFIX configuration and confirm each shard's "
+                    "head container started successfully."
+                )
             print(
-                f"[ag_ray] progress: submitted={submitted} completed={completed} "
-                f"in_flight={len(pending)} rows_so_far={len(output_rows)}",
+                f"[ag_ray] cluster identity verified: {cluster_id_key!r} present in cluster resources.",
+                flush=True,
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "AutoGluon distributed work-item mode requires a Ray-backed cluster. "
+            "Ray initialization failed before any output CSV was written. "
+            "Falling back to single-node mode is disabled for this entrypoint because it can "
+            "create duplicate shard files."
+        ) from exc
+
+    print(f"[ag_ray] driver owns shard {SHARD_INDEX}/{NUM_SHARDS}", flush=True)
+    print(
+        f"[ag_ray] dataset loading mode={WORKER_DATA_ACCESS_MODE} "
+        "driver_metadata_only=true no_driver_ray_put=true",
+        flush=True,
+    )
+
+    # ---------------------------------------------------------------------------
+    # Snowpark session (driver only)
+    # ---------------------------------------------------------------------------
+
+    session = create_snowpark_session()
+
+    # ---------------------------------------------------------------------------
+    # Work-item assignment
+    # ---------------------------------------------------------------------------
+
+    print(f"[ag_ray] loading index suite_id={SUITE_ID!r} …", flush=True)
+    all_rows_index = load_synthetic_regression_index(suite_family=None, session=session)
+    all_work_items = expand_synreg_work_items(all_rows_index, train_size_grid=None)
+    assigned_work_items = assign_synthetic_regression_shard(all_work_items, SHARD_INDEX, NUM_SHARDS)
+    dataset_url_cache: dict[str, str] = {}
+    my_work_items = [
+        build_compact_synreg_work_item(
+            row,
+            session=session,
+            access_mode=WORKER_DATA_ACCESS_MODE,
+            max_item_bytes=MAX_WORK_ITEM_BYTES,
+            dataset_url_cache=dataset_url_cache,
+        )
+        for row in assigned_work_items
+    ]
+    items_total_bytes, items_max_bytes = compact_work_items_serialized_bytes(my_work_items)
+
+    print(
+        f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS}: "
+        f"{len(all_rows_index)} index rows → {len(all_work_items)} work items → "
+        f"{len(my_work_items)} compact items assigned to this shard "
+        f"unique_dataset_access_urls={len(dataset_url_cache)} "
+        f"serialized_total_bytes={items_total_bytes} "
+        f"serialized_max_item_bytes={items_max_bytes}",
+        flush=True,
+    )
+
+    # Atomic work-item uniqueness guard: detect duplicates before submitting to Ray.
+    # Each (suite_id, stage_path, split_seed, n_train_override) must be unique within this shard.
+    _seen_keys: set[tuple] = set()
+    for _item in my_work_items:
+        _key = (
+            _item.get("suite_id"),
+            _item.get("stage_path") or _item.get("dataset_id"),
+            _item.get("split_seed"),
+            _item.get("n_train_override"),
+        )
+        if _key in _seen_keys:
+            raise RuntimeError(
+                f"[ag_ray] Duplicate atomic work item detected before Ray submission: "
+                f"{_key!r}. This indicates a bug in shard assignment or work-item expansion. "
+                f"Aborting to prevent double-evaluation."
+            )
+        _seen_keys.add(_key)
+    del _seen_keys
+
+    if not my_work_items:
+        raise RuntimeError(
+            f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} has zero work items. "
+            f"Check that SYNTHETIC_REGRESSION_DATASET_INDEX has rows for suite_id={SUITE_ID!r}."
+        )
+
+    # Finding 7: Presigned URL expiry validation.
+    # Strict by default so late workers do not silently hit expired URLs.
+    if WORKER_DATA_ACCESS_MODE == "driver_presigned_url":
+        _expiry_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_SECONDS", "86400"))
+        # Conservative upper bound: all items run sequentially at max time_limit.
+        _estimated_max_shard_seconds = len(my_work_items) * TIME_LIMIT
+        _buffer_seconds = int(os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS", "3600"))
+        _policy = os.getenv("SYNREG_PRESIGNED_URL_EXPIRY_POLICY", "strict").strip().lower()
+        if _policy not in {"strict", "warn"}:
+            raise RuntimeError(
+                "[ag_ray] SYNREG_PRESIGNED_URL_EXPIRY_POLICY must be 'strict' or 'warn'; "
+                f"got {_policy!r}."
+            )
+        if _expiry_seconds < _estimated_max_shard_seconds + _buffer_seconds:
+            if _policy == "strict":
+                raise RuntimeError(
+                    f"[ag_ray] presigned URL expiry={_expiry_seconds}s may be insufficient: "
+                    f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
+                    f"for {len(my_work_items)} items at {TIME_LIMIT}s plus buffer={_buffer_seconds}s. "
+                    "Increase SYNREG_PRESIGNED_URL_EXPIRY_SECONDS or set "
+                    "SYNREG_PRESIGNED_URL_EXPIRY_POLICY=warn to accept late-worker HTTP 403 risk."
+                )
+            print(
+                f"[ag_ray] WARNING presigned URL expiry={_expiry_seconds}s may be insufficient: "
+                f"estimated_max_shard_runtime={_estimated_max_shard_seconds}s "
+                f"({len(my_work_items)} items × {TIME_LIMIT}s) + buffer={_buffer_seconds}s. "
+                "Consider increasing SYNREG_PRESIGNED_URL_EXPIRY_SECONDS to avoid "
+                "HTTP 403 errors on late-running workers.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[ag_ray] presigned URL expiry ok: expiry={_expiry_seconds}s "
+                f">= estimated_max={_estimated_max_shard_seconds}s + buffer={_buffer_seconds}s.",
                 flush=True,
             )
 
-print(
-    f"[ag_ray] work items done: submitted={submitted} completed={completed} "
-    f"output_rows={len(output_rows)}",
-    flush=True,
-)
+    # Pre-fetch AutoGluon predictor class to trigger import errors early.
+    get_tabular_predictor_class()
 
-# ---------------------------------------------------------------------------
-# Completeness check
-# ---------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Main distributed evaluation loop
+    # ---------------------------------------------------------------------------
 
-if not output_rows:
-    raise RuntimeError(
-        f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} produced zero output rows. "
-        "This is fatal — refusing to write an empty CSV to stage. "
-        "Check that the combined suite index is populated and all datasets are accessible."
+    try:
+        MAX_IN_FLIGHT = _env_int("SYNREG_AUTOGLUON_MAX_IN_FLIGHT", WORKERS_PER_SHARD)
+        if MAX_IN_FLIGHT < 1:
+            raise RuntimeError(
+                f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} must be >= 1."
+            )
+        if MAX_IN_FLIGHT > WORKERS_PER_SHARD:
+            raise RuntimeError(
+                f"[ag_ray] SYNREG_AUTOGLUON_MAX_IN_FLIGHT={MAX_IN_FLIGHT} exceeds "
+                f"SYNREG_AUTOGLUON_WORKERS_PER_SHARD={WORKERS_PER_SHARD}. "
+                f"MAX_IN_FLIGHT must not exceed WORKERS_PER_SHARD to avoid scheduling "
+                f"starvation (more in-flight futures than available workers). "
+                f"Reduce SYNREG_AUTOGLUON_MAX_IN_FLIGHT or increase SYNREG_AUTOGLUON_WORKERS_PER_SHARD."
+            )
+
+        print(
+            f"[ag_ray] starting distributed evaluation: "
+            f"{len(my_work_items)} work items "
+            f"max_in_flight={MAX_IN_FLIGHT} task_cpus={TASK_CPUS}",
+            flush=True,
+        )
+
+        expected_work_items = len(my_work_items)
+        output_rows: list[dict] = []
+        pending: list[ray.ObjectRef] = []  # futures only; workers load datasets independently
+        future_to_item: dict[ray.ObjectRef, dict] = {}
+        item_iter = iter(my_work_items)
+        items_exhausted = False
+        submitted = 0
+        completed = 0
+
+        while True:
+            # Refill the pending pool up to MAX_IN_FLIGHT
+            while not items_exhausted and len(pending) < MAX_IN_FLIGHT:
+                item = next(item_iter, None)
+                if item is None:
+                    items_exhausted = True
+                    break
+                # Workers load their own datasets; driver passes only small item metadata
+                # num_cpus is resolved at runtime (after _resolve_runtime_globals) via .options()
+                future = _autogluon_work_item.options(num_cpus=TASK_CPUS).remote(item)
+                pending.append(future)
+                future_to_item[future] = item
+                submitted += 1
+
+            if not pending:
+                break  # all work done
+
+            # Collect one completed result (blocking)
+            done_futures, _ = ray.wait(pending, num_returns=1, timeout=None)
+            if done_futures:
+                done_future = done_futures[0]
+                pending.remove(done_future)
+                item_meta = future_to_item.pop(done_future)
+                try:
+                    row = ray.get(done_future)
+                    output_rows.append(row)
+                except Exception as exc:
+                    # Ray task raised unexpectedly outside the worker's handled path.
+                    print(f"[ag_ray] unexpected Ray task error; emitting failed row: {exc}", flush=True)
+                    output_rows.append(
+                        _failed_row(
+                            _base_autogluon_row(item_meta),
+                            type(exc).__name__,
+                            str(exc)[:500],
+                        )
+                    )
+                del done_future
+                completed += 1
+                gc.collect()
+                if completed == 1 or completed % 10 == 0:
+                    print(
+                        f"[ag_ray] progress: submitted={submitted} completed={completed} "
+                        f"in_flight={len(pending)} rows_so_far={len(output_rows)}",
+                        flush=True,
+                    )
+
+        print(
+            f"[ag_ray] work items done: submitted={submitted} completed={completed} "
+            f"output_rows={len(output_rows)}",
+            flush=True,
+        )
+
+        # ---------------------------------------------------------------------------
+        # Completeness check
+        # ---------------------------------------------------------------------------
+
+        if not output_rows:
+            raise RuntimeError(
+                f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} produced zero output rows. "
+                "This is fatal — refusing to write an empty CSV to stage. "
+                "Check that the combined suite index is populated and all datasets are accessible."
+            )
+
+        if (
+            submitted != expected_work_items
+            or completed != expected_work_items
+            or len(output_rows) != expected_work_items
+        ):
+            raise RuntimeError(
+                f"[ag_ray] Incomplete Ray work item accounting for shard {SHARD_INDEX}/{NUM_SHARDS}: "
+                f"expected={expected_work_items} submitted={submitted} completed={completed} "
+                f"output_rows={len(output_rows)}. Refusing to write a partial shard CSV."
+            )
+
+        ok_count = sum(1 for r in output_rows if r.get("status") == "ok")
+        skip_count = sum(1 for r in output_rows if r.get("status") == "skipped")
+        fail_count = sum(1 for r in output_rows if r.get("status") == "failed")
+        print(
+            f"[ag_ray] row summary: ok={ok_count} skipped={skip_count} failed={fail_count} "
+            f"total={len(output_rows)}",
+            flush=True,
+        )
+
+        # ---------------------------------------------------------------------------
+        # Write output — driver only, exactly one file
+        # ---------------------------------------------------------------------------
+
+        write_part_csv_to_stage(
+            session,
+            output_rows,
+            "AutoGluon",
+            SHARD_INDEX,
+            NUM_SHARDS,
+        )
+
+    except Exception as _exc:
+        print(f"[ag_ray] FATAL distributed evaluation failure: {_exc}", flush=True)
+        try:
+            _cr = ray.cluster_resources() if ray.is_initialized() else {}
+            _ar = ray.available_resources() if ray.is_initialized() else {}
+        except Exception:
+            _cr, _ar = {}, {}
+        _sample = None
+        if my_work_items:
+            try:
+                _sample = _sanitize_item_for_debug(my_work_items[0])
+            except Exception:
+                _sample = None
+        _write_ag_ray_failure_debug(session, {
+            "event": "ag_ray_failure",
+            "run_id": SPCS_RAY_RUN_ID,
+            "shard_index": SHARD_INDEX,
+            "num_shards": NUM_SHARDS,
+            "suite_id": SUITE_ID,
+            "distributed_mode": DISTRIBUTED_MODE,
+            "workers_per_shard": WORKERS_PER_SHARD,
+            "task_cpus": TASK_CPUS,
+            "max_in_flight": locals().get("MAX_IN_FLIGHT", WORKERS_PER_SHARD),
+            "time_limit": TIME_LIMIT,
+            "presets": PRESETS,
+            "worker_data_access_mode": WORKER_DATA_ACCESS_MODE,
+            "results_stage": RESULTS_STAGE,
+            "debug_stage": DEBUG_STAGE,
+            "exception_type": type(_exc).__name__,
+            "exception_message": str(_exc),
+            "traceback": traceback.format_exc(),
+            "submitted": locals().get("submitted", 0),
+            "completed": locals().get("completed", 0),
+            "pending_count": len(locals().get("pending", [])),
+            "output_rows_count": len(locals().get("output_rows", [])),
+            "expected_work_items": locals().get("expected_work_items", len(my_work_items)),
+            "compact_items_count": len(my_work_items),
+            "items_total_bytes": items_total_bytes,
+            "items_max_bytes": items_max_bytes,
+            "cluster_resources": _cr,
+            "available_resources": _ar,
+            "sample_item_metadata_sanitized": _sample,
+        })
+        raise
+
+    print(
+        f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS} complete: "
+        f"{len(output_rows)} rows written to {RESULTS_STAGE}",
+        flush=True,
     )
 
-if (
-    submitted != expected_work_items
-    or completed != expected_work_items
-    or len(output_rows) != expected_work_items
-):
-    raise RuntimeError(
-        f"[ag_ray] Incomplete Ray work item accounting for shard {SHARD_INDEX}/{NUM_SHARDS}: "
-        f"expected={expected_work_items} submitted={submitted} completed={completed} "
-        f"output_rows={len(output_rows)}. Refusing to write a partial shard CSV."
-    )
 
-ok_count = sum(1 for r in output_rows if r.get("status") == "ok")
-skip_count = sum(1 for r in output_rows if r.get("status") == "skipped")
-fail_count = sum(1 for r in output_rows if r.get("status") == "failed")
-print(
-    f"[ag_ray] row summary: ok={ok_count} skipped={skip_count} failed={fail_count} "
-    f"total={len(output_rows)}",
-    flush=True,
-)
-
-# ---------------------------------------------------------------------------
-# Write output — driver only, exactly one file
-# ---------------------------------------------------------------------------
-
-# SYNREG_RESULTS_STAGE was captured at module import time from the required
-# SYNREG_RESULTS_STAGE env var; write_part_csv_to_stage uses that constant directly.
-write_part_csv_to_stage(
-    session,
-    output_rows,
-    "AutoGluon",
-    SHARD_INDEX,
-    NUM_SHARDS,
-)
-
-print(
-    f"[ag_ray] shard {SHARD_INDEX}/{NUM_SHARDS} complete: "
-    f"{len(output_rows)} rows written to {RESULTS_STAGE}",
-    flush=True,
-)
+if __name__ == "__main__":
+    _resolve_runtime_globals()
+    _validate_runtime_globals()
+    main()
