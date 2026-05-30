@@ -2,8 +2,9 @@
 
 This probe validates the production worker-local dataset access path without
 running AutoGluon training and without writing evaluation shard outputs.
-Current production access mode is scoped_file_url: the driver derives scoped
-file URLs, and workers use SnowflakeFile without creating Snowpark sessions.
+Current production access mode is driver_presigned_url: the driver derives
+presigned HTTPS URLs, and workers download with urllib without creating
+Snowpark sessions.
 
 Ray mode:
   - attach to the Snowflake Ray cluster

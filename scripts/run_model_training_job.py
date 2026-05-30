@@ -289,10 +289,8 @@ def _run_model_training_impl(
         "TRAINING_DATA_FAMILY":       training_data_family,
         "MODEL_DESIGN_PATTERN":      model_design_pattern,
         "PRETRAIN_LOAD_POLICY":      pretrain_policy,
+        "PRETRAIN_CHECKPOINT_PATH":  pretrain_checkpoint_path,
     }
-    if pretrain_checkpoint_path:
-        env_vars["PRETRAIN_CHECKPOINT_PATH"] = pretrain_checkpoint_path
-
     # Topology preflight: EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES × 4.
     _expected_ws = int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"])
     if _expected_ws != TRAIN_NUM_NODES * 4:

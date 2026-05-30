@@ -20,7 +20,7 @@
 --      CALL run_synthetic_nonlinear_prep('2.5.0-py311');
 --      CALL run_synthetic_nonlinear_deepset_evaluation('2.5.0-py311');
 --      CALL run_synthetic_nonlinear_baseline_evaluation('2.5.0-py311');
---      CALL run_synthetic_nonlinear_autogluon_spcs_evaluation('<AG_IMAGE>', 6, 4, 1, 6, 300, 'best_quality', 600, 1);
+--      CALL run_synthetic_nonlinear_autogluon_spcs_evaluation('<AG_IMAGE>', 6, 4, 6, 300, 'best_quality', 1, 600, 1);
 --      CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
 --   5. Verify index (expect I/J/K/L each with 100 rows):
 --      SELECT prior_regime, COUNT(*) AS n

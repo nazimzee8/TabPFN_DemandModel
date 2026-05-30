@@ -591,9 +591,9 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
   service-to-service traffic on declared endpoints. Do not add a separate head or driver service —
   the coordinator replaces both. Resource profile: `SYNREG_SPCS_RAY_COORDINATOR_*` (default 1/2 CPU, 4Gi/8Gi memory).
 - **Session-free worker dataset loading:** The Ray driver opens Snowpark only to query
-  `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.scoped_url` with
-  `BUILD_SCOPED_FILE_URL`. Each Ray worker receives only a compact item dict and opens
-  the scoped URL with `SnowflakeFile.open(scoped_url)`. Workers must not call
+  `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.presigned_url` with
+  `GET_PRESIGNED_URL`. Each Ray worker receives only a compact item dict and downloads
+  the presigned HTTPS URL with `urllib`. Workers must not call
   `Session.builder.getOrCreate()`, must not query the index, and the driver must not
   call `ray.put(dataset)`. `MAX_IN_FLIGHT` bounds active worker-loaded AutoGluon fits.
 - The driver process inside each MLJob writes exactly **one** output file:
@@ -1125,6 +1125,15 @@ set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting t
 **Key rules:**
 - `run_training_job.py`, `run_model_training_job.py`, and `run_hpo_job.py` each expose
   `DEFAULT_TRAINING_DATA_FAMILY = os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")`.
+- Standalone pretrain and HPO submitters support purpose-specific selectors:
+  `PRETRAIN_TRAINING_DATA_FAMILY` and `HPO_TRAINING_DATA_FAMILY` override
+  `TRAINING_DATA_FAMILY` for zero-arg `run_pretrain_pipeline()` and
+  `run_hpo_pipeline()` respectively. `NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY`
+  overrides the zero-arg nonlinear pretrain default and otherwise falls back to
+  `PRETRAIN_TRAINING_DATA_FAMILY`, then `TRAINING_DATA_FAMILY`, then
+  `synthetic_regression_nonlinear`.
+- Explicit SQL procedure arguments always win over env-var defaults; use them for
+  production runs when the lineage selector must be auditable in the call text.
 - Pretrain and final training in `run_training_job.py` must use the **same** value.
 - `train.py` validates the value at module load time and raises `ValueError` for unknown values.
 - Checkpoint `metadata["training_data_family"]` is populated from `TRAINING_DATA_FAMILY`; it enables end-to-end lineage tracing from staged data → checkpoint → evaluation.

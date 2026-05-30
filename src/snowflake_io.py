@@ -134,9 +134,11 @@ def _normalize_stage_path(stage_path, split=None):
     if stage_path is None:
         raise ValueError("META_DATASET_INDEX row has NULL stage_path")
     path = str(stage_path).replace("\\", "/").strip()
-    prefix = f"{META_DATASET_STAGE}/"
-    if path.upper().startswith(prefix.upper()):
-        path = path[len(prefix):]
+    for stage in (META_DATASET_STAGE, META_NONLINEAR_DATASET_STAGE):
+        prefix = f"{stage}/"
+        if path.upper().startswith(prefix.upper()):
+            path = path[len(prefix):]
+            break
     path = path.lstrip("/")
     if not path:
         raise ValueError("META_DATASET_INDEX row has empty stage_path")
@@ -146,7 +148,8 @@ def _normalize_stage_path(stage_path, split=None):
 
 
 def _stage_file_path(stage_path, split=None):
-    return f"{META_DATASET_STAGE}/{_normalize_stage_path(stage_path, split=split)}"
+    _index_table, _stage = _resolve_index_table_and_stage()
+    return f"{_stage}/{_normalize_stage_path(stage_path, split=split)}"
 
 
 def _validate_index_rows(rows, required_columns, split_limits=None):
@@ -263,12 +266,13 @@ ORDER BY split, task_id
 
 def select_rank_sharded_index_rows(split, rank, world_size, session=None):
     """
-    Select the META_DATASET_INDEX rows owned by one DDP rank.
+    Select the active meta dataset index rows owned by one DDP rank.
 
     This is the production training sharding path. It avoids
     ShardedDataConnector worker-side shard conversion and lets Snowflake do the
     deterministic split assignment with ROW_NUMBER() and MOD().
     """
+    _index_table, _stage = _resolve_index_table_and_stage()
     rank = int(rank)
     world_size = int(world_size)
     if world_size <= 0:
@@ -294,7 +298,7 @@ FROM (
   SELECT
     split, task_id, stage_path, p, n_train,
     ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1 AS rn
-  FROM {META_DATASET_INDEX}
+  FROM {_index_table}
   WHERE split = {split_sql}
 )
 WHERE MOD(rn, {world_size}) = {rank}
@@ -304,7 +308,7 @@ ORDER BY task_id
         rows = [_row_to_dict(row) for row in session.sql(sql).collect()]
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to query rank-sharded {META_DATASET_INDEX} rows for "
+            f"Failed to query rank-sharded {_index_table} rows for "
             f"split={split!r}, rank={rank}, world_size={world_size}."
         ) from exc
 

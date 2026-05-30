@@ -18,7 +18,7 @@ Execution sequence:
 
 Environment variables (read by this script):
   SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT           (default 6379)
-  SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES  (default 500000000 = ~500 MB)
+  SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES  (default 268435456 = 256 MiB)
   SPCS_RAY_HEAD_CONNECT_TIMEOUT_SECONDS          (default 300)
   SPCS_RAY_RUN_ID                                Run ID for cluster identity (Finding 6)
   SPCS_RAY_SHARD_INDEX                           Shard index for cluster identity
@@ -62,7 +62,7 @@ _DRIVER_SCRIPT = os.getenv("SPCS_RAY_DRIVER_SCRIPT", str(_AUTOGLUON_RAY_PY))
 
 head_port = int(os.getenv("SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT", "6379"))
 obj_store_bytes = int(
-    os.getenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", "500000000")
+    os.getenv("SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES", "268435456")
 )
 head_connect_timeout = int(os.getenv("SPCS_RAY_HEAD_CONNECT_TIMEOUT_SECONDS", "300"))
 node_manager_port = int(os.getenv("SYNREG_SPCS_RAY_NODE_MANAGER_PORT", "6380"))

@@ -6,7 +6,7 @@ Keeps alive until a sentinel file or timeout.
 Environment variables:
   RAY_HEAD_ADDRESS                              required, e.g. "spcs-ray-coord-abc123-0.myschema.mydb.snowflakecomputing.internal:6379"
   AUTOGLUON_TASK_CPUS                           (default 1) — logical CPUs advertised to Ray scheduler
-  SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES  (default 2000000000 = ~2 GB)
+  SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES  (default 268435456 = 256 MiB)
   SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS       (default 300)
   SPCS_RAY_WORKER_KEEPALIVE_SECONDS             (default 7200)
   SYNREG_SPCS_RAY_NODE_MANAGER_PORT             (default 6380) — deterministic raylet port
@@ -47,7 +47,7 @@ connect_timeout = int(os.getenv("SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS", "300"
 keepalive_seconds = int(os.getenv("SPCS_RAY_WORKER_KEEPALIVE_SECONDS", "7200"))
 task_cpus = int(os.getenv("AUTOGLUON_TASK_CPUS", "1"))
 obj_store_bytes = int(
-    os.getenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", "2000000000")
+    os.getenv("SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES", "268435456")
 )
 node_manager_port = int(os.getenv("SYNREG_SPCS_RAY_NODE_MANAGER_PORT", "6380"))
 object_manager_port = int(os.getenv("SYNREG_SPCS_RAY_OBJECT_MANAGER_PORT", "6381"))

@@ -22,6 +22,7 @@ NONLINEAR_PRETRAIN_DEFAULTS = {
     "use_ridge_expert": False,
 }
 NONLINEAR_PRETRAIN_CHECKPOINT = "pretrain_nonlinear_meta.pt"
+NONLINEAR_TRAINING_DATA_FAMILY = "synthetic_regression_nonlinear"
 
 GPU_POOL            = "DEEPSET_GPU_POOL"
 MODEL_STAGE         = "@MODEL_STAGE"
@@ -32,7 +33,17 @@ TRAIN_NUM_NODES             = 10
 # Model selector env vars — propagated to the pretrain MLJob so train.py builds
 # the correct model family.
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
-DEFAULT_TRAINING_DATA_FAMILY  = os.getenv("TRAINING_DATA_FAMILY",  "synthetic_regression_combined")
+DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
+    "PRETRAIN_TRAINING_DATA_FAMILY",
+    os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined"),
+)
+DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY = os.getenv(
+    "NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY",
+    os.getenv(
+        "PRETRAIN_TRAINING_DATA_FAMILY",
+        os.getenv("TRAINING_DATA_FAMILY", NONLINEAR_TRAINING_DATA_FAMILY),
+    ),
+)
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
@@ -340,7 +351,10 @@ def _run_pretrain_nonlinear_impl(
     training_data_family: str,
     model_design_pattern: str,
 ) -> str:
-    _validate_nonlinear_dataset_index(session)
+    if training_data_family == NONLINEAR_TRAINING_DATA_FAMILY:
+        _validate_nonlinear_dataset_index(session)
+    else:
+        _validate_meta_dataset_index(session)
     print("Submitting nonlinear pre-training job ...")
     pretrain_job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -377,7 +391,7 @@ def run_pretrain_pipeline_nonlinear() -> str:
     return _run_pretrain_nonlinear_impl(
         session,
         DEFAULT_MODEL_FAMILY,
-        DEFAULT_TRAINING_DATA_FAMILY,
+        DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY,
         DEFAULT_MODEL_DESIGN_PATTERN,
     )
 

@@ -42,6 +42,7 @@ for _mod in (
 import run_training_job      # noqa: E402
 import run_model_training_job  # noqa: E402
 import run_hpo_job           # noqa: E402
+import run_pretrain_job      # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,57 @@ class TestRunPipelinePropagation:
 
 
 # ---------------------------------------------------------------------------
+# Tests: run_pretrain_job.py — purpose-specific training-family env defaults
+# ---------------------------------------------------------------------------
+
+class TestRunPretrainJobFamilyDefaults:
+    def test_pretrain_specific_env_overrides_shared_training_family(self, monkeypatch):
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
+        monkeypatch.setenv("PRETRAIN_TRAINING_DATA_FAMILY", "market_mental_model")
+        importlib.reload(run_pretrain_job)
+
+        assert run_pretrain_job.DEFAULT_TRAINING_DATA_FAMILY == "market_mental_model"
+        importlib.reload(run_pretrain_job)
+
+    def test_pretrain_falls_back_to_shared_training_family(self, monkeypatch):
+        monkeypatch.delenv("PRETRAIN_TRAINING_DATA_FAMILY", raising=False)
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
+        importlib.reload(run_pretrain_job)
+
+        assert (
+            run_pretrain_job.DEFAULT_TRAINING_DATA_FAMILY
+            == "synthetic_regression_nonlinear"
+        )
+        importlib.reload(run_pretrain_job)
+
+    def test_nonlinear_pretrain_has_nonlinear_default_without_shared_env(self, monkeypatch):
+        monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
+        monkeypatch.delenv("PRETRAIN_TRAINING_DATA_FAMILY", raising=False)
+        monkeypatch.delenv("NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY", raising=False)
+        importlib.reload(run_pretrain_job)
+
+        assert (
+            run_pretrain_job.DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY
+            == "synthetic_regression_nonlinear"
+        )
+        importlib.reload(run_pretrain_job)
+
+    def test_nonlinear_pretrain_specific_env_overrides_default(self, monkeypatch):
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
+        monkeypatch.setenv(
+            "NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY",
+            "market_mental_model",
+        )
+        importlib.reload(run_pretrain_job)
+
+        assert (
+            run_pretrain_job.DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY
+            == "market_mental_model"
+        )
+        importlib.reload(run_pretrain_job)
+
+
+# ---------------------------------------------------------------------------
 # Tests: run_model_training_job.py — run_model_training() propagation
 # ---------------------------------------------------------------------------
 
@@ -303,12 +355,30 @@ class TestRunModelTrainingPropagation:
 
 class TestRunHpoJobPropagation:
     def test_default_is_combined(self, monkeypatch):
+        monkeypatch.delenv("HPO_TRAINING_DATA_FAMILY", raising=False)
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_hpo_job)
         assert run_hpo_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_combined"
         importlib.reload(run_hpo_job)
 
+    def test_hpo_specific_env_overrides_shared_training_family(self, monkeypatch):
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
+        monkeypatch.setenv("HPO_TRAINING_DATA_FAMILY", "market_mental_model")
+        importlib.reload(run_hpo_job)
+
+        assert run_hpo_job.DEFAULT_TRAINING_DATA_FAMILY == "market_mental_model"
+        importlib.reload(run_hpo_job)
+
+    def test_hpo_falls_back_to_shared_training_family(self, monkeypatch):
+        monkeypatch.delenv("HPO_TRAINING_DATA_FAMILY", raising=False)
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
+        importlib.reload(run_hpo_job)
+
+        assert run_hpo_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_nonlinear"
+        importlib.reload(run_hpo_job)
+
     def test_hpo_job_receives_training_data_family(self, monkeypatch):
+        monkeypatch.delenv("HPO_TRAINING_DATA_FAMILY", raising=False)
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_hpo_job)
 

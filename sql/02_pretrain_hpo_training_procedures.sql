@@ -242,7 +242,11 @@ CREATE OR REPLACE PROCEDURE build_meta_nonlinear_dataset_index()
 -- Validates META_NONLINEAR_DATASET_INDEX before submitting.
 -- Run this before any nonlinear HPO sweep.
 --
--- 0-arg form (env-var defaults):
+-- 0-arg form (env-var defaults). Training-family precedence:
+--   NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY
+--   -> PRETRAIN_TRAINING_DATA_FAMILY
+--   -> TRAINING_DATA_FAMILY
+--   -> synthetic_regression_nonlinear.
 --   CALL run_pretrain_pipeline_nonlinear();
 -- 3-arg form (explicit model selectors — recommended):
 --   CALL run_pretrain_pipeline_nonlinear(
@@ -274,7 +278,9 @@ CREATE OR REPLACE PROCEDURE run_pretrain_pipeline_nonlinear(
 -- train.py as BEST_CONFIG, and produces @MODEL_STAGE/checkpoints/best.pt.
 -- Checkpoint metadata includes: model_family, task_type, training_data_family,
 --   best_val_mse, train_mse_at_best, best_epoch, pytorch_version.
--- Zero-arg form uses env-var defaults (MODEL_FAMILY, TRAINING_DATA_FAMILY, MODEL_DESIGN_PATTERN):
+-- Zero-arg form uses env-var defaults (MODEL_FAMILY, TRAINING_DATA_FAMILY, MODEL_DESIGN_PATTERN).
+-- Standalone HPO also supports HPO_TRAINING_DATA_FAMILY -> TRAINING_DATA_FAMILY
+-- -> synthetic_regression_combined for zero-arg run_hpo_pipeline().
 CREATE OR REPLACE PROCEDURE run_model_training()
   RETURNS STRING
   LANGUAGE PYTHON

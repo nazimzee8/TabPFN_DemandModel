@@ -14,7 +14,8 @@ MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 # Training data family for traceability — passed through to the HPO job for logging.
 # Does not affect search behavior or Ray Tune metric selection.
 DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
-    "TRAINING_DATA_FAMILY", "synthetic_regression_combined"
+    "HPO_TRAINING_DATA_FAMILY",
+    os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined"),
 )
 
 # MODEL3 architecture selectors — propagated to the HPO MLJob env_vars.

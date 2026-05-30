@@ -2370,12 +2370,12 @@ Ray nodes are alive. The driver process:
 1. Loads `SYNTHETIC_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
 2. Expands rows to explicit `(dataset, split_seed, condition)` work items
 3. Assigns this cluster's shard using `assign_synthetic_regression_shard(items, shard_index, num_shards)`
-4. Builds compact JSON item dicts and derives `dataset_access.scoped_url` with `BUILD_SCOPED_FILE_URL`
-5. Distributes only compact item dicts across Ray tasks; each worker loads its own dataset with `SnowflakeFile.open(scoped_url)` (no `ray.put`, no worker Snowpark session)
+4. Builds compact JSON item dicts and derives `dataset_access.presigned_url` with `GET_PRESIGNED_URL`
+5. Distributes only compact item dicts across Ray tasks; each worker downloads its own dataset with `urllib` (no `ray.put`, no worker Snowpark session)
 6. Writes exactly one file: `AutoGluon_shard{shard_index}_of_{num_shards}_detailed.csv`
 
 Workers never query `SYNTHETIC_REGRESSION_DATASET_INDEX` and do not create Snowpark sessions.
-The only worker data access surface is the scoped URL in the item dict produced by the driver.
+The only worker data access surface is the presigned HTTPS URL in the item dict produced by the driver.
 
 Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CLUSTER_SHARDS`).
 
@@ -2678,7 +2678,7 @@ requests from limits, use the same prefixes with `_CPU_REQUEST`, `_CPU_LIMIT`,
 `_MEMORY_REQUEST`, and `_MEMORY_LIMIT`.
 
 Object store memory overrides: `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES`
-(default 500 MB) and `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` (default 2 GB).
+(default 256 MiB) and `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` (default 256 MiB).
 
 ### Step 0 — Create the image repository (once)
 
@@ -3038,17 +3038,20 @@ The nonlinear synthetic regression path is opt-in and keeps the existing MODEL3
 family selector:
 
 - `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`
+- `PRETRAIN_TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` for zero-arg
+  standalone pretrain, or pass the training family explicitly in SQL.
+- `HPO_TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` for zero-arg
+  standalone HPO, or pass the training family explicitly in SQL.
 - `MODEL_FAMILY=market_exchangeable_icl`
 - `MODEL_DESIGN_PATTERN=inductive_forecasting`
 - `HPO_SWEEP_MODE=nonlinear_meta`
 - Optional second sweep: `HPO_SWEEP_MODE=nonlinear_architecture` with
   `HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_nonlinear_meta.json`
 
-Nonlinear HPO cold-starts by default. It does not require the gate-specific
-`pretrain_gate<N>.pt` checkpoints used by `ridge_residual`. If an exact nonlinear
-pretrain is intentionally available, pass it through
-`HPO_PRETRAIN_CHECKPOINT_STAGE_PATH`; incompatible nonlinear checkpoints are skipped
-and the trial cold-starts.
+Nonlinear HPO does not use the gate-specific `pretrain_gate<N>.pt` checkpoints
+from `ridge_residual`. For the intended warm-start path, pass
+`HPO_PRETRAIN_CHECKPOINT_STAGE_PATH=@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt`;
+incompatible nonlinear checkpoints are skipped and the trial cold-starts.
 
 ---
 
@@ -3135,7 +3138,7 @@ CALL run_synthetic_nonlinear_baseline_evaluation('2.5.0-py311');
 
 -- Phase 4: AutoGluon SPCS evaluation (Ray distributed, 6 cluster shards)
 CALL run_synthetic_nonlinear_autogluon_spcs_evaluation(
-    '<AG_IMAGE>', 6, 4, 1, 6, 300, 'best_quality', 600, 1);
+    '<AG_IMAGE>', 6, 4, 6, 300, 'best_quality', 1, 600, 1);
 
 -- Phase 5: Aggregate results
 CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
@@ -3191,6 +3194,9 @@ plus metadata columns `prior_regime`, `n`, `p`, `n_train`, `n_test`).
 The nonlinear training pipeline uses a **separate** stage and index from the linear pipeline.
 Routing is controlled by the `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` environment
 variable read by `snowflake_io.py::_resolve_index_table_and_stage()`.
+For zero-arg standalone submitters, `PRETRAIN_TRAINING_DATA_FAMILY` and
+`HPO_TRAINING_DATA_FAMILY` can override the shared `TRAINING_DATA_FAMILY` without
+changing code; explicit SQL procedure arguments still take precedence.
 
 ### Infrastructure
 

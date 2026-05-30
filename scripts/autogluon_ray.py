@@ -15,8 +15,9 @@ Strategy: Ray work-item distribution (SYNREG_AUTOGLUON_DISTRIBUTED_MODE=ray_work
   - Each Ray task runs one bounded local AutoGluon fit.
   - The DRIVER is the only process that writes the output CSV. Worker tasks return
     canonical row dicts; they never query SYNTHETIC_REGRESSION_DATASET_INDEX or write
-    stage files. Current worker dataset access mode is scoped_file_url:
-    the driver derives scoped URLs and workers use SnowflakeFile without sessions.
+    stage files. Current worker dataset access mode is driver_presigned_url:
+    the driver derives presigned HTTPS URLs and workers download with urllib
+    without Snowpark sessions.
   - Fallback to single-node mode is DISABLED to prevent duplicate shard file writes.
 
 Invariants:

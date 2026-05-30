@@ -99,6 +99,51 @@ class TestResolveIndexTableAndStage:
             "SQL must reference META_NONLINEAR_DATASET_INDEX, not META_DATASET_INDEX"
         )
 
+    def test_rank_sharded_training_sql_uses_nonlinear_index_when_env_set(self, monkeypatch):
+        """DDP rank sharding must query META_NONLINEAR_DATASET_INDEX for nonlinear training."""
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
+        captured_sql = []
+
+        class _FakeSession:
+            def sql(self, query):
+                captured_sql.append(query)
+                return self
+
+            def collect(self):
+                return [{
+                    "split": "train",
+                    "task_id": 0,
+                    "stage_path": "train/sample.parquet",
+                    "p": 8,
+                    "n_train": 256,
+                }]
+
+        rows = self.mod.select_rank_sharded_index_rows(
+            "train", rank=0, world_size=4, session=_FakeSession()
+        )
+
+        assert rows[0]["stage_path"] == "train/sample.parquet"
+        assert captured_sql, "No SQL was captured"
+        assert any("FROM META_NONLINEAR_DATASET_INDEX" in sql for sql in captured_sql), (
+            f"Expected rank-sharded SQL to query nonlinear index, got: {captured_sql}"
+        )
+
+    def test_stage_file_path_uses_nonlinear_stage_when_env_set(self, monkeypatch):
+        """Materialization must download nonlinear rows from @META_NONLINEAR_DATASET_STAGE."""
+        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
+
+        assert (
+            self.mod._stage_file_path("train/sample.parquet", split="train")
+            == "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet"
+        )
+        assert (
+            self.mod._stage_file_path(
+                "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet",
+                split="train",
+            )
+            == "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Fix 1d — SQL DDL presence checks
