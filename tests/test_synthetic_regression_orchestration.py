@@ -1421,10 +1421,11 @@ class TestCombinedSplitPhase:
         assert "def _autogluon_work_item(item_meta: dict, dataset_payload" not in text
 
     def test_ray_driver_submits_without_payload_ref(self):
-        """Driver must submit _autogluon_work_item.remote(item) — no payload_ref argument."""
+        """Driver must submit _autogluon_work_item via .options().remote(item) — no payload_ref."""
         text = (ROOT / "scripts" / "autogluon_ray.py").read_text()
-        assert "_autogluon_work_item.remote(item)" in text, (
-            "driver must call _autogluon_work_item.remote(item) without a payload_ref"
+        # After Fix 8, the call site uses .options(num_cpus=TASK_CPUS).remote(item)
+        assert "_autogluon_work_item.options(num_cpus=TASK_CPUS).remote(item)" in text, (
+            "driver must call _autogluon_work_item.options(num_cpus=TASK_CPUS).remote(item)"
         )
         assert "_autogluon_work_item.remote(item, payload_ref)" not in text
 
@@ -2421,7 +2422,7 @@ class TestSPCSStaticAnalysis:
         # The remote task function should not call it
         import re
         remote_task_match = re.search(
-            r'@ray\.remote.*?def _autogluon_work_item.*?(?=@ray\.remote|\Z)',
+            r'@ray\.remote.*?def _autogluon_work_item.*?(?=# ---------------------------------------------------------------------------\n# Main distributed evaluation loop|\Z)',
             text, re.DOTALL
         )
         if remote_task_match:
@@ -4727,3 +4728,70 @@ class TestNonlinearEvaluation:
         assert "nonlinear_v1" in coord_specs[0]
         assert "linear_all_v1" not in coord_specs[0]
         assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in coord_specs[0]
+
+    def test_nonlinear_spcs_ray_concurrent_must_equal_cluster_shards(self, monkeypatch):
+        """concurrent_clusters != cluster_shards in Ray mode raises ValueError."""
+        import run_synthetic_nonlinear_evaluation as mod
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
+        with pytest.raises(ValueError, match="concurrent_clusters"):
+            mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+                object(),
+                autogluon_cluster_shards=4,
+                autogluon_workers_per_shard=1,
+                autogluon_concurrent_clusters=2,  # != cluster_shards → must raise
+            )
+
+    def test_nonlinear_spcs_injects_distributed_mode_env(self, monkeypatch):
+        """Coordinator env contains SYNREG_AUTOGLUON_DISTRIBUTED_MODE=ray_work_items."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
+        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(), autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        assert coord_specs, "No coordinator spec captured"
+        assert "ray_work_items" in coord_specs[0]
+
+    def test_nonlinear_spcs_injects_index_table_in_all_envs(self, monkeypatch):
+        """All submitted SPCS envs include SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
+        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(), autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=1, autogluon_concurrent_clusters=2)
+        assert submitted, "No SPCS jobs submitted"
+        coordinator_specs = [(label, spec) for label, spec in submitted if "coord" in label]
+        assert coordinator_specs, "No coordinator SPCS jobs found"
+        for _label, spec in coordinator_specs:
+            assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in spec, (
+                f"Coordinator SPCS spec for {_label!r} is missing SYNTHETIC_NONLINEAR_DATASET_INDEX"
+            )

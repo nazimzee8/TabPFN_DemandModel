@@ -56,6 +56,19 @@ Replace `<account>` with your Snowflake account identifier and `<repository_url>
 shown in `SHOW IMAGE REPOSITORIES` (typically
 `<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY`).
 
+For GitHub Actions pushes, set these repository variables after creating a new Snowflake
+account or image repository:
+
+```text
+SNOWFLAKE_REGISTRY_HOST=<account>.registry.snowflakecomputing.com
+SNOWFLAKE_IMAGE_REPOSITORY=<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY
+SNOWFLAKE_IMAGE_VERSION=1.0.0
+```
+
+The workflow can also be run manually with `workflow_dispatch` inputs for the registry host,
+image repository, and image version. This avoids committing free-trial account-specific
+repository URLs.
+
 ### 3. Set the image reference in environment
 
 ```bash

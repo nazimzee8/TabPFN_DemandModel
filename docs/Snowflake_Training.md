@@ -2709,6 +2709,18 @@ docker tag tabpfn-autogluon-ray:1.0.0 \
 docker push <repository_url>/tabpfn-autogluon-ray:1.0.0
 ```
 
+For GitHub Actions image pushes, set repository variables instead of committing an
+account-specific registry URL:
+
+```text
+SNOWFLAKE_REGISTRY_HOST=<account>.registry.snowflakecomputing.com
+SNOWFLAKE_IMAGE_REPOSITORY=<account>.registry.snowflakecomputing.com/<db>/<schema>/AUTOGLUON_IMAGE_REPOSITORY
+SNOWFLAKE_IMAGE_VERSION=1.0.0
+```
+
+The `Build and Push AutoGluon Image` workflow also accepts these values as manual
+`workflow_dispatch` inputs for one-off pushes to a new trial account.
+
 Verify the image is available:
 
 ```sql
@@ -3171,3 +3183,116 @@ Output:
 
 Schema is identical to linear training data (`X_train`, `y_train`, `X_test`, `betaX_test`,
 plus metadata columns `prior_regime`, `n`, `p`, `n_train`, `n_test`).
+
+---
+
+## Nonlinear Training Pipeline
+
+The nonlinear training pipeline uses a **separate** stage and index from the linear pipeline.
+Routing is controlled by the `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` environment
+variable read by `snowflake_io.py::_resolve_index_table_and_stage()`.
+
+### Infrastructure
+
+- **Stage:** `@META_NONLINEAR_DATASET_STAGE` — upload train/val/test nonlinear parquets here
+- **Index table:** `META_NONLINEAR_DATASET_INDEX` — schema identical to `META_DATASET_INDEX`
+- Created by `sql/01_stages_and_metadata_tables.sql` and `sql/run_training_job.sql`
+
+### Step 1 — Upload training data (SnowSQL)
+
+```sql
+-- Clear stale files first
+REMOVE @META_NONLINEAR_DATASET_STAGE/train/;
+REMOVE @META_NONLINEAR_DATASET_STAGE/val/;
+REMOVE @META_NONLINEAR_DATASET_STAGE/test/;
+-- Upload parquets
+PUT file://data/nonlinear/train/*.parquet @META_NONLINEAR_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear/val/*.parquet   @META_NONLINEAR_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear/test/*.parquet  @META_NONLINEAR_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+```
+
+### Step 2 — Build index
+
+```sql
+CALL build_meta_nonlinear_dataset_index();
+```
+
+This submits a CPU MLJob that lists `@META_NONLINEAR_DATASET_STAGE/{train,val,test}/`,
+reads scalar metadata, rebuilds `META_NONLINEAR_DATASET_INDEX`, and validates `train=800`,
+`val=100`, `test=100`.
+
+### Step 3 — Nonlinear pretrain
+
+Writes `@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt` with
+`use_latent_ridge_expert=True` and `latent_ridge_dim=64`.
+
+```sql
+CALL run_pretrain_pipeline_nonlinear(
+    'market_exchangeable_icl',
+    'synthetic_regression_nonlinear',
+    'inductive_forecasting'
+);
+```
+
+### Step 4 — Nonlinear HPO (two-sweep sequence)
+
+**Sweep 1 — nonlinear_meta** (warm-start from pretrain checkpoint):
+
+```sql
+CALL run_hpo_pipeline(
+    'market_exchangeable_icl',
+    'synthetic_regression_nonlinear',
+    'inductive_forecasting',
+    'nonlinear_meta',
+    '',
+    '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+);
+```
+
+Produces `best_config_nonlinear_meta.json` and merged `best_config.json`.
+
+**Sweep 2 — nonlinear_architecture** (tune d_phi/n_sab_feat):
+
+```sql
+CALL run_hpo_pipeline(
+    'market_exchangeable_icl',
+    'synthetic_regression_nonlinear',
+    'inductive_forecasting',
+    'nonlinear_architecture',
+    '@MODEL_STAGE/hpo/best_config_nonlinear_meta.json',
+    '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+);
+```
+
+### Step 5 — Final training
+
+```sql
+CALL run_model_training(
+    'market_exchangeable_icl',
+    'synthetic_regression_nonlinear',
+    'inductive_forecasting'
+);
+```
+
+Reads `@MODEL_STAGE/hpo/best_config.json` (written by HPO).
+Produces `@MODEL_STAGE/checkpoints/best.pt`.
+
+**Important:** If `best_config._meta.pretrain_checkpoint_stage_path` is empty,
+training **fails hard** with a `RuntimeError`. This prevents silent cold-start.
+For development-only cold-start: set `ALLOW_NONLINEAR_COLD_START=true`.
+
+### Checkpoint lineage
+
+```
+generate_nonlinear_dgp.py
+    └─ @META_NONLINEAR_DATASET_STAGE/{train,val,test}/
+           └─ build_meta_nonlinear_dataset_index()  →  META_NONLINEAR_DATASET_INDEX
+                  └─ run_pretrain_pipeline_nonlinear(...)  →  pretrain_nonlinear_meta.pt
+                         └─ run_hpo_pipeline(... nonlinear_meta ...)  →  best_config.json
+                                └─ run_model_training(...)  →  best.pt
+```
+
+### SYNREG_INDEX_TABLE injection
+
+When evaluation procedures submit SPCS or MLJob containers, they automatically inject
+`SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX`. No manual step is required.

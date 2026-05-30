@@ -174,6 +174,29 @@ def _validate_meta_dataset_index(session):
             ) from exc
 
 
+def _apply_nonlinear_cold_start_guard() -> None:
+    """Raise RuntimeError unless ALLOW_NONLINEAR_COLD_START=true.
+
+    Called when a nonlinear best_config has no pretrain_checkpoint_stage_path.
+    This prevents silent cold-start of nonlinear final training; the intended flow is:
+
+        1. CALL run_pretrain_pipeline_nonlinear(...)  → pretrain_nonlinear_meta.pt
+        2. CALL run_hpo_pipeline(... , pretrain_checkpoint_stage_path=...)  → best_config.json
+        3. CALL run_model_training(...)
+
+    For development-only cold-start, set ALLOW_NONLINEAR_COLD_START=true.
+    """
+    allow_cold_start = os.getenv("ALLOW_NONLINEAR_COLD_START", "").lower() == "true"
+    if not allow_cold_start:
+        raise RuntimeError(
+            "[run_model_training] Nonlinear config has no pretrain checkpoint in "
+            "best_config._meta.pretrain_checkpoint_stage_path. "
+            "Run CALL run_pretrain_pipeline_nonlinear(...) then rerun HPO, "
+            "or set ALLOW_NONLINEAR_COLD_START=true to override (dev only)."
+        )
+    print("[run_model_training] ALLOW_NONLINEAR_COLD_START=true: cold-starting.", flush=True)
+
+
 def _run_model_training_impl(
     session,
     model_family: str,
@@ -236,15 +259,7 @@ def _run_model_training_impl(
             flush=True,
         )
     elif is_nonlinear_config:
-        allow_cold_start = os.getenv("ALLOW_NONLINEAR_COLD_START", "").lower() == "true"
-        if not allow_cold_start:
-            raise RuntimeError(
-                "[run_model_training] Nonlinear config has no pretrain checkpoint in "
-                "best_config._meta.pretrain_checkpoint_stage_path. "
-                "Run CALL run_pretrain_pipeline_nonlinear(...) then rerun HPO, "
-                "or set ALLOW_NONLINEAR_COLD_START=true to override (dev only)."
-            )
-        print("[run_model_training] ALLOW_NONLINEAR_COLD_START=true: cold-starting.", flush=True)
+        _apply_nonlinear_cold_start_guard()
     else:
         _gate_ckpt_name = f"pretrain_gate{gate_dim}.pt"
         _gate_ckpt_path = f"{MODEL_STAGE}/checkpoints/{_gate_ckpt_name}"

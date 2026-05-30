@@ -209,6 +209,13 @@ def _resolve_runtime_globals() -> None:
 
 def _validate_runtime_globals() -> None:
     """Validate resolved module-level constants. Call after _resolve_runtime_globals()."""
+    if ray is None:
+        raise RuntimeError(
+            "[ag_ray] Ray is not installed in this environment. "
+            "The AutoGluon distributed work-item entrypoint requires Ray. "
+            "Install it or use evaluate_synthetic_regression.py for single-node mode."
+        )
+
     if DISTRIBUTED_MODE != "ray_work_items":
         raise RuntimeError(
             f"[ag_ray] SYNREG_AUTOGLUON_DISTRIBUTED_MODE={DISTRIBUTED_MODE!r} but this "
@@ -280,12 +287,8 @@ print("[ag_ray] imports complete", flush=True)
 
 try:
     import ray
-except ImportError as exc:
-    raise RuntimeError(
-        "[ag_ray] Ray is not installed in this environment. "
-        "The AutoGluon distributed work-item entrypoint requires Ray. "
-        "Install it or use evaluate_synthetic_regression.py for single-node mode."
-    ) from exc
+except ImportError:
+    ray = None  # type: ignore[assignment]  # validated at runtime in _validate_runtime_globals()
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +335,10 @@ def _wait_for_ray_capacity(*, expected_nodes: int, expected_cpus_min: int) -> tu
 # Ray remote task — @ray.remote without num_cpus; call sites use .options(num_cpus=TASK_CPUS)
 # ---------------------------------------------------------------------------
 
-@ray.remote
+_ray_remote = ray.remote if ray is not None else (lambda fn: fn)
+
+
+@_ray_remote
 def _autogluon_work_item(item_meta: dict) -> dict:
     """Execute one AutoGluon fit+predict for a single (dataset, seed, condition) triple.
 
@@ -518,7 +524,7 @@ def _autogluon_work_item(item_meta: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main — all executable logic (Ray init + work assignment + evaluation loop)
+# Main distributed evaluation loop
 # ---------------------------------------------------------------------------
 
 def main() -> None:
