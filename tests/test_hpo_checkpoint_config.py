@@ -227,7 +227,6 @@ def test_hpo_sweep_mode_constant_exists():
         "ridge_residual",
         "architecture",
         "nonlinear_meta",
-        "nonlinear_architecture",
     }
 
 

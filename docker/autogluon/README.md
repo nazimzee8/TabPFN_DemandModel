@@ -100,7 +100,7 @@ export SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job
   | Role | CPU request | CPU limit | Memory request | Memory limit |
   |------|-------------|-----------|----------------|--------------|
   | Coordinator | 1 | 2 | 4Gi | 8Gi |
-  | Worker | 4 | 4 | 16Gi | 16Gi |
+  | Worker | 1 | 1 | 8Gi | 16Gi |
   | Single-node AutoGluon | 4 | 4 | 16Gi | 16Gi |
   | Probe / import-timing | 0.5 | 0.5 | 2Gi | 2Gi |
   Override via `SYNREG_SPCS_RAY_COORDINATOR_*`, `SYNREG_SPCS_RAY_WORKER_*`,

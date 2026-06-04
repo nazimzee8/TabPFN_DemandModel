@@ -1047,7 +1047,7 @@ Procedure responsibilities:
 - `build_meta_dataset_index()` imports `run_training_job.py` and submits `build_meta_dataset_index.py` on `DEEPSET_CPU_POOL`; it rebuilds `META_DATASET_INDEX` from `@META_DATASET_STAGE/{train,val,test}/`.
 - `run_hpo_pipeline()` imports `run_hpo_job.py` and submits only the `hpo.py` MLJob/container.
 - `run_model_training()` imports `run_model_training_job.py`, reads `@MODEL_STAGE/hpo/best_config.json`, passes it to `train.py` as `BEST_CONFIG`, and submits only the training MLJob/container.
-- `run_training_pipeline()` imports `run_training_job.py` and remains a one-call convenience wrapper for HPO plus training.
+- `run_training_pipeline()` is the **linear-only** convenience wrapper (Validate → Pretrain → HPO ridge_residual → MemProbe → HPO architecture → Final training); it raises `RuntimeError` for `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`. Use `run_pretrain_pipeline_nonlinear` + `run_hpo_pipeline` + `run_model_training` for the nonlinear path.
 - `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_DATASET_STAGE/benchmark_prepared/`.
 - `run_evaluation_pipeline()` imports `run_evaluation_test.py`, verifies `best.pt`, `runtime_probe.py`, compute pools, and runtime-image imports by submitting and waiting on 5 serial probes including the CPU baseline probe with `pip_requirements=["catboost"]`, runs single-node GPU synthetic evaluation, always submits benchmark preparation as manifest/index validation, then launches prepared benchmark shards and aggregation.
 - `run_evaluation_runtime_probes()` imports `run_evaluation_test.py` and runs only the 5 serial preflight probes without submitting evaluation jobs. Use this to validate runtime environments before a full evaluation run.
@@ -2631,25 +2631,31 @@ Key differences from the MLJob backend:
 ### Architecture (text diagram)
 
 ```
-SPCS Job Services per shard (Ray distributed mode):
+SPCS job submission order — per-shard barrier (repeated for each shard independently):
 
-  [SPCS coordinator]       spcs_ray_coordinator.py
-    subprocess 1: ray start --head --num-cpus=0 --object-store-memory=...
-                            --resources={"spcs_cluster_id_<run_id>_<shard>": 1}
-    subprocess 2: autogluon_ray.py
-                            (SYNREG_RAY_ADDRESS_MODE=explicit,
-                             RAY_HEAD_ADDRESS=localhost:<port>)
-    TCP endpoint: ray-head → port 6379 (exposed in SPCS spec)
+  Step 1 → Submit this shard's workers [SPCS worker 0..N]   spcs_ray_worker.py
+              polls RAY_HEAD_ADDRESS socket (_wait_head_reachable)
+              waits until coordinator head port opens
 
-          | <-- RAY_HEAD_ADDRESS (<coordinator_dns>.<SPCS_RAY_HEAD_DNS_SUFFIX>:<port>)
-          |     SPCS DNS rule: underscores in service name → dashes
-          |     e.g. spcs_ray_coord_r0_0 → spcs-ray-coord-r0-0.<suffix>
+  Step 2 → Orchestrator polls SHOW SERVICE CONTAINERS IN SERVICE <worker_job>
+              (falls back to SYSTEM$GET_SERVICE_STATUS if SHOW raises)
+              until ALL of this shard's workers reach READY or RUNNING
+              — DONE/SUCCEEDED raise immediately (unexpected terminal)
+              — FAILED/FAILED_OOM/INTERNAL_ERROR/UNKNOWN raise immediately
+              — ≥5 consecutive empty responses raise immediately
 
-  [SPCS worker 0]          spcs_ray_worker.py
-                            (--num-cpus=<AUTOGLUON_TASK_CPUS>
-                             --object-store-memory=<SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES>)
-  [SPCS worker 1]          spcs_ray_worker.py
-  ...
+  Step 3 → Submit this shard's coordinator [SPCS coordinator]  spcs_ray_coordinator.py
+              subprocess 1: ray start --head --num-cpus=0 --object-store-memory=...
+                                      --resources={"spcs_cluster_id_<run_id>_<shard>": 1}
+              subprocess 2: autogluon_ray.py
+                                      (SYNREG_RAY_ADDRESS_MODE=explicit,
+                                       RAY_HEAD_ADDRESS=localhost:<port>)
+              TCP endpoint: ray-head → port 6379 (exposed in SPCS spec)
+              Ray readiness timeout starts here — SPCS placement latency excluded
+
+  Workers connect via RAY_HEAD_ADDRESS (<coordinator_dns>.<SPCS_RAY_HEAD_DNS_SUFFIX>:<port>)
+  SPCS DNS rule: underscores in service name → dashes
+  e.g. spcs_ray_coord_r0_0 → spcs-ray-coord-r0-0.<suffix>
 ```
 
 Single-node mode (AUTOGLUON_CLUSTER_SHARDS=0): one SPCS container per shard running
@@ -2662,12 +2668,20 @@ the head to become reachable on localhost, then runs `autogluon_ray.py` with
 `RAY_HEAD_ADDRESS=localhost:<port>`. Workers connect to the coordinator's external
 DNS address. Only the 24 worker containers provide schedulable Ray CPUs.
 
+Workers are intentionally submitted before coordinators using a **per-shard barrier**:
+after each shard's workers are submitted, `_wait_spcs_workers_ready` polls
+`SHOW SERVICE CONTAINERS IN SERVICE` (falling back to `SYSTEM$GET_SERVICE_STATUS`) until
+all of that shard's workers reach READY or RUNNING (default 900 s, configurable via
+`SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS`). Only then is that shard's coordinator
+submitted. This ensures `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` measures only Ray
+cluster formation (head start + worker join), not SPCS scheduling/image-pull latency.
+
 Default SPCS resource profiles:
 
 | Role | CPU request | CPU limit | Memory request | Memory limit |
 | --- | ---: | ---: | ---: | ---: |
 | Ray coordinator | 1 | 2 | 4Gi | 8Gi |
-| Ray worker | 4 | 4 | 16Gi | 16Gi |
+| Ray worker | 1 | 1 | 8Gi | 16Gi |
 | Single-node AutoGluon | 4 | 4 | 16Gi | 16Gi |
 | Import/session probe | 0.5 | 0.5 | 2Gi | 2Gi |
 
@@ -2875,13 +2889,34 @@ When a capacity probe reports partial worker join (e.g. `live_nodes=2/5`), use t
 
 1. **Check timeout first** — The default readiness timeout is now 900 s. If the probe timed out
    at 300 s, simply rerun: cold-start of a custom image can take 3–5 minutes.
-2. **Reduce burst pressure** — If partial join persists, rerun with
+2. **Reduce burst pressure** — Workers-first ordering already eliminates most burst-scheduling
+   failures: all workers are placed and READY before the coordinator starts its Ray readiness
+   timer. If partial join persists after workers-first, rerun with
    `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS=10` to stagger worker submission by 10 s per
-   worker and reduce simultaneous scheduling pressure.
-3. **Capture missing worker logs** — If workers still show no logs, rerun with
-   `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true`. On coordinator timeout the worker jobs are
-   left running so their logs can be retrieved via SPCS job service log inspection.
-4. **Cancel leftover jobs** — After inspection, manually cancel each leftover worker:
+   worker and further reduce simultaneous scheduling pressure.
+3. **Worker placement timeout** — If workers are not reaching READY within 900 s (e.g. image
+   pull is slow), increase `SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS` (default 900).
+   Check `SHOW SERVICE CONTAINERS IN SERVICE <worker_job_service>` (or the legacy
+   `SYSTEM$GET_SERVICE_STATUS('<worker_job_service>')`) to confirm workers are scheduling.
+   Note: `DONE`/`SUCCEEDED` container statuses raise immediately as unexpected terminal states;
+   `UNKNOWN` is treated as a failure, not a transient state.
+4. **Capture missing worker logs** — If workers still show no logs, rerun with
+   `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true`. On coordinator timeout or worker placement
+   failure the worker jobs are left running so their logs can be retrieved via SPCS job service
+   log inspection.
+5. **Cancel leftover jobs** — After inspection, manually cancel each leftover worker:
+   `SELECT <job_service_name>!SPCS_CANCEL_JOB();`
+
+Recommended diagnostic sequence for Ray readiness failures:
+1. Check `SHOW SERVICE CONTAINERS IN SERVICE <worker_job_service>` for each worker
+   (preferred; shows `status`, `containerName`, `instanceId`, `message`, `restartCount`).
+   Legacy alternative: `SYSTEM$GET_SERVICE_STATUS('<worker_job_service>')`.
+2. If workers are PENDING, increase `SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS` (default 900 s).
+   If workers show `DONE`/`SUCCEEDED`, they exited prematurely — check worker logs immediately.
+   If workers show `UNKNOWN`, treat as failure — do not wait for it to resolve.
+3. Inspect worker logs: `SYSTEM$GET_SERVICE_LOGS('<job_service>', 0, 'main', 1000)`.
+4. Set `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE=true` to keep workers alive after failure.
+5. Cancel leftover worker jobs manually after inspection:
    `SELECT <job_service_name>!SPCS_CANCEL_JOB();`
 
 Env vars summary:
@@ -2891,13 +2926,15 @@ Env vars summary:
 | `SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS` | 900 | Capacity probe readiness timeout |
 | `SYNREG_SPCS_WORKER_SUBMIT_STAGGER_SECONDS` | 0 | Sleep (s) between worker submissions |
 | `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE` | false | Leave workers running on coordinator failure |
+| `SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS` | 900 | Per-shard barrier: max seconds to wait for each shard's workers to reach READY/RUNNING before submitting that shard's coordinator |
+| `SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS` | `max(ray_start, placement+300)` = **1200** | Injected into worker container; must outlast SPCS placement + coordinator Ray head startup. Computed by `_spcs_worker_connect_timeout()`. |
 
 **SPCS coordinator topology (6×4):** Each Ray shard uses a coordinator container (merges Ray
 head (`--num-cpus=0`) + AutoGluon driver in one container) plus N worker containers. For
 6 shards × 4 workers this is **6 coordinators + 24 workers = 30 containers** submitted to
 `AUTOGLUON_CPU_POOL`. Resource sizing: coordinators default to 1/2 CPU, 4Gi/8Gi memory
 (override via `SYNREG_SPCS_RAY_COORDINATOR_CPU` / `SYNREG_SPCS_RAY_COORDINATOR_MEMORY_*`);
-workers default to 4 CPU, 16Gi memory (override via `SYNREG_SPCS_RAY_WORKER_CPU` /
+workers default to 1 CPU, 8Gi/16Gi memory (override via `SYNREG_SPCS_RAY_WORKER_CPU` /
 `SYNREG_SPCS_RAY_WORKER_MEMORY_*`).
 
 ### SPCS Ray cancellation diagnostics
@@ -3039,26 +3076,29 @@ The nonlinear synthetic regression path is opt-in and keeps the existing MODEL3
 family selector:
 
 - `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`
-- `PRETRAIN_TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` for zero-arg
-  standalone pretrain, or pass the training family explicitly in SQL.
+- `PRETRAIN_TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` overrides the training
+  family for zero-arg `run_pretrain_pipeline()` (the generic linear entrypoint) only.
+  `run_pretrain_pipeline_nonlinear()` always uses `synthetic_regression_nonlinear`
+  regardless of this env var — it is intentionally strict. For auditable production
+  nonlinear runs, use the explicit 3-arg SQL form:
+  ```sql
+  CALL run_pretrain_pipeline_nonlinear(
+      'market_exchangeable_icl',
+      'synthetic_regression_nonlinear',
+      'inductive_forecasting'
+  );
+  ```
 - `HPO_TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` for zero-arg
   standalone HPO, or pass the training family explicitly in SQL.
 - `MODEL_FAMILY=market_exchangeable_icl`
 - `MODEL_DESIGN_PATTERN=inductive_forecasting`
-- `HPO_SWEEP_MODE=nonlinear_meta`
-- Optional second sweep: `HPO_SWEEP_MODE=nonlinear_architecture` with
-  `HPO_BASELINE_CONFIG_STAGE_PATH=@MODEL_STAGE/hpo/best_config_nonlinear_meta.json`
+- `HPO_SWEEP_MODE=nonlinear_meta` — tunes `latent_ridge_dim` ∈ {32, 64, 128}
 
 Nonlinear HPO does not use the gate-specific `pretrain_gate<N>.pt` checkpoints
 from `ridge_residual`. For the intended warm-start path, pass
 `HPO_PRETRAIN_CHECKPOINT_STAGE_PATH=@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt`;
-incompatible nonlinear checkpoints are skipped and the trial cold-starts.
-
-**Checkpoint preservation through merge:** `_merge_sweep_configs()` preserves
-`_meta.pretrain_checkpoint_stage_path` from the `nonlinear_meta` baseline sweep when the
-`nonlinear_architecture` sweep produces an empty path. The merged `best_config.json` will
-always carry the correct pretrain checkpoint, preventing the cold-start guard in
-`run_model_training_job.py` from triggering spuriously.
+dim=64 trials warm-start from the pretrain checkpoint; dim=32/128 trials cold-start on
+architecture mismatch.
 
 **Worker data access:** The coordinator creates a Snowpark session, queries the index, and
 generates presigned URLs for each task. Workers receive compact item dicts and download
@@ -3124,7 +3164,11 @@ Execute `sql/05_synthetic_nonlinear_evaluation_pipeline.sql` in Snowflake. This 
 `run_synthetic_nonlinear_prep`, `run_synthetic_nonlinear_deepset_evaluation`,
 `run_synthetic_nonlinear_baseline_evaluation` (3 overloads),
 `run_synthetic_nonlinear_autogluon_spcs_evaluation` (2 overloads),
-`run_synthetic_nonlinear_aggregation` (2 overloads).
+`run_synthetic_nonlinear_aggregation` (2 overloads),
+`run_synthetic_nonlinear_autogluon_spcs_import_probe`,
+`run_synthetic_nonlinear_autogluon_spcs_session_probe`,
+`run_synthetic_nonlinear_autogluon_spcs_capacity_probe` (2 overloads),
+`run_synthetic_nonlinear_autogluon_spcs_worker_access_probe`.
 
 Verify after creation (expect 100 rows per regime):
 
@@ -3146,6 +3190,12 @@ CALL run_synthetic_nonlinear_deepset_evaluation('2.5.0-py311');
 
 -- Phase 3: Baseline CPU evaluation
 CALL run_synthetic_nonlinear_baseline_evaluation('2.5.0-py311');
+
+-- SPCS preflight probes (run before Phase 4)
+CALL run_synthetic_nonlinear_autogluon_spcs_import_probe('<AG_IMAGE>', 1);
+CALL run_synthetic_nonlinear_autogluon_spcs_session_probe('<AG_IMAGE>', 1);
+CALL run_synthetic_nonlinear_autogluon_spcs_capacity_probe('<AG_IMAGE>', 6, 4, 6);
+CALL run_synthetic_nonlinear_autogluon_spcs_worker_access_probe('<AG_IMAGE>', 6, 4, 6);
 
 -- Phase 4: AutoGluon SPCS evaluation (Ray distributed, 6 cluster shards)
 CALL run_synthetic_nonlinear_autogluon_spcs_evaluation(
@@ -3251,9 +3301,9 @@ CALL run_pretrain_pipeline_nonlinear(
 );
 ```
 
-### Step 4 — Nonlinear HPO (two-sweep sequence)
+### Step 4 — Nonlinear HPO (single sweep)
 
-**Sweep 1 — nonlinear_meta** (warm-start from pretrain checkpoint):
+**nonlinear_meta** — tunes `latent_ridge_dim` ∈ {32, 64, 128} (warm-start from pretrain checkpoint):
 
 ```sql
 CALL run_hpo_pipeline(
@@ -3266,20 +3316,7 @@ CALL run_hpo_pipeline(
 );
 ```
 
-Produces `best_config_nonlinear_meta.json` and merged `best_config.json`.
-
-**Sweep 2 — nonlinear_architecture** (tune d_phi/n_sab_feat):
-
-```sql
-CALL run_hpo_pipeline(
-    'market_exchangeable_icl',
-    'synthetic_regression_nonlinear',
-    'inductive_forecasting',
-    'nonlinear_architecture',
-    '@MODEL_STAGE/hpo/best_config_nonlinear_meta.json',
-    '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
-);
-```
+Produces `best_config_nonlinear_meta.json` and `best_config.json`.
 
 ### Step 5 — Final training
 

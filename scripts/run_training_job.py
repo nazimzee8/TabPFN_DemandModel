@@ -31,6 +31,10 @@ DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
+# Module-level constant shared by both linear and nonlinear index validators.
+EXPECTED_INDEX_COUNTS = {"train": 800, "val": 100, "test": 100}
+_NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
+
 
 def _get_session():
     from snowflake.snowpark import Session
@@ -198,7 +202,7 @@ def build_meta_dataset_index() -> str:
 
 def _validate_meta_dataset_index(session):
     """Pre-flight check: raises RuntimeError if META_DATASET_INDEX is missing or has wrong counts."""
-    _EXPECTED_INDEX_COUNTS = {"train": 800, "val": 100, "test": 100}
+    # (uses module-level EXPECTED_INDEX_COUNTS)
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
@@ -213,7 +217,7 @@ def _validate_meta_dataset_index(session):
     counts = {str(row[0]).lower(): int(row[1]) for row in rows}
     mismatches = {
         split: {"expected": expected, "actual": counts.get(split, 0)}
-        for split, expected in _EXPECTED_INDEX_COUNTS.items()
+        for split, expected in EXPECTED_INDEX_COUNTS.items()
         if counts.get(split, 0) != expected
     }
     if mismatches:
@@ -259,13 +263,81 @@ def _validate_meta_dataset_index(session):
             ) from exc
 
 
+def _validate_nonlinear_training_index(session) -> None:
+    """Pre-flight for META_NONLINEAR_DATASET_INDEX + @META_NONLINEAR_DATASET_STAGE."""
+    try:
+        rows = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_NONLINEAR_DATASET_INDEX GROUP BY split"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            "META_NONLINEAR_DATASET_INDEX does not exist or cannot be queried. "
+            "Run CALL build_meta_nonlinear_dataset_index(); first."
+        ) from exc
+    counts = {str(row[0]).lower(): int(row[1]) for row in rows}
+    mismatches = {
+        split: {"expected": exp, "actual": counts.get(split, 0)}
+        for split, exp in EXPECTED_INDEX_COUNTS.items()
+        if counts.get(split, 0) != exp
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"META_NONLINEAR_DATASET_INDEX has wrong split counts: {mismatches}. "
+            "Run CALL build_meta_nonlinear_dataset_index(); to rebuild."
+        )
+    print(
+        "META_NONLINEAR_DATASET_INDEX validated: "
+        + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
+    )
+    _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
+    try:
+        session.sql(
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_NONLINEAR_DATASET_INDEX LIMIT 1"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"META_NONLINEAR_DATASET_INDEX missing required columns ({_REQUIRED_COLUMNS}): {exc}"
+        ) from exc
+    for _split in ("train", "val"):
+        try:
+            _files = session.sql(f"LIST @META_NONLINEAR_DATASET_STAGE/{_split}/").collect()
+            if not _files:
+                raise RuntimeError(
+                    f"No staged files in @META_NONLINEAR_DATASET_STAGE/{_split}/. "
+                    "Re-upload nonlinear training data before starting a GPU job."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"@META_NONLINEAR_DATASET_STAGE/{_split}/ inaccessible: {exc}"
+            ) from exc
+
+
+def _validate_training_index(session, training_data_family: str) -> None:
+    """Route to the correct index validation based on training_data_family."""
+    if training_data_family == _NONLINEAR_TRAINING_FAMILY:
+        _validate_nonlinear_training_index(session)
+    else:
+        _validate_meta_dataset_index(session)
+
+
 _GATE_HIDDEN_DIM_CANDIDATES = [32, 64, 128]
 
 
 def run_pipeline() -> str:
-    """Full two-sweep training pipeline:
+    """Full two-sweep training pipeline (linear families only).
 
-    Step 1: Validate META_DATASET_INDEX (counts + columns + stage access)
+    Enforces linear-only: raises RuntimeError immediately if
+    DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_nonlinear". For nonlinear
+    production training use the dedicated sequence:
+      1. CALL build_meta_nonlinear_dataset_index();
+      2. CALL run_pretrain_pipeline_nonlinear(...);
+      3. CALL run_hpo_pipeline(..., 'nonlinear_meta', ...);
+      4. CALL run_model_training(...);
+
+    Step 1: Validate training dataset index (META_DATASET_INDEX for linear families)
     Step 2: Pre-training (pretrain.pt, no BEST_CONFIG — establishes warm-start baseline)
     Step 3: HPO sweep — ridge_residual (tunes optimizer/regularization/Ridge Expert)
             Writes best_config_ridge_residual.json.
@@ -277,6 +349,24 @@ def run_pipeline() -> str:
     Step 6: Load merged best_config.json
     Step 7: Final training with best_config + pretrain warm-start (best.pt)
     """
+    if DEFAULT_TRAINING_DATA_FAMILY == _NONLINEAR_TRAINING_FAMILY:
+        raise RuntimeError(
+            "run_pipeline() is the linear synthetic regression training pipeline and rejects "
+            f"TRAINING_DATA_FAMILY={_NONLINEAR_TRAINING_FAMILY!r}. "
+            "For nonlinear production training use the dedicated sequence:\n"
+            "  1. CALL build_meta_nonlinear_dataset_index();\n"
+            "  2. CALL run_pretrain_pipeline_nonlinear('market_exchangeable_icl', "
+            "'synthetic_regression_nonlinear', 'inductive_forecasting');\n"
+            "  3. CALL run_hpo_pipeline(..., 'nonlinear_meta', '', "
+            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt');\n"
+            "  4. -- optional: CALL run_hpo_pipeline(..., 'nonlinear_architecture', "
+            "'@MODEL_STAGE/hpo/best_config_nonlinear_meta.json', "
+            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt');\n"
+            "  5. CALL run_model_training('market_exchangeable_icl', "
+            "'synthetic_regression_nonlinear', 'inductive_forecasting');\n"
+            "Set TRAINING_DATA_FAMILY to a linear family (e.g. synthetic_regression_combined) "
+            "to use run_pipeline() for linear training."
+        )
     session = _get_session()
     _common_env = {
         "HOME":                      "/tmp",
@@ -288,9 +378,9 @@ def run_pipeline() -> str:
         "MODEL_DESIGN_PATTERN":     DEFAULT_MODEL_DESIGN_PATTERN,
     }
 
-    # ── Step 1: Validate META_DATASET_INDEX ──────────────────────────────────
-    print("Step 1: Validating META_DATASET_INDEX ...")
-    _validate_meta_dataset_index(session)
+    # ── Step 1: Validate training dataset index ──────────────────────────────
+    print("Step 1: Validating training dataset index ...")
+    _validate_training_index(session, DEFAULT_TRAINING_DATA_FAMILY)
 
     # ── Step 2: Pre-training ──────────────────────────────────────────────────
     print("Step 2: Submitting pre-training job (pretrain.pt) ...")

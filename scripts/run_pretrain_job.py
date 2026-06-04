@@ -37,13 +37,7 @@ DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
     "PRETRAIN_TRAINING_DATA_FAMILY",
     os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined"),
 )
-DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY = os.getenv(
-    "NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY",
-    os.getenv(
-        "PRETRAIN_TRAINING_DATA_FAMILY",
-        os.getenv("TRAINING_DATA_FAMILY", NONLINEAR_TRAINING_DATA_FAMILY),
-    ),
-)
+
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 
@@ -134,13 +128,21 @@ def _validate_meta_dataset_index(session):
             ) from exc
 
 
+def _validate_training_dataset_index(session, training_data_family: str) -> None:
+    """Route index validation to the nonlinear or linear table by training family."""
+    if training_data_family == NONLINEAR_TRAINING_DATA_FAMILY:
+        _validate_nonlinear_dataset_index(session)
+    else:
+        _validate_meta_dataset_index(session)
+
+
 def _run_pretrain_impl(
     session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
 ) -> str:
-    _validate_meta_dataset_index(session)
+    _validate_training_dataset_index(session, training_data_family)
     print("Submitting pre-training job ...")
     pretrain_job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -182,7 +184,7 @@ def _run_pretrain_gate_impl(
     gate_hidden_dim must be one of the HPO candidates: 32, 64, or 128.
     This must be called for all three candidates before run_hpo_pipeline().
     """
-    _validate_meta_dataset_index(session)
+    _validate_training_dataset_index(session, training_data_family)
     gate_dim = int(gate_hidden_dim)
     if gate_dim not in (32, 64, 128):
         raise ValueError(

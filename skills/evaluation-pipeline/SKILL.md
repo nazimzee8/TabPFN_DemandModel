@@ -183,10 +183,11 @@ Each MLJob:
 **not** call `ray.put(dataset)`. Full dataset payloads must not flow through the Ray
 driver or Ray object store. The Ray task argument is a small serializable item dict,
 not the dataset bytes. Session-free worker loading is required: the driver generates
-the scoped file URL while it has a Snowpark session, and the worker opens that scoped
-URL with `snowflake.snowpark.files.SnowflakeFile`. Workers must not call
-`Session.builder.getOrCreate()` and must never query `SYNTHETIC_REGRESSION_DATASET_INDEX`.
-If scoped URLs fail in the Snowflake MLJob environment, fail clearly; do not silently
+a presigned HTTPS URL (`dataset_access.presigned_url`) via `GET_PRESIGNED_URL` while it
+has a Snowpark session, and workers download via `urllib` without creating a Snowpark
+session. Workers must not call `Session.builder.getOrCreate()` and must never query
+`SYNTHETIC_REGRESSION_DATASET_INDEX`. `SYNREG_WORKER_DATA_ACCESS_MODE=driver_presigned_url`
+is the production setting. If presigned URL download fails, fail clearly; do not silently
 return to driver-side dataset downloads or worker-created Snowpark sessions.
 
 **Key env vars:**
@@ -209,6 +210,41 @@ return to driver-side dataset downloads or worker-created Snowpark sessions.
 
 **Derived entrypoint:** Ray mode derives `autogluon_ray.py` internally. Do not expose
 or accept an arbitrary runtime entrypoint for normal distributed AutoGluon execution.
+
+**SPCS custom-image backend — per-shard barrier:**
+When `SYNREG_AUTOGLUON_EXECUTION_BACKEND=spcs_job`, the orchestrator uses a **per-shard**
+barrier, not a global all-worker barrier. For each shard in order:
+1. Submit this shard's workers (N SPCS job services).
+2. Call `_wait_spcs_workers_ready(session, shard_workers, timeout_seconds=SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS)` — waits only for **this shard's** workers.
+3. Submit this shard's coordinator immediately after workers are READY.
+
+This means coordinator `i` is submitted as soon as shard `i`'s workers are placed, without
+waiting for any other shard's workers. The `coord_plans` accumulation pattern (global barrier)
+has been replaced with inline coordinator submission inside the shard loop.
+
+**SPCS worker placement semantics (`_wait_spcs_workers_ready`):**
+Container statuses are polled via `_get_service_container_statuses()`, which prefers
+`SHOW SERVICE CONTAINERS IN SERVICE {job_name}` (attribute-based row access) and falls back
+to `SELECT SYSTEM$GET_SERVICE_STATUS('{job_name}')` (JSON parse) only if SHOW raises.
+
+Status sets:
+- `_RUNNING_STATUSES = {"READY", "RUNNING"}` — worker healthy; removed from pending.
+- `_UNEXPECTED_TERMINAL = {"DONE", "SUCCEEDED"}` — raises `RuntimeError` immediately;
+  worker exited before coordinator was submitted (premature exit).
+- `_FAILED_STATUSES = {"FAILED", "FAILED_OOM", "INTERNAL_ERROR", "UNKNOWN"}` — raises
+  `RuntimeError` immediately. `UNKNOWN` is treated as a failure, not a transient state.
+- Consecutive empty: ≥ 5 consecutive polls returning no container rows raises immediately
+  (`MAX_CONSECUTIVE_EMPTY=5`); indicates persistent SQL/network fault.
+
+Timeout messages include per-container detail: `containerName`, `instanceId`, `message`,
+`restartCount` for all still-pending shard workers.
+
+**Worker connect timeout formula (`_spcs_worker_connect_timeout()`):**
+`SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS` is set to:
+`max(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS, SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS + 300)`
+With defaults (placement=900 s, ray_start=600 s) → **1200 s**. This ensures workers wait
+long enough for the coordinator container to be placed and its Ray head to start before the
+worker's socket-poll loop times out.
 
 **Startup validation sequence (fail-before-CSV guarantee):**
 - `DISTRIBUTED_MODE != "ray_work_items"` → `RuntimeError` immediately

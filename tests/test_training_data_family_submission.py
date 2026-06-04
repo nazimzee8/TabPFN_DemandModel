@@ -251,31 +251,6 @@ class TestRunPretrainJobFamilyDefaults:
         )
         importlib.reload(run_pretrain_job)
 
-    def test_nonlinear_pretrain_has_nonlinear_default_without_shared_env(self, monkeypatch):
-        monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
-        monkeypatch.delenv("PRETRAIN_TRAINING_DATA_FAMILY", raising=False)
-        monkeypatch.delenv("NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY", raising=False)
-        importlib.reload(run_pretrain_job)
-
-        assert (
-            run_pretrain_job.DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY
-            == "synthetic_regression_nonlinear"
-        )
-        importlib.reload(run_pretrain_job)
-
-    def test_nonlinear_pretrain_specific_env_overrides_default(self, monkeypatch):
-        monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
-        monkeypatch.setenv(
-            "NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY",
-            "market_mental_model",
-        )
-        importlib.reload(run_pretrain_job)
-
-        assert (
-            run_pretrain_job.DEFAULT_NONLINEAR_TRAINING_DATA_FAMILY
-            == "market_mental_model"
-        )
-        importlib.reload(run_pretrain_job)
 
 
 # ---------------------------------------------------------------------------

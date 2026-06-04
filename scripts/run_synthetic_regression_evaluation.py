@@ -165,6 +165,9 @@ SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE = (
     os.getenv("SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", "false").lower()
     in ("1", "true", "yes")
 )
+SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS = int(
+    os.getenv("SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", "900")
+)
 
 SPCS_RAY_HEAD_RESOURCES = "ray_head"
 SPCS_RAY_DRIVER_RESOURCES = "ray_driver"
@@ -178,6 +181,14 @@ SPCS_WORKER_CAPACITY_PROBE_RESOURCES = "worker_capacity_probe"
 # Workers and coordinators each cap Ray's object store to avoid OOM on fixed-memory nodes.
 _SYNREG_COORDINATOR_OBJ_STORE_ENV = "SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES"
 _SYNREG_WORKER_OBJ_STORE_ENV = "SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES"
+
+
+def _spcs_worker_connect_timeout() -> int:
+    """Worker socket-poll timeout must outlast SPCS placement + coordinator Ray startup."""
+    return max(
+        SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS,
+        SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS + 300,
+    )
 
 
 def _spcs_ray_port_env_vars() -> dict:
@@ -1130,9 +1141,9 @@ def _spcs_resources_for_role(role: str) -> dict[str, str]:
     if role == SPCS_RAY_WORKER_RESOURCES:
         return _resolve_spcs_resource_profile(
             "SYNREG_SPCS_RAY_WORKER",
-            default_cpu_request="4",
-            default_cpu_limit="4",
-            default_memory_request="16Gi",
+            default_cpu_request="1",
+            default_cpu_limit="1",
+            default_memory_request="8Gi",
             default_memory_limit="16Gi",
         )
     if role == SPCS_SINGLE_NODE_RESOURCES:
@@ -1389,6 +1400,143 @@ def _wait_spcs_job_group(labeled_jobs: list, session) -> None:
     """Wait for all (label, job_name) SPCS job services to complete."""
     for label, job_name in labeled_jobs:
         _wait_spcs_job(session, job_name)
+
+
+def _get_service_container_statuses(session, job_name: str) -> list:
+    """Return list of container-status dicts. Prefers SHOW … IN SERVICE; falls back to SYSTEM$."""
+    import json as _json
+    try:
+        rows = session.sql(
+            f"SHOW SERVICE CONTAINERS IN SERVICE {job_name}"
+        ).collect()
+        return [
+            {
+                "status":        str(getattr(r, "status",        "") or getattr(r, "STATUS",        "")).upper(),
+                "containerName": str(getattr(r, "container_name","") or getattr(r, "CONTAINER_NAME","")),
+                "instanceId":    str(getattr(r, "instance_id",   "") or getattr(r, "INSTANCE_ID",   "")),
+                "message":       str(getattr(r, "message",       "") or getattr(r, "MESSAGE",       "")),
+                "restartCount":  str(getattr(r, "restart_count", "") or getattr(r, "RESTART_COUNT", "")),
+            }
+            for r in rows
+        ]
+    except Exception:
+        pass  # fallback below
+    # Fallback: legacy SYSTEM$ function
+    try:
+        rows = session.sql(f"SELECT SYSTEM$GET_SERVICE_STATUS('{job_name}')").collect()
+        raw = str(rows[0][0]) if rows else "[]"
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            data = [data]
+        return [
+            {k: str(v) for k, v in inst.items()}
+            for inst in (data or [])
+            if isinstance(inst, dict)
+        ]
+    except Exception:
+        return []
+
+
+def _wait_spcs_workers_ready(
+    session,
+    worker_jobs: list,
+    timeout_seconds: int = 900,
+    poll_interval_seconds: int = 10,
+) -> None:
+    """Poll SHOW SERVICE CONTAINERS until all worker job services are READY/RUNNING.
+
+    Raises RuntimeError if any worker reaches a failed or unexpected terminal state,
+    or if the timeout expires before all workers are ready.
+
+    worker_jobs is a list of (label, job_name) pairs as produced by the worker
+    submission loop.
+    """
+    _RUNNING_STATUSES    = {"READY", "RUNNING"}
+    _UNEXPECTED_TERMINAL = {"DONE", "SUCCEEDED"}          # worker exited before coordinator started
+    _FAILED_STATUSES     = {"FAILED", "FAILED_OOM", "INTERNAL_ERROR", "UNKNOWN"}
+
+    MAX_CONSECUTIVE_EMPTY = 5
+
+    if not worker_jobs:
+        return
+
+    pending = dict(worker_jobs)  # label -> job_name
+    last_statuses: dict = {}
+    last_containers: dict = {}
+    consecutive_empty: dict = {lbl: 0 for lbl, _ in worker_jobs}
+    deadline = time.monotonic() + timeout_seconds
+
+    while pending:
+        if time.monotonic() >= deadline:
+            detail = {
+                lbl: {
+                    "last_status": last_statuses.get(lbl, "PENDING"),
+                    "containers":  last_containers.get(lbl, []),
+                }
+                for lbl in pending
+            }
+            raise RuntimeError(
+                f"[TIMEOUT] Worker placement did not complete within {timeout_seconds}s. "
+                f"Pending: {detail}. "
+                "Increase SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS to allow more time."
+            )
+
+        newly_ready = []
+        for label, job_name in list(pending.items()):
+            containers = _get_service_container_statuses(session, job_name)
+
+            if not containers:
+                consecutive_empty[label] = consecutive_empty.get(label, 0) + 1
+                if consecutive_empty[label] >= MAX_CONSECUTIVE_EMPTY:
+                    raise RuntimeError(
+                        f"[FATAL] Worker '{job_name}' (label={label!r}) returned no container "
+                        f"status for {MAX_CONSECUTIVE_EMPTY} consecutive polls. "
+                        "Check SPCS service and container logs."
+                    )
+                status = "PENDING"
+            else:
+                consecutive_empty[label] = 0
+                last_containers[label] = containers
+                instance_statuses = [c["status"] for c in containers if c.get("status")]
+                if not instance_statuses:
+                    status = "PENDING"
+                elif any(s in _FAILED_STATUSES for s in instance_statuses):
+                    raise RuntimeError(
+                        f"[FATAL] Worker job service '{job_name}' (label={label!r}) "
+                        f"reached failed status: {instance_statuses}"
+                    )
+                elif any(s in _UNEXPECTED_TERMINAL for s in instance_statuses):
+                    bad = next(s for s in instance_statuses if s in _UNEXPECTED_TERMINAL)
+                    raise RuntimeError(
+                        f"[FATAL] Worker '{job_name}' (label={label!r}) reached unexpected terminal "
+                        f"status {bad!r} before coordinator was submitted. "
+                        "Worker exited prematurely. Check worker logs."
+                    )
+                elif all(s in _RUNNING_STATUSES for s in instance_statuses):
+                    status = "READY"
+                else:
+                    status = next(
+                        (s for s in instance_statuses if s not in _RUNNING_STATUSES),
+                        instance_statuses[0],
+                    )
+
+            if status != last_statuses.get(label):
+                print(
+                    f"[INFO] SPCS worker placement: label={label!r} job={job_name!r} "
+                    f"status={status} containers={last_containers.get(label, [])}",
+                    flush=True,
+                )
+                last_statuses[label] = status
+
+            if status == "READY":
+                newly_ready.append(label)
+
+        for label in newly_ready:
+            del pending[label]
+            consecutive_empty.pop(label, None)
+
+        if pending:
+            time.sleep(poll_interval_seconds)
 
 
 def _spcs_session_context_env(session) -> dict[str, str]:
@@ -3624,8 +3772,9 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
         )
     else:
         # Ray distributed mode — coordinator topology (30 containers for 6×4).
-        # Each shard gets 1 coordinator (Ray head + AutoGluon driver merged) + N workers.
-        # This replaces the old 3-service-per-shard model (head + workers + driver = 36).
+        # Workers-first: submit all workers, wait for SPCS placement, then submit coordinators.
+        # This ensures SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS measures only Ray formation,
+        # not SPCS scheduling / image-pull latency (which can take 3–5 minutes).
         cluster_shards = plan.output_shards
         workers_per_shard = plan.workers_per_shard
         head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
@@ -3639,112 +3788,126 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
         )
         support_jobs: list = []
         coordinator_jobs: list = []
-        # Resolve DNS domain: checks SPCS_RAY_HEAD_DNS_SUFFIX override first, then
-        # calls SYSTEM$GET_SERVICE_DNS_DOMAIN to auto-resolve the current schema's domain.
+        # Resolve DNS domain once before the shard loop — deterministic, used by all shards.
         dns_suffix = _spcs_dns_domain(session)
         # Object store memory limits: explicit caps prevent Ray from over-allocating.
         coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")
         worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")
 
-        for shard_index in range(cluster_shards):
-            coord_label = f"spcs_ray_coord_{run_id}_{shard_index}"
-            safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
-            # SPCS replaces underscores with dashes in DNS names (service name portion only).
-            dns_service_name = safe_coord_label.lower().replace("_", "-")
-            if dns_suffix:
-                coord_hostname = f"{dns_service_name}.{dns_suffix}"
-            else:
-                coord_hostname = dns_service_name
-            # Workers connect to this address to join the per-shard Ray cluster.
-            head_address = f"{coord_hostname}:{head_port}"
-            print(
-                f"[INFO] {proc}: shard={shard_index} coord_label={coord_label!r} "
-                f"head_address={head_address!r}",
-                flush=True,
-            )
-
-            # Coordinator env: Ray head config + AutoGluon driver config (all-in-one).
-            # The coordinator script sets SYNREG_RAY_ADDRESS_MODE=explicit and
-            # RAY_HEAD_ADDRESS=localhost:{head_port} internally before running autogluon_ray.py,
-            # so we do NOT set those here (they must point to localhost, not the DNS address).
-            coord_env = _synreg_shard_env(
-                mode="autogluon",
-                suite_id=COMBINED_SUITE_ID,
-                num_shards=cluster_shards,
-                shard_index=shard_index,
-                results_stage=COMBINED_PARTS_PREFIX,
-                extra_env={
-                    # Ray head config (consumed by spcs_ray_coordinator.py)
-                    _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
-                    # Cluster identity (Finding 6): autogluon_ray.py verifies after ray.init()
-                    "SPCS_RAY_RUN_ID": run_id,
-                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
-                    # Driver config (passed through to autogluon_ray.py subprocess)
-                    "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
-                    "SYNREG_AUTOGLUON_CLUSTER_SHARDS": str(cluster_shards),
-                    "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(workers_per_shard),
-                    "SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS": str(cluster_shards),
-                    "AUTOGLUON_TIME_LIMIT": str(time_limit),
-                    "AUTOGLUON_PRESETS": presets,
-                    "AUTOGLUON_TASK_CPUS": str(task_cpus),
-                    "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
-                    "SYNREG_MAX_WORK_ITEM_BYTES": max_work_item_bytes,
-                    "SYNREG_PRESIGNED_URL_EXPIRY_SECONDS": presigned_url_expiry_seconds,
-                    "SYNREG_PRESIGNED_URL_EXPIRY_POLICY": presigned_url_expiry_policy,
-                    "SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS": presigned_url_expiry_buffer_seconds,
-                    "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES": ag_min_tmp,
-                    "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
-                    "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
-                    "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
-                    **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
-                    **_spcs_ray_port_env_vars(),
-                },
-            )
-            coord_job = _submit_spcs_synreg(
-                session=session,
-                label=coord_label,
-                compute_pool=AUTOGLUON_CPU_POOL,
-                env_vars=coord_env,
-                image=image,
-                entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
-                resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                endpoints=_spcs_ray_coordinator_endpoints(head_port),
-            )
-            coordinator_jobs.append((coord_label, coord_job))
-
-            # Workers — connect to coordinator's DNS address, advertise explicit CPU capacity.
-            worker_env_base = {
-                "HOME": "/tmp",
-                "RAY_HEAD_ADDRESS": head_address,
-                "AUTOGLUON_TASK_CPUS": str(task_cpus),
-                _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
-                "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
-                **_spcs_ray_port_env_vars(),
-            }
-            for w in range(workers_per_shard):
-                w_label = f"spcs_ray_worker_{run_id}_{shard_index}_{w}"
-                w_job = _submit_spcs_synreg(
-                    session=session,
-                    label=w_label,
-                    compute_pool=AUTOGLUON_CPU_POOL,
-                    env_vars=worker_env_base,
-                    image=image,
-                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
-                    resource_role=SPCS_RAY_WORKER_RESOURCES,
-                    endpoints=_spcs_ray_worker_endpoints(),
-                )
-                support_jobs.append((w_label, w_job))
-                if _stagger > 0 and w < workers_per_shard - 1:
-                    print(
-                        f"[INFO] worker submit stagger: run_id={run_id!r} "
-                        f"shard_index={shard_index} worker_index={w} "
-                        f"sleep_seconds={_stagger}",
-                        flush=True,
-                    )
-                    time.sleep(_stagger)
-
+        # Per-shard barrier: for each shard, submit workers, wait for SPCS placement,
+        # then submit that shard's coordinator immediately.  This lets coordinators for
+        # early shards start forming Ray clusters while later shard workers are still
+        # being scheduled.
         _eval_ok = False
         try:
+            for shard_index in range(cluster_shards):
+                coord_label = f"spcs_ray_coord_{run_id}_{shard_index}"
+                safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
+                # SPCS replaces underscores with dashes in DNS names (service name portion only).
+                dns_service_name = safe_coord_label.lower().replace("_", "-")
+                if dns_suffix:
+                    coord_hostname = f"{dns_service_name}.{dns_suffix}"
+                else:
+                    coord_hostname = dns_service_name
+                # Workers connect to this address to join the per-shard Ray cluster.
+                head_address = f"{coord_hostname}:{head_port}"
+                print(
+                    f"[INFO] {proc}: shard={shard_index} coord_label={coord_label!r} "
+                    f"head_address={head_address!r}",
+                    flush=True,
+                )
+
+                # Coordinator env: Ray head config + AutoGluon driver config (all-in-one).
+                # The coordinator script sets SYNREG_RAY_ADDRESS_MODE=explicit and
+                # RAY_HEAD_ADDRESS=localhost:{head_port} internally before running autogluon_ray.py,
+                # so we do NOT set those here (they must point to localhost, not the DNS address).
+                coord_env = _synreg_shard_env(
+                    mode="autogluon",
+                    suite_id=COMBINED_SUITE_ID,
+                    num_shards=cluster_shards,
+                    shard_index=shard_index,
+                    results_stage=COMBINED_PARTS_PREFIX,
+                    extra_env={
+                        # Ray head config (consumed by spcs_ray_coordinator.py)
+                        _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
+                        # Cluster identity: autogluon_ray.py verifies after ray.init()
+                        "SPCS_RAY_RUN_ID": run_id,
+                        "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                        # Driver config (passed through to autogluon_ray.py subprocess)
+                        "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
+                        "SYNREG_AUTOGLUON_CLUSTER_SHARDS": str(cluster_shards),
+                        "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(workers_per_shard),
+                        "SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS": str(cluster_shards),
+                        "AUTOGLUON_TIME_LIMIT": str(time_limit),
+                        "AUTOGLUON_PRESETS": presets,
+                        "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                        "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
+                        "SYNREG_MAX_WORK_ITEM_BYTES": max_work_item_bytes,
+                        "SYNREG_PRESIGNED_URL_EXPIRY_SECONDS": presigned_url_expiry_seconds,
+                        "SYNREG_PRESIGNED_URL_EXPIRY_POLICY": presigned_url_expiry_policy,
+                        "SYNREG_PRESIGNED_URL_EXPIRY_BUFFER_SECONDS": presigned_url_expiry_buffer_seconds,
+                        "BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES": ag_min_tmp,
+                        "BENCHMARK_CPU_MAX_PROCESSED_FEATURES": ag_max_features,
+                        "BENCHMARK_CPU_MAX_MATRIX_BYTES": ag_max_matrix_bytes,
+                        "BENCHMARK_AUTOGLUON_MAX_DATASET_BYTES": ag_max_dataset_bytes,
+                        **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
+                        **_spcs_ray_port_env_vars(),
+                    },
+                )
+
+                # Submit this shard's workers.
+                worker_env_base = {
+                    "HOME": "/tmp",
+                    "RAY_HEAD_ADDRESS": head_address,
+                    "AUTOGLUON_TASK_CPUS": str(task_cpus),
+                    _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
+                    "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(_spcs_worker_connect_timeout()),
+                    **_spcs_ray_port_env_vars(),
+                }
+                shard_workers: list = []
+                for w in range(workers_per_shard):
+                    w_label = f"spcs_ray_worker_{run_id}_{shard_index}_{w}"
+                    w_job = _submit_spcs_synreg(
+                        session=session,
+                        label=w_label,
+                        compute_pool=AUTOGLUON_CPU_POOL,
+                        env_vars=worker_env_base,
+                        image=image,
+                        entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                        resource_role=SPCS_RAY_WORKER_RESOURCES,
+                        endpoints=_spcs_ray_worker_endpoints(),
+                    )
+                    shard_workers.append((w_label, w_job))
+                    support_jobs.append((w_label, w_job))
+                    if _stagger > 0 and w < workers_per_shard - 1:
+                        print(
+                            f"[INFO] worker submit stagger: run_id={run_id!r} "
+                            f"shard_index={shard_index} worker_index={w} "
+                            f"sleep_seconds={_stagger}",
+                            flush=True,
+                        )
+                        time.sleep(_stagger)
+
+                # Per-shard barrier: wait for this shard's workers before submitting its coordinator.
+                _wait_spcs_workers_ready(
+                    session,
+                    shard_workers,
+                    timeout_seconds=SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS,
+                )
+
+                # Submit this shard's coordinator now that its workers are placed and waiting.
+                coord_job = _submit_spcs_synreg(
+                    session=session,
+                    label=coord_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars=coord_env,
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
+                    resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
+                    endpoints=_spcs_ray_coordinator_endpoints(head_port),
+                )
+                coordinator_jobs.append((coord_label, coord_job))
+
             _wait_spcs_job_group(coordinator_jobs, session)
             _eval_ok = True
         finally:
@@ -3783,16 +3946,17 @@ def run_synthetic_regression_autogluon_spcs_import_probe(
         raise ValueError(f"{proc}: probe_count must be >= 1; got {probe_count!r}.")
     _ensure_compute_pool_usable(session, AUTOGLUON_CPU_POOL)
     _verify_spcs_image_in_repository(session, image)
+    run_id = _spcs_run_id()
     jobs = []
     for i in range(probe_count):
-        lbl = f"spcs_ag_import_probe_{i}"
+        lbl = f"spcs_ag_import_probe_{run_id}_{i}"
         job_name = _submit_spcs_synreg(
             session=session,
             label=lbl,
             compute_pool=AUTOGLUON_CPU_POOL,
             env_vars={
                 "SYNREG_AUTOGLUON_RUNTIME_DEPS_MODE": "preinstalled",
-                "SYNREG_AG_IMPORT_PROBE_LABEL": f"spcs_ag_import_probe_{i}_of_{probe_count}",
+                "SYNREG_AG_IMPORT_PROBE_LABEL": f"spcs_ag_import_probe_{run_id}_{i}_of_{probe_count}",
             },
             image=image,
             entrypoint_path="/app/scripts/autogluon_import_timing_probe.py",
@@ -3909,75 +4073,88 @@ def run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
         coordinator_jobs = []
         head_port = SYNREG_AUTOGLUON_SPCS_RAY_HEAD_PORT
         dns_suffix = _spcs_dns_domain(session)
-        # Capacity probe uses reduced object-store to avoid pressure on /dev/shm (64 MiB in SPCS).
-        # Production evaluation keeps its own larger defaults (500 MB / 2 GB).
+        # Both probe and production evaluation default to 256 MiB (268435456 bytes) object-store.
+        # SPCS /dev/shm is only 64 MiB; Ray falls back to /tmp. Override via env vars if needed.
         coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")
         worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")
 
-        for shard_index in range(plan.output_shards):
-            coord_label = f"spcs_cap_ray_coord_{run_id}_{shard_index}"
-            safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
-            dns_service_name = safe_coord_label.lower().replace("_", "-")
-            coord_hostname = f"{dns_service_name}.{dns_suffix}" if dns_suffix else dns_service_name
-            head_address = f"{coord_hostname}:{head_port}"
-
-            coord_env = {
-                _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
-                "SPCS_RAY_RUN_ID": run_id,
-                "SPCS_RAY_SHARD_INDEX": str(shard_index),
-                # Coordinator runs ray_capacity_probe.py instead of autogluon_ray.py
-                "SPCS_RAY_DRIVER_SCRIPT": "/app/scripts/ray_capacity_probe.py",
-                # Probe-specific config (passed through to ray_capacity_probe.py subprocess)
-                "CAPACITY_PROBE_LABEL": coord_label,
-                "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
-                "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
-                "CAPACITY_PROBE_SLEEP_SECONDS": "10",
-                **_spcs_ray_port_env_vars(),
-                **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
-            }
-            coord_job = _submit_spcs_synreg(
-                session=session,
-                label=coord_label,
-                compute_pool=AUTOGLUON_CPU_POOL,
-                env_vars=coord_env,
-                image=image,
-                entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
-                resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                endpoints=_spcs_ray_coordinator_endpoints(head_port),
-            )
-            coordinator_jobs.append((coord_label, coord_job))
-
-            worker_env_base = {
-                "RAY_HEAD_ADDRESS": head_address,
-                "AUTOGLUON_TASK_CPUS": "1",
-                _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
-                "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
-                **_spcs_ray_port_env_vars(),
-            }
-            for worker_index in range(plan.workers_per_shard):
-                worker_label = f"spcs_cap_ray_worker_{run_id}_{shard_index}_{worker_index}"
-                worker_job = _submit_spcs_synreg(
-                    session=session,
-                    label=worker_label,
-                    compute_pool=AUTOGLUON_CPU_POOL,
-                    env_vars=worker_env_base,
-                    image=image,
-                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
-                    resource_role=SPCS_RAY_WORKER_RESOURCES,
-                    endpoints=_spcs_ray_worker_endpoints(),
-                )
-                support_jobs.append((worker_label, worker_job))
-                if _stagger > 0:
-                    print(
-                        f"[INFO] worker submit stagger: run_id={run_id!r} "
-                        f"shard_index={shard_index} worker_index={worker_index} "
-                        f"sleep_seconds={_stagger}",
-                        flush=True,
-                    )
-                    time.sleep(_stagger)
-
+        # Per-shard barrier: submit this shard's workers, wait for placement, then submit
+        # its coordinator immediately so early shards can start Ray formation in parallel.
         _cap_ok = False
         try:
+            for shard_index in range(plan.output_shards):
+                coord_label = f"spcs_cap_ray_coord_{run_id}_{shard_index}"
+                safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
+                dns_service_name = safe_coord_label.lower().replace("_", "-")
+                coord_hostname = f"{dns_service_name}.{dns_suffix}" if dns_suffix else dns_service_name
+                head_address = f"{coord_hostname}:{head_port}"
+
+                coord_env = {
+                    _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
+                    "SPCS_RAY_RUN_ID": run_id,
+                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                    # Coordinator runs ray_capacity_probe.py instead of autogluon_ray.py
+                    "SPCS_RAY_DRIVER_SCRIPT": "/app/scripts/ray_capacity_probe.py",
+                    # Probe-specific config (passed through to ray_capacity_probe.py subprocess)
+                    "CAPACITY_PROBE_LABEL": coord_label,
+                    "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
+                    "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
+                    "CAPACITY_PROBE_SLEEP_SECONDS": "10",
+                    **_spcs_ray_port_env_vars(),
+                    **({"SYNREG_RAY_CLUSTER_READY_TIMEOUT_SECONDS": str(ray_ready_timeout_seconds)} if ray_ready_timeout_seconds is not None else {}),
+                }
+
+                worker_env_base = {
+                    "RAY_HEAD_ADDRESS": head_address,
+                    "AUTOGLUON_TASK_CPUS": "1",
+                    _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
+                    "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(_spcs_worker_connect_timeout()),
+                    **_spcs_ray_port_env_vars(),
+                }
+                shard_workers: list = []
+                for worker_index in range(plan.workers_per_shard):
+                    worker_label = f"spcs_cap_ray_worker_{run_id}_{shard_index}_{worker_index}"
+                    worker_job = _submit_spcs_synreg(
+                        session=session,
+                        label=worker_label,
+                        compute_pool=AUTOGLUON_CPU_POOL,
+                        env_vars=worker_env_base,
+                        image=image,
+                        entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                        resource_role=SPCS_RAY_WORKER_RESOURCES,
+                        endpoints=_spcs_ray_worker_endpoints(),
+                    )
+                    shard_workers.append((worker_label, worker_job))
+                    support_jobs.append((worker_label, worker_job))
+                    if _stagger > 0:
+                        print(
+                            f"[INFO] worker submit stagger: run_id={run_id!r} "
+                            f"shard_index={shard_index} worker_index={worker_index} "
+                            f"sleep_seconds={_stagger}",
+                            flush=True,
+                        )
+                        time.sleep(_stagger)
+
+                # Per-shard barrier: wait for this shard's workers before submitting its coordinator.
+                _wait_spcs_workers_ready(
+                    session,
+                    shard_workers,
+                    timeout_seconds=SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS,
+                )
+
+                # Submit this shard's coordinator immediately after workers are placed.
+                coord_job = _submit_spcs_synreg(
+                    session=session,
+                    label=coord_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars=coord_env,
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
+                    resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
+                    endpoints=_spcs_ray_coordinator_endpoints(head_port),
+                )
+                coordinator_jobs.append((coord_label, coord_job))
+
             _wait_spcs_job_group(coordinator_jobs, session)
             _cap_ok = True
         finally:
@@ -4059,71 +4236,86 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
         dns_suffix = _spcs_dns_domain(session)
         coord_obj_store = os.getenv(_SYNREG_COORDINATOR_OBJ_STORE_ENV, "268435456")   # 256 MiB
         worker_obj_store = os.getenv(_SYNREG_WORKER_OBJ_STORE_ENV, "268435456")        # 256 MiB
-        for shard_index in range(shard_count):
-            coord_label = f"spcs_worker_probe_ray_coord_{run_id}_{shard_index}"
-            safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
-            dns_service_name = safe_coord_label.lower().replace("_", "-")
-            coord_hostname = f"{dns_service_name}.{dns_suffix}" if dns_suffix else dns_service_name
-            head_address = f"{coord_hostname}:{head_port}"
 
-            coord_env = {
-                _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
-                "SPCS_RAY_RUN_ID": run_id,
-                "SPCS_RAY_SHARD_INDEX": str(shard_index),
-                "SPCS_RAY_DRIVER_SCRIPT": "/app/scripts/autogluon_worker_access_probe.py",
-                # Probe env vars (inherited by autogluon_worker_access_probe.py subprocess)
-                "SYNTHETIC_REGRESSION_SUITE_ID": os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", COMBINED_SUITE_ID),
-                "SYNTHETIC_REGRESSION_NUM_SHARDS": str(shard_count),
-                "SYNTHETIC_REGRESSION_SHARD_INDEX": str(shard_index),
-                "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
-                "SYNREG_PRESIGNED_URL_EXPIRY_SECONDS": presigned_url_expiry_seconds,
-                "SYNREG_WORKER_ACCESS_PROBE_USE_RAY": "true",
-                "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
-                "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
-                "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(plan.workers_per_shard),
-                **_spcs_ray_port_env_vars(),
-            }
-            coord_job = _submit_spcs_synreg(
-                session=session,
-                label=coord_label,
-                compute_pool=AUTOGLUON_CPU_POOL,
-                env_vars=coord_env,
-                image=image,
-                entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
-                resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
-                endpoints=_spcs_ray_coordinator_endpoints(head_port),
-            )
-            driver_jobs.append((coord_label, coord_job))
-
-            worker_env = {
-                "RAY_HEAD_ADDRESS": head_address,
-                _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
-                "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS),
-                **_spcs_ray_port_env_vars(),
-            }
-            for worker_index in range(plan.workers_per_shard):
-                worker_label = f"spcs_worker_probe_ray_worker_{run_id}_{shard_index}_{worker_index}"
-                worker_job = _submit_spcs_synreg(
-                    session=session,
-                    label=worker_label,
-                    compute_pool=AUTOGLUON_CPU_POOL,
-                    env_vars=worker_env,
-                    image=image,
-                    entrypoint_path="/app/scripts/spcs_ray_worker.py",
-                    resource_role=SPCS_RAY_WORKER_RESOURCES,
-                    endpoints=_spcs_ray_worker_endpoints(),
-                )
-                support_jobs.append((worker_label, worker_job))
-                if _stagger > 0:
-                    print(
-                        f"[INFO] worker submit stagger: run_id={run_id!r} "
-                        f"shard_index={shard_index} worker_index={worker_index} "
-                        f"sleep_seconds={_stagger}",
-                        flush=True,
-                    )
-                    time.sleep(_stagger)
+        # Per-shard barrier: submit this shard's workers, wait for placement, then submit
+        # its coordinator immediately so early shards start Ray formation in parallel.
         _probe_ok = False
         try:
+            for shard_index in range(shard_count):
+                coord_label = f"spcs_worker_probe_ray_coord_{run_id}_{shard_index}"
+                safe_coord_label = "".join(c if c.isalnum() else "_" for c in coord_label).upper()
+                dns_service_name = safe_coord_label.lower().replace("_", "-")
+                coord_hostname = f"{dns_service_name}.{dns_suffix}" if dns_suffix else dns_service_name
+                head_address = f"{coord_hostname}:{head_port}"
+
+                coord_env = {
+                    _SYNREG_COORDINATOR_OBJ_STORE_ENV: coord_obj_store,
+                    "SPCS_RAY_RUN_ID": run_id,
+                    "SPCS_RAY_SHARD_INDEX": str(shard_index),
+                    "SPCS_RAY_DRIVER_SCRIPT": "/app/scripts/autogluon_worker_access_probe.py",
+                    # Probe env vars (inherited by autogluon_worker_access_probe.py subprocess)
+                    "SYNTHETIC_REGRESSION_SUITE_ID": os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", COMBINED_SUITE_ID),
+                    "SYNTHETIC_REGRESSION_NUM_SHARDS": str(shard_count),
+                    "SYNTHETIC_REGRESSION_SHARD_INDEX": str(shard_index),
+                    "SYNREG_WORKER_DATA_ACCESS_MODE": worker_access_mode,
+                    "SYNREG_PRESIGNED_URL_EXPIRY_SECONDS": presigned_url_expiry_seconds,
+                    "SYNREG_WORKER_ACCESS_PROBE_USE_RAY": "true",
+                    "EXPECTED_RAY_NODES": str(plan.workers_per_shard + 1),
+                    "EXPECTED_RAY_CPUS_MIN": str(plan.workers_per_shard),
+                    "SYNREG_AUTOGLUON_WORKERS_PER_SHARD": str(plan.workers_per_shard),
+                    **_spcs_ray_port_env_vars(),
+                }
+
+                worker_env = {
+                    "RAY_HEAD_ADDRESS": head_address,
+                    _SYNREG_WORKER_OBJ_STORE_ENV: worker_obj_store,
+                    "SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS": str(_spcs_worker_connect_timeout()),
+                    **_spcs_ray_port_env_vars(),
+                }
+                shard_workers: list = []
+                for worker_index in range(plan.workers_per_shard):
+                    worker_label = f"spcs_worker_probe_ray_worker_{run_id}_{shard_index}_{worker_index}"
+                    worker_job = _submit_spcs_synreg(
+                        session=session,
+                        label=worker_label,
+                        compute_pool=AUTOGLUON_CPU_POOL,
+                        env_vars=worker_env,
+                        image=image,
+                        entrypoint_path="/app/scripts/spcs_ray_worker.py",
+                        resource_role=SPCS_RAY_WORKER_RESOURCES,
+                        endpoints=_spcs_ray_worker_endpoints(),
+                    )
+                    shard_workers.append((worker_label, worker_job))
+                    support_jobs.append((worker_label, worker_job))
+                    if _stagger > 0:
+                        print(
+                            f"[INFO] worker submit stagger: run_id={run_id!r} "
+                            f"shard_index={shard_index} worker_index={worker_index} "
+                            f"sleep_seconds={_stagger}",
+                            flush=True,
+                        )
+                        time.sleep(_stagger)
+
+                # Per-shard barrier: wait for this shard's workers before submitting its coordinator.
+                _wait_spcs_workers_ready(
+                    session,
+                    shard_workers,
+                    timeout_seconds=SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS,
+                )
+
+                # Submit this shard's coordinator immediately after workers are placed.
+                coord_job = _submit_spcs_synreg(
+                    session=session,
+                    label=coord_label,
+                    compute_pool=AUTOGLUON_CPU_POOL,
+                    env_vars=coord_env,
+                    image=image,
+                    entrypoint_path="/app/scripts/spcs_ray_coordinator.py",
+                    resource_role=SPCS_RAY_COORDINATOR_RESOURCES,
+                    endpoints=_spcs_ray_coordinator_endpoints(head_port),
+                )
+                driver_jobs.append((coord_label, coord_job))
+
             _wait_spcs_job_group(driver_jobs, session)
             _probe_ok = True
         finally:

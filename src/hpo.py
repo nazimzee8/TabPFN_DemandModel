@@ -46,15 +46,13 @@ MODEL_DESIGN_PATTERN = os.environ.get("MODEL_DESIGN_PATTERN", "inductive_forecas
 # HPO sweep mode — controls which search space is used.
 # ridge_residual (default): tunes optimizer/regularization/Ridge Expert; architecture fixed.
 # architecture: tunes d_phi/n_sab_feat with Ridge Expert fixed; cold-start allowed on mismatch.
-# nonlinear_meta: tunes latent nonlinear ridge/head/pooling behavior with fixed base dimensions.
-# nonlinear_architecture: tunes nonlinear architecture fields using nonlinear_meta baseline.
+# nonlinear_meta: tunes latent nonlinear ridge/head/pooling behavior; latent_ridge_dim ∈ {32,64,128}.
 HPO_SWEEP_MODE = os.environ.get("HPO_SWEEP_MODE", "ridge_residual").strip().lower()
 
 _ALLOWED_HPO_SWEEP_MODES = {
     "ridge_residual",
     "architecture",
     "nonlinear_meta",
-    "nonlinear_architecture",
 }
 if HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
     raise ValueError(
@@ -608,6 +606,15 @@ def build_hpo_search_space(tune, baseline_config=None) -> dict:
         Tunes: lr, weight_decay, dropout, ridge_lambda, gate_hidden_dim,
                use_huber, huber_delta, lambda_l1.
 
+    nonlinear_meta:
+        Fixed architecture (d_phi, d_rho, n_sab_feat, pool).
+        Tunes: lr, weight_decay, dropout, latent_ridge_dim, latent_ridge_lambda,
+               latent_ridge_jitter, latent_ridge_use_bias, use_query_context_attention,
+               icl_pool_mode, feature_pool_mode, ridge_mixture_mode,
+               nonlinear_head_hidden_mult, use_huber, huber_delta, lambda_l1.
+        The pretrain checkpoint (pretrain_nonlinear_meta.pt, built with dim=64)
+        warm-starts dim=64 trials; dim=32/128 trials cold-start on architecture mismatch.
+
     architecture:
         Requires baseline_config (from ridge_residual sweep).
         Fixes all optimizer/regularization params from baseline_config.
@@ -642,7 +649,7 @@ def build_hpo_search_space(tune, baseline_config=None) -> dict:
             "ridge_lambda":         1.0,
             "gate_hidden_dim":      64,
             "use_latent_ridge_expert": True,
-            "latent_ridge_dim":     64,
+            "latent_ridge_dim":     tune.choice([32, 64, 128]),
             "latent_ridge_lambda":  tune.loguniform(1e-3, 1e2),
             "latent_ridge_jitter":  tune.choice([1e-8, 1e-6, 1e-4]),
             "latent_ridge_use_bias": tune.choice([True, False]),
@@ -669,36 +676,6 @@ def build_hpo_search_space(tune, baseline_config=None) -> dict:
             f"{HPO_SWEEP_MODE} HPO requires HPO_BASELINE_CONFIG_STAGE_PATH. Run the baseline HPO "
             "first, then pass the matching best_config stage path."
         )
-    if HPO_SWEEP_MODE == "nonlinear_architecture":
-        return {
-            "lr":               float(baseline_config["lr"]),
-            "weight_decay":     float(baseline_config["weight_decay"]),
-            "dropout":          float(baseline_config["dropout"]),
-            "use_ridge_expert": bool(baseline_config.get("use_ridge_expert", False)),
-            "ridge_lambda":     float(baseline_config.get("ridge_lambda", 1.0)),
-            "gate_hidden_dim":  int(baseline_config.get("gate_hidden_dim", 64)),
-            "use_latent_ridge_expert": True,
-            "latent_ridge_dim": tune.choice([32, 64, 128]),
-            "latent_ridge_lambda": float(baseline_config.get("latent_ridge_lambda", 1.0)),
-            "latent_ridge_jitter": float(baseline_config.get("latent_ridge_jitter", 1e-6)),
-            "latent_ridge_use_bias": bool(baseline_config.get("latent_ridge_use_bias", True)),
-            "use_query_context_attention": tune.choice([False, True]),
-            "query_context_heads": int(baseline_config.get("query_context_heads", 4)),
-            "icl_pool_mode": tune.choice(["mean", "pna", "multipool"]),
-            "feature_pool_mode": tune.choice(["mean", "pna", "attn"]),
-            "ridge_mixture_mode": baseline_config.get("ridge_mixture_mode", "residual"),
-            "nonlinear_head_hidden_mult": int(baseline_config.get("nonlinear_head_hidden_mult", 2)),
-            "use_huber":        bool(baseline_config.get("use_huber", False)),
-            "huber_delta":      float(baseline_config.get("huber_delta", 1.0)),
-            "lambda_l1":        float(baseline_config.get("lambda_l1", 0.0)),
-            "d_rho":            FIXED_D_RHO,
-            "pool":             FIXED_POOL,
-            "model_family":     MODEL_FAMILY,
-            "model_design_pattern": MODEL_DESIGN_PATTERN,
-            "hpo_sweep_mode":   HPO_SWEEP_MODE,
-            "d_phi":            tune.choice(ARCH_D_PHI_CANDIDATES),
-            "n_sab_feat":       tune.choice(ARCH_N_SAB_FEAT_CANDIDATES),
-        }
     return {
         "lr":               float(baseline_config["lr"]),
         "weight_decay":     float(baseline_config["weight_decay"]),
@@ -999,7 +976,7 @@ def main():
 
     # Load baseline config for architecture sweep (driver only, before Ray init)
     baseline_config = None
-    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture"):
+    if HPO_SWEEP_MODE == "architecture":
         baseline_config = _load_baseline_config_from_stage(HPO_BASELINE_CONFIG_STAGE_PATH)
         print("[HPO driver] loaded baseline config from", HPO_BASELINE_CONFIG_STAGE_PATH, flush=True)
 
@@ -1043,7 +1020,7 @@ def main():
 
     # ── Ray Tune search space ─────────────────────────────────────────────────
     search_space = build_hpo_search_space(tune, baseline_config=baseline_config)
-    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture"):
+    if HPO_SWEEP_MODE == "architecture":
         _arch_info = {
             "d_phi_candidates":      ARCH_D_PHI_CANDIDATES,
             "n_sab_feat_candidates": ARCH_N_SAB_FEAT_CANDIDATES,
@@ -1054,7 +1031,7 @@ def main():
             "d_phi":       FIXED_D_PHI,
             "n_sab_feat":  FIXED_N_SAB_FEAT,
             "pretrain_mismatch_policy": "cold_start",
-            "latent_ridge_dim": 64,
+            "latent_ridge_dim_candidates": [32, 64, 128],
         }
     else:
         _arch_info = {
@@ -1167,12 +1144,12 @@ def main():
     _upload_json_to_hpo(sweep_filename, best_config)
     print(f"Uploaded {sweep_filename} to @MODEL_STAGE/hpo/", flush=True)
 
-    if HPO_SWEEP_MODE in ("architecture", "nonlinear_architecture") and baseline_config is not None:
+    if HPO_SWEEP_MODE == "architecture" and baseline_config is not None:
         merged = _merge_sweep_configs(baseline_config, best_config)
         _upload_json_to_hpo("best_config.json", merged)
         print("Uploaded merged best_config.json to @MODEL_STAGE/hpo/", flush=True)
     else:
-        # ridge_residual: best_config.json == best_config_ridge_residual.json
+        # ridge_residual / nonlinear_meta: best_config.json == best_config_{mode}.json
         _upload_json_to_hpo("best_config.json", best_config)
         print("Uploaded best_config.json to @MODEL_STAGE/hpo/", flush=True)
 

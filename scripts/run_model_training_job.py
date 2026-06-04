@@ -384,7 +384,7 @@ def _run_model_training_impl(
             "entrypoint":                 "train.py",
             "source":                     SCRIPTS_STAGE,
             "stage_name":                 MLJOB_PAYLOAD_STAGE,
-            "has_pretrain":               "PRETRAIN_CHECKPOINT_PATH" in env_vars,
+            "has_pretrain":               bool(pretrain_checkpoint_path),
         },
         flush=True,
     )
@@ -399,7 +399,7 @@ def _run_model_training_impl(
         "checkpoint_output_name":    env_vars["CHECKPOINT_OUTPUT_NAME"],
         "training_data_family":      training_data_family,
         "has_best_config":           True,
-        "has_pretrain":              "PRETRAIN_CHECKPOINT_PATH" in env_vars,
+        "has_pretrain":              bool(pretrain_checkpoint_path),
         "pretrain_load_policy":      pretrain_policy,
         "compute_pool":              GPU_POOL,
         "target_instances":          TRAIN_NUM_NODES,

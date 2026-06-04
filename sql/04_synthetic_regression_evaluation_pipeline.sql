@@ -337,6 +337,26 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_cap
   IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
   HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe';
 
+-- 7-argument overload — adds explicit Ray readiness timeout, worker stagger, and keep-on-failure flag.
+-- RAY_READY_TIMEOUT_SECONDS: how long each coordinator waits for all Ray workers to join (default 900 s).
+-- WORKER_SUBMIT_STAGGER_SECONDS: sleep between worker job submissions (1 s recommended to reduce burst pressure).
+-- KEEP_SUPPORT_JOBS_ON_FAILURE: when TRUE, worker support jobs are not cancelled on failure; inspect logs then cancel manually.
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+  AUTOGLUON_SPCS_IMAGE STRING,
+  AUTOGLUON_CLUSTER_SHARDS INTEGER,
+  AUTOGLUON_WORKERS_PER_SHARD INTEGER,
+  AUTOGLUON_CONCURRENT_CLUSTERS INTEGER,
+  RAY_READY_TIMEOUT_SECONDS INTEGER,
+  WORKER_SUBMIT_STAGGER_SECONDS INTEGER,
+  KEEP_SUPPORT_JOBS_ON_FAILURE BOOLEAN
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py')
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_combined_autogluon_spcs_capacity_probe';
+
 -- SPCS worker-access probe — driver queries index, builds compact item dicts,
 -- workers validate dataset access via presigned URLs. No AutoGluon training.
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
@@ -444,7 +464,7 @@ CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(
 --   Coordinator topology: 6 coordinators + 24 workers = 30 containers.
 --   Each coordinator merges Ray head (--num-cpus=0) + AutoGluon driver in one container.
 --   Only the 24 worker containers are schedulable AutoGluon workers; coordinators are downsized.
---   Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 4 CPU, 16Gi memory.
+--   Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 1 CPU, 8Gi/16Gi memory.
 --   Override with SYNREG_SPCS_RAY_COORDINATOR_*, SYNREG_SPCS_RAY_WORKER_*,
 --   or SYNREG_SPCS_SINGLE_NODE_*.
 CALL run_synthetic_regression_combined_autogluon_spcs_evaluation(

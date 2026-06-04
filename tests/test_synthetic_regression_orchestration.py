@@ -2963,9 +2963,9 @@ class TestSPCSAutogluonBackend:
             "memory_limit": "4Gi",
         }
         assert mod._spcs_resources_for_role(mod.SPCS_RAY_WORKER_RESOURCES) == {
-            "cpu_request": "4",
-            "cpu_limit": "4",
-            "memory_request": "16Gi",
+            "cpu_request": "1",
+            "cpu_limit": "1",
+            "memory_request": "8Gi",
             "memory_limit": "16Gi",
         }
 
@@ -3095,6 +3095,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "")
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3120,6 +3121,7 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3167,6 +3169,7 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
@@ -3195,7 +3198,9 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3227,7 +3232,9 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
@@ -3270,7 +3277,9 @@ class TestSPCSAutogluonBackend:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
@@ -3287,8 +3296,8 @@ class TestSPCSAutogluonBackend:
 
         # Coordinator default: cpu request=1, limit=2; memory request=4Gi, limit=8Gi
         assert _resource_values(submitted["spcs_ray_coord_r0_0"]) == ["1", "4Gi", "2", "8Gi"]
-        # Worker default: cpu request=4, limit=4; memory request=16Gi, limit=16Gi
-        assert _resource_values(submitted["spcs_ray_worker_r0_0_0"]) == ["4", "16Gi", "4", "16Gi"]
+        # Worker default: cpu request=1, limit=1; memory request=8Gi, limit=16Gi
+        assert _resource_values(submitted["spcs_ray_worker_r0_0_0"]) == ["1", "8Gi", "1", "16Gi"]
 
     def test_spcs_distributed_waits_drivers_and_cancels_support_jobs(self, monkeypatch):
         """Coordinator is waited to completion; workers are cancelled as support jobs after coordinator finishes."""
@@ -3301,6 +3310,7 @@ class TestSPCSAutogluonBackend:
             "_execute_spcs_job_service",
             lambda session, *, label, compute_pool, spec: label.upper(),
         )
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3339,6 +3349,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3371,6 +3382,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3477,6 +3489,7 @@ class TestSPCSAutogluonBackend:
         run_labels: list = []
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3561,6 +3574,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3604,6 +3618,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3636,6 +3651,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3675,6 +3691,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3703,6 +3720,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3730,6 +3748,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3756,6 +3775,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3793,6 +3813,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3830,6 +3851,7 @@ class TestSPCSAutogluonBackend:
         )
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -3859,6 +3881,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_execute_spcs_job_service", lambda *a, **k: "MOCK")
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
@@ -3888,6 +3911,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
@@ -3914,6 +3938,7 @@ class TestSPCSAutogluonBackend:
         def _fail(*a, **k):
             raise RuntimeError("simulated failure")
         monkeypatch.setattr(mod, "_wait_spcs_job_group", _fail)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group",
             lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
@@ -3940,6 +3965,7 @@ class TestSPCSAutogluonBackend:
         def _fail(*a, **k):
             raise RuntimeError("simulated failure")
         monkeypatch.setattr(mod, "_wait_spcs_job_group", _fail)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group",
             lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
@@ -3963,6 +3989,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group",
             lambda jobs, session: cancelled.extend(lbl for lbl, _ in jobs))
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
@@ -4009,6 +4036,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
         monkeypatch.setattr(mod, "_submit_spcs_synreg", _capture_submit)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
 
@@ -4045,6 +4073,7 @@ class TestSPCSAutogluonBackend:
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.internal")
         monkeypatch.setattr(mod, "_submit_spcs_synreg", _capture_submit)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
 
@@ -4077,6 +4106,7 @@ class TestSPCSAutogluonBackend:
             lambda session, *, label, compute_pool, env_vars, image,
                    entrypoint_path, resource_role, endpoints=None: label.upper())
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
@@ -4110,6 +4140,7 @@ class TestSPCSAutogluonBackend:
             lambda session, *, label, compute_pool, env_vars, image,
                    entrypoint_path, resource_role, endpoints=None: label.upper())
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
@@ -4149,7 +4180,9 @@ class TestSPCSRayCoordinatorTopology:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
@@ -4265,8 +4298,8 @@ class TestSPCSRayCoordinatorTopology:
         assert coord_profile["cpu_request"] == "1", (
             f"Coordinator default cpu_request should be '1', got {coord_profile['cpu_request']!r}"
         )
-        assert coord_profile["cpu_request"] != worker_profile["cpu_request"], (
-            "Coordinator and worker must have different CPU defaults"
+        assert coord_profile != worker_profile, (
+            "Coordinator and worker must have different resource profiles"
         )
 
     def test_coordinator_dns_uses_dashes_not_underscores(self, monkeypatch):
@@ -4437,6 +4470,357 @@ class TestSPCSRayCoordinatorTopology:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Workers-first submission order
+# ---------------------------------------------------------------------------
+
+class TestSPCSWorkersFirstOrchestration:
+    """Verify that workers are submitted before coordinators in all SPCS Ray functions."""
+
+    def _setup_mocks(self, monkeypatch, mod, call_log):
+        """Patch SPCS helpers so call_log records submission order."""
+        def _mock_execute(session, *, label, compute_pool, spec):
+            call_log.append(("submit", label))
+            return f"MOCK_{label.upper()}"
+
+        def _mock_wait_placement(session, worker_jobs, **kw):
+            call_log.append(("wait_placement", None))
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", _mock_wait_placement)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+    def test_workers_submitted_before_coordinator_in_spcs_evaluation(self, monkeypatch):
+        """Per-shard: each shard's workers are submitted before that shard's coordinator."""
+        import run_synthetic_regression_evaluation as mod
+        call_log = []
+        self._setup_mocks(monkeypatch, mod, call_log)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=2,
+        )
+
+        # Per-shard barrier: between consecutive wait_placement events, only workers are
+        # submitted before the wait and a coordinator is submitted immediately after.
+        events = call_log
+        wait_positions = [i for i, (ev, _) in enumerate(events) if ev == "wait_placement"]
+        assert len(wait_positions) == 2, (
+            f"Expected 2 wait_placement calls (one per shard), got {wait_positions}"
+        )
+        # Verify that no coordinator appears before its shard's wait_placement.
+        # We check the global invariant: each coordinator is preceded by a wait.
+        coord_positions = [i for i, (ev, lbl) in enumerate(events)
+                           if ev == "submit" and lbl and "coord" in lbl]
+        for cp in coord_positions:
+            preceding_waits = [wp for wp in wait_positions if wp < cp]
+            assert preceding_waits, (
+                f"Coordinator at position {cp} has no preceding wait_placement. "
+                f"Call log: {events}"
+            )
+
+    def test_workers_submitted_before_coordinator_in_capacity_probe_ray_mode(self, monkeypatch):
+        """Per-shard: each shard's workers are submitted before that shard's coordinator."""
+        import run_synthetic_regression_evaluation as mod
+        call_log = []
+        self._setup_mocks(monkeypatch, mod, call_log)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_capacity_probe(
+            object(),
+            cluster_shards=2,
+            workers_per_shard=2,
+            concurrent_clusters=2,
+        )
+
+        events = call_log
+        wait_positions = [i for i, (ev, _) in enumerate(events) if ev == "wait_placement"]
+        assert len(wait_positions) == 2, (
+            f"Expected 2 wait_placement calls (one per shard), got {wait_positions}"
+        )
+        coord_positions = [i for i, (ev, lbl) in enumerate(events)
+                           if ev == "submit" and lbl and "coord" in lbl]
+        for cp in coord_positions:
+            preceding_waits = [wp for wp in wait_positions if wp < cp]
+            assert preceding_waits, (
+                f"Coordinator at position {cp} has no preceding wait_placement. "
+                f"Call log: {events}"
+            )
+
+    def test_worker_placement_wait_called_between_worker_and_coordinator_submission(self, monkeypatch):
+        """_wait_spcs_workers_ready must be called once per shard, after that shard's workers
+        and before that shard's coordinator."""
+        import run_synthetic_regression_evaluation as mod
+        call_log = []
+        self._setup_mocks(monkeypatch, mod, call_log)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=2,
+        )
+
+        events = call_log
+        wait_positions = [i for i, (ev, _) in enumerate(events) if ev == "wait_placement"]
+        coord_positions = [i for i, (ev, lbl) in enumerate(events)
+                           if ev == "submit" and "coord" in (lbl or "")]
+
+        # Per-shard barrier: one wait per shard (2 shards → 2 waits).
+        assert len(wait_positions) == 2, (
+            f"Expected exactly 2 wait_placement calls (one per shard), got {wait_positions}"
+        )
+        # Each coordinator must be preceded by a wait_placement.
+        for cp in coord_positions:
+            preceding_waits = [wp for wp in wait_positions if wp < cp]
+            assert preceding_waits, (
+                f"Coordinator submit at position {cp} has no preceding wait_placement. "
+                f"Call log: {events}"
+            )
+        # Each wait must be preceded by at least one worker submit.
+        worker_positions = [i for i, (ev, lbl) in enumerate(events)
+                            if ev == "submit" and "worker" in (lbl or "")]
+        for wp in wait_positions:
+            preceding_workers = [w for w in worker_positions if w < wp]
+            assert preceding_workers, (
+                f"wait_placement at position {wp} has no preceding worker submit. "
+                f"Call log: {events}"
+            )
+
+    def test_worker_placement_failure_respects_keep_support_jobs_true(self, monkeypatch):
+        """When _wait_spcs_workers_ready raises, workers must be kept if keep=true."""
+        import run_synthetic_regression_evaluation as mod
+        cancel_calls = []
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancel_calls.extend(jobs))
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("timeout")))
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", True)
+
+        import pytest
+        with pytest.raises(RuntimeError, match="timeout"):
+            mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+                object(),
+                autogluon_cluster_shards=1,
+                autogluon_workers_per_shard=2,
+                autogluon_concurrent_clusters=1,
+            )
+        assert not cancel_calls, (
+            "With keep=true, _cancel_spcs_job_group must NOT be called on worker placement failure"
+        )
+
+    def test_worker_placement_failure_cancels_workers_when_keep_false(self, monkeypatch):
+        """When _wait_spcs_workers_ready raises and keep=false, workers must be cancelled."""
+        import run_synthetic_regression_evaluation as mod
+        cancel_calls = []
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancel_calls.extend(jobs))
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("timeout")))
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", False)
+
+        import pytest
+        with pytest.raises(RuntimeError, match="timeout"):
+            mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+                object(),
+                autogluon_cluster_shards=1,
+                autogluon_workers_per_shard=2,
+                autogluon_concurrent_clusters=1,
+            )
+        assert cancel_calls, (
+            "With keep=false, _cancel_spcs_job_group must be called on worker placement failure"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _wait_spcs_workers_ready unit tests
+# ---------------------------------------------------------------------------
+
+class TestSPCSWorkerPlacementWait:
+    """Unit tests for _wait_spcs_workers_ready."""
+
+    class _StatusSession:
+        """Minimal session mock returning fixed SYSTEM$ JSON status for all job names.
+
+        Raises on SHOW SERVICE CONTAINERS queries so _get_service_container_statuses
+        falls through to the SYSTEM$ fallback path.
+        """
+
+        def __init__(self, status_json: str):
+            self._status_json = status_json
+            self._last_query = ""
+
+        def sql(self, query: str):
+            self._last_query = query
+            return self
+
+        def collect(self):
+            if "SHOW SERVICE CONTAINERS" in self._last_query:
+                raise RuntimeError("SHOW not supported in _StatusSession mock")
+            class _Row:
+                def __init__(self, val):
+                    self._val = val
+                def __getitem__(self, i):
+                    return self._val
+            return [_Row(self._status_json)]
+
+    def test_returns_immediately_when_all_workers_ready(self):
+        """Should return without sleeping if all workers already READY."""
+        import time as _time
+        from run_synthetic_regression_evaluation import _wait_spcs_workers_ready
+        session = self._StatusSession('[{"status": "READY"}]')
+        # Should not raise or sleep
+        _wait_spcs_workers_ready(session, [("w0", "job_w0"), ("w1", "job_w1")], timeout_seconds=30)
+
+    def test_polls_until_workers_transition_to_running(self, monkeypatch):
+        """Should keep polling until status transitions from PENDING to RUNNING."""
+        import run_synthetic_regression_evaluation as mod
+        call_count = [0]
+
+        class _TransitionSession:
+            def sql(self, query):
+                self._q = query
+                return self
+            def collect(self):
+                if "SHOW SERVICE CONTAINERS" in self._q:
+                    raise RuntimeError("SHOW not supported")
+                call_count[0] += 1
+                status = "PENDING" if call_count[0] < 2 else "RUNNING"
+                class _Row:
+                    def __getitem__(self, i):
+                        return f'[{{"status": "{status}"}}]'
+                return [_Row()]
+
+        sleep_calls = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        mod._wait_spcs_workers_ready(
+            _TransitionSession(), [("w0", "job_w0")], timeout_seconds=60, poll_interval_seconds=5
+        )
+        assert call_count[0] >= 2, "Expected at least 2 poll iterations"
+        assert sleep_calls, "Expected at least one sleep between polls"
+
+    def test_raises_on_failed_worker(self):
+        """Should raise RuntimeError immediately when a worker reaches FAILED status."""
+        import pytest
+        from run_synthetic_regression_evaluation import _wait_spcs_workers_ready
+        session = self._StatusSession('[{"status": "FAILED"}]')
+        with pytest.raises(RuntimeError, match="failed status"):
+            _wait_spcs_workers_ready(session, [("w0", "job_w0")], timeout_seconds=30)
+
+    def test_raises_on_timeout_with_pending_states(self, monkeypatch):
+        """Should raise RuntimeError with worker label and hint when timeout expires."""
+        import pytest
+        import run_synthetic_regression_evaluation as mod
+
+        monotonic_val = [0.0]
+        monkeypatch.setattr(mod.time, "monotonic", lambda: monotonic_val[0])
+        monkeypatch.setattr(mod.time, "sleep", lambda s: monotonic_val.__setitem__(0, monotonic_val[0] + s + 9999))
+
+        session = self._StatusSession('[{"status": "PENDING"}]')
+        with pytest.raises(RuntimeError) as exc_info:
+            mod._wait_spcs_workers_ready(
+                session, [("my_worker", "job_my_worker")], timeout_seconds=1, poll_interval_seconds=1
+            )
+        msg = str(exc_info.value)
+        assert "my_worker" in msg, f"Error message should include worker label; got: {msg}"
+        assert "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS" in msg, (
+            f"Error message should hint at env var; got: {msg}"
+        )
+
+    def test_handles_empty_json_response_as_pending(self, monkeypatch):
+        """An empty JSON array response must be treated as PENDING (no crash)."""
+        import run_synthetic_regression_evaluation as mod
+
+        call_count = [0]
+
+        class _EmptyThenReadySession:
+            def sql(self, query):
+                self._q = query
+                return self
+            def collect(self):
+                if "SHOW SERVICE CONTAINERS" in self._q:
+                    raise RuntimeError("SHOW not supported")
+                call_count[0] += 1
+                status_json = "[]" if call_count[0] < 2 else '[{"status": "READY"}]'
+                class _Row:
+                    def __init__(self, v):
+                        self._v = v
+                    def __getitem__(self, i):
+                        return self._v
+                return [_Row(status_json)]
+
+        sleep_calls = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        # Should not raise; should eventually see READY
+        mod._wait_spcs_workers_ready(
+            _EmptyThenReadySession(), [("w0", "job_w0")], timeout_seconds=60, poll_interval_seconds=1
+        )
+        assert call_count[0] >= 2
+
+    def test_handles_malformed_json_as_pending(self, monkeypatch):
+        """A non-JSON string response must be treated as PENDING (no crash)."""
+        import run_synthetic_regression_evaluation as mod
+
+        call_count = [0]
+
+        class _BadThenReadySession:
+            def sql(self, query):
+                self._q = query
+                return self
+            def collect(self):
+                if "SHOW SERVICE CONTAINERS" in self._q:
+                    raise RuntimeError("SHOW not supported")
+                call_count[0] += 1
+                val = "not-json-at-all" if call_count[0] < 2 else '[{"status": "READY"}]'
+                class _Row:
+                    def __init__(self, v):
+                        self._v = v
+                    def __getitem__(self, i):
+                        return self._v
+                return [_Row(val)]
+
+        sleep_calls = []
+        monkeypatch.setattr(mod.time, "sleep", lambda s: sleep_calls.append(s))
+
+        mod._wait_spcs_workers_ready(
+            _BadThenReadySession(), [("w0", "job_w0")], timeout_seconds=60, poll_interval_seconds=1
+        )
+        assert call_count[0] >= 2
+
+
+# ---------------------------------------------------------------------------
 # Tests: SELECT * removal in dataset index query
 # ---------------------------------------------------------------------------
 
@@ -4520,6 +4904,7 @@ class TestSPCSDNSDomainResolution:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
@@ -4582,6 +4967,7 @@ class TestSPCSCoordinatorTopologyGuards:
 
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
@@ -4608,6 +4994,7 @@ class TestSPCSCoordinatorTopologyGuards:
         monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -4715,6 +5102,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -4737,6 +5125,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -4759,6 +5148,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -4780,6 +5170,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
@@ -4795,3 +5186,628 @@ class TestNonlinearEvaluation:
             assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in spec, (
                 f"Coordinator SPCS spec for {_label!r} is missing SYNTHETIC_NONLINEAR_DATASET_INDEX"
             )
+
+    def test_nonlinear_parts_prefix_uses_nonlinear_namespace(self):
+        """NONLINEAR_PARTS_PREFIX must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
+        import run_synthetic_nonlinear_evaluation as mod
+        assert mod.NONLINEAR_PARTS_PREFIX.startswith("@EVALUATION_RESULTS_STAGE/nonlinear"), (
+            f"NONLINEAR_PARTS_PREFIX={mod.NONLINEAR_PARTS_PREFIX!r} must start with "
+            "'@EVALUATION_RESULTS_STAGE/nonlinear'"
+        )
+        assert "/regression/" not in mod.NONLINEAR_PARTS_PREFIX, (
+            f"NONLINEAR_PARTS_PREFIX={mod.NONLINEAR_PARTS_PREFIX!r} must not use the "
+            "regression namespace"
+        )
+
+    def test_nonlinear_deepset_results_stage_uses_nonlinear_namespace(self, monkeypatch):
+        """DeepSet shard env SYNREG_RESULTS_STAGE must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_submit_synreg",
+            lambda *a, **kw: submitted.append(kw) or "JOB_ID")
+        monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: True)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        mod.run_synthetic_nonlinear_deepset_evaluation(object())
+        assert submitted, "No DeepSet jobs submitted"
+        for s in submitted:
+            results_stage = s["env_vars"].get("SYNREG_RESULTS_STAGE", "")
+            assert results_stage.startswith("@EVALUATION_RESULTS_STAGE/nonlinear"), (
+                f"DeepSet SYNREG_RESULTS_STAGE={results_stage!r} must be under "
+                "@EVALUATION_RESULTS_STAGE/nonlinear"
+            )
+            assert "/regression/" not in results_stage
+
+    def test_nonlinear_baseline_results_stage_uses_nonlinear_namespace(self, monkeypatch):
+        """Baseline shard env SYNREG_RESULTS_STAGE must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_submit_synreg",
+            lambda *a, **kw: submitted.append(kw) or "JOB_ID")
+        monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_resolve_baseline_shard_count", lambda *a, **kw: 2)
+        mod.run_synthetic_nonlinear_baseline_evaluation(object())
+        assert submitted, "No baseline jobs submitted"
+        for s in submitted:
+            results_stage = s["env_vars"].get("SYNREG_RESULTS_STAGE", "")
+            assert results_stage.startswith("@EVALUATION_RESULTS_STAGE/nonlinear"), (
+                f"Baseline SYNREG_RESULTS_STAGE={results_stage!r} must be under "
+                "@EVALUATION_RESULTS_STAGE/nonlinear"
+            )
+            assert "/regression/" not in results_stage
+
+    def test_nonlinear_spcs_single_node_results_stage_uses_nonlinear_namespace(self, monkeypatch):
+        """Single-node SPCS shard spec must reference @EVALUATION_RESULTS_STAGE/nonlinear."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=0,    # single_node_shards mode
+            autogluon_workers_per_shard=None,  # defaults to 1
+            autogluon_concurrent_clusters=2,
+        )
+        assert submitted, "No SPCS single-node specs captured"
+        for _label, spec in submitted:
+            assert "@EVALUATION_RESULTS_STAGE/nonlinear" in spec, (
+                f"Single-node SPCS spec missing nonlinear results stage: {spec!r}"
+            )
+            assert "/regression/" not in spec
+
+    def test_nonlinear_spcs_coordinator_results_stage_uses_nonlinear_namespace(self, monkeypatch):
+        """Ray coordinator SPCS spec must reference @EVALUATION_RESULTS_STAGE/nonlinear."""
+        import run_synthetic_nonlinear_evaluation as mod
+        submitted = []
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
+        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(), autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
+        coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
+        assert coord_specs, "No coordinator SPCS specs captured"
+        for spec in coord_specs:
+            assert "@EVALUATION_RESULTS_STAGE/nonlinear" in spec, (
+                f"Coordinator SPCS spec missing nonlinear results stage: {spec!r}"
+            )
+            assert "/regression/" not in spec
+
+
+# ---------------------------------------------------------------------------
+# Tests: Per-shard barrier orchestration
+# ---------------------------------------------------------------------------
+
+class TestSPCSPerShardOrchestration:
+    """Verify that _wait_spcs_workers_ready is called once per shard (not globally)."""
+
+    def _setup_mocks(self, monkeypatch, mod, call_log):
+        """Patch SPCS helpers so call_log records per-shard submission order."""
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            call_log.append(("submit", label))
+            return f"MOCK_{label.upper()}"
+
+        def _mock_wait_placement(session, worker_jobs, **kw):
+            call_log.append(("wait_placement", [lbl for lbl, _ in worker_jobs]))
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", _mock_wait_placement)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+
+    def test_wait_called_once_per_shard_not_globally(self, monkeypatch):
+        """_wait_spcs_workers_ready must be called exactly once per shard."""
+        import run_synthetic_regression_evaluation as mod
+        call_log = []
+        self._setup_mocks(monkeypatch, mod, call_log)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=3,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=3,
+        )
+
+        wait_events = [labels for ev, labels in call_log if ev == "wait_placement"]
+        assert len(wait_events) == 3, (
+            f"Expected exactly 3 wait_placement calls (one per shard), got {len(wait_events)}"
+        )
+        # Each call must be for exactly 2 workers (workers_per_shard=2).
+        for i, labels in enumerate(wait_events):
+            assert len(labels) == 2, (
+                f"Shard {i} wait_placement call has {len(labels)} workers, expected 2"
+            )
+            # All labels must share the same shard index.
+            shard_indices = set()
+            for lbl in labels:
+                # Label format: spcs_ray_worker_r0_{shard_index}_{w}
+                parts = lbl.rsplit("_", 1)  # split off worker index
+                shard_indices.add(parts[0])
+            assert len(shard_indices) == 1, (
+                f"Shard {i} wait_placement called with workers from multiple shards: {labels}"
+            )
+
+    def test_coordinator_submitted_immediately_after_shard_workers_placed(self, monkeypatch):
+        """For each shard: submit workers → wait → submit coordinator (in that order)."""
+        import run_synthetic_regression_evaluation as mod
+        call_log = []
+        self._setup_mocks(monkeypatch, mod, call_log)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=2,
+            autogluon_workers_per_shard=2,
+            autogluon_concurrent_clusters=2,
+        )
+
+        # Expected event order for shards=2, workers=2:
+        # submit w0_0, submit w0_1, wait shard_0, submit coord_0,
+        # submit w1_0, submit w1_1, wait shard_1, submit coord_1
+        events = call_log
+        wait_positions = [i for i, (ev, _) in enumerate(events) if ev == "wait_placement"]
+        assert len(wait_positions) == 2
+
+        # Between positions 0 and wait_positions[0]: only worker submits.
+        pre_shard0 = events[:wait_positions[0]]
+        assert all(ev == "submit" and "worker" in (lbl or "")
+                   for ev, lbl in pre_shard0), (
+            f"Expected only worker submits before first wait; got: {pre_shard0}"
+        )
+        # Immediately after first wait: coordinator submit.
+        post_wait0 = events[wait_positions[0] + 1]
+        assert post_wait0[0] == "submit" and "coord" in (post_wait0[1] or ""), (
+            f"Expected coordinator submit immediately after first wait; got: {post_wait0}"
+        )
+
+    def test_per_shard_failure_keeps_only_placed_workers_when_keep_true(self, monkeypatch):
+        """If wait fails on shard_1, cancel is NOT called when keep=true."""
+        import run_synthetic_regression_evaluation as mod
+        cancel_calls = []
+        call_count = [0]
+
+        def _mock_wait_fail_on_second(session, worker_jobs, **kw):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                raise RuntimeError("shard_1 placement timeout")
+
+        monkeypatch.setattr(mod, "_execute_spcs_job_service",
+            lambda session, *, label, compute_pool, spec: label.upper())
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", _mock_wait_fail_on_second)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group",
+            lambda jobs, session: cancel_calls.extend(jobs))
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE", True)
+
+        import pytest
+        with pytest.raises(RuntimeError, match="shard_1 placement timeout"):
+            mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+                object(),
+                autogluon_cluster_shards=2,
+                autogluon_workers_per_shard=1,
+                autogluon_concurrent_clusters=2,
+            )
+        assert not cancel_calls, (
+            "With keep=true, _cancel_spcs_job_group must NOT be called on failure"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _wait_spcs_workers_ready placement semantics
+# ---------------------------------------------------------------------------
+
+class TestSPCSWorkerPlacementSemantics:
+    """Unit tests for new status-set semantics in _wait_spcs_workers_ready."""
+
+    class _ShowContainerSession:
+        """Session that returns rows from SHOW SERVICE CONTAINERS IN SERVICE."""
+
+        def __init__(self, rows_by_call=None):
+            # rows_by_call: list of lists of dicts; each inner list is returned
+            # for consecutive sql().collect() calls.
+            self._rows = rows_by_call or []
+            self._call_idx = 0
+            self.queries_seen = []
+
+        def sql(self, query):
+            self.queries_seen.append(query)
+            self._pending_query = query
+            return self
+
+        def collect(self):
+            idx = self._call_idx
+            self._call_idx += 1
+            if idx < len(self._rows):
+                rows = self._rows[idx]
+            else:
+                rows = self._rows[-1] if self._rows else []
+
+            class _Row:
+                def __init__(self, d):
+                    for k, v in d.items():
+                        setattr(self, k, v)
+                        setattr(self, k.upper(), v)
+            return [_Row(r) for r in rows]
+
+    def _make_container_session(self, status: str, extra=None):
+        """Return a session that always returns one container row with the given status."""
+        row = {"status": status, "container_name": "main", "instance_id": "0",
+               "message": "", "restart_count": "0"}
+        if extra:
+            row.update(extra)
+        return self._ShowContainerSession(rows_by_call=[[row]])
+
+    def test_done_status_raises_unexpected_terminal(self, monkeypatch):
+        """DONE status must raise RuntimeError with 'unexpected terminal' message."""
+        import run_synthetic_regression_evaluation as mod
+        import time as _time
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+
+        session = self._make_container_session("DONE")
+        with pytest.raises(RuntimeError, match="unexpected terminal"):
+            mod._wait_spcs_workers_ready(session, [("w0", "job_w0")], timeout_seconds=300)
+
+    def test_succeeded_status_raises_unexpected_terminal(self, monkeypatch):
+        """SUCCEEDED status must raise RuntimeError with 'unexpected terminal' message."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+
+        session = self._make_container_session("SUCCEEDED")
+        with pytest.raises(RuntimeError, match="unexpected terminal"):
+            mod._wait_spcs_workers_ready(session, [("w0", "job_w0")], timeout_seconds=300)
+
+    def test_unknown_status_raises_failed(self, monkeypatch):
+        """UNKNOWN status must raise RuntimeError (treated as a failure state)."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+
+        session = self._make_container_session("UNKNOWN")
+        with pytest.raises(RuntimeError):
+            mod._wait_spcs_workers_ready(session, [("w0", "job_w0")], timeout_seconds=300)
+
+    def test_timeout_message_includes_container_details(self, monkeypatch):
+        """Timeout error must include 'containers' key with per-container detail."""
+        import run_synthetic_regression_evaluation as mod
+
+        tick = [0.0]
+        def _mono():
+            return tick[0]
+        def _sleep(s):
+            tick[0] += s + 9999  # force deadline exceeded on next check
+
+        monkeypatch.setattr(mod.time, "monotonic", _mono)
+        monkeypatch.setattr(mod.time, "sleep", _sleep)
+
+        session = self._make_container_session(
+            "PENDING",
+            extra={"message": "image pull", "container_name": "main", "restart_count": "0"},
+        )
+        with pytest.raises(RuntimeError) as exc_info:
+            mod._wait_spcs_workers_ready(
+                session, [("w0", "job_w0")], timeout_seconds=1, poll_interval_seconds=1
+            )
+        msg = str(exc_info.value)
+        assert "containers" in msg, f"Timeout message must include 'containers'; got: {msg}"
+        assert "TIMEOUT" in msg
+
+    def test_consecutive_empty_responses_raises(self, monkeypatch):
+        """After MAX_CONSECUTIVE_EMPTY empty poll responses, must raise RuntimeError."""
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+
+        class _EmptySession:
+            def sql(self, query):
+                return self
+            def collect(self):
+                return []  # always empty — triggers SHOW fallback and SYSTEM$ fallback
+
+        with pytest.raises(RuntimeError):
+            mod._wait_spcs_workers_ready(
+                _EmptySession(), [("w0", "job_w0")], timeout_seconds=9999, poll_interval_seconds=0
+            )
+
+    def test_prefers_show_containers_over_system_function(self, monkeypatch):
+        """SHOW SERVICE CONTAINERS must be tried before SYSTEM$GET_SERVICE_STATUS."""
+        import run_synthetic_regression_evaluation as mod
+
+        queries_seen = []
+
+        class _ShowSession:
+            def sql(self, query):
+                queries_seen.append(query)
+                self._q = query
+                return self
+            def collect(self):
+                if "SHOW SERVICE CONTAINERS" in self._q:
+                    class _Row:
+                        status = "READY"
+                        STATUS = "READY"
+                        container_name = "main"
+                        CONTAINER_NAME = "main"
+                        instance_id = "0"
+                        INSTANCE_ID = "0"
+                        message = ""
+                        MESSAGE = ""
+                        restart_count = "0"
+                        RESTART_COUNT = "0"
+                    return [_Row()]
+                return []
+
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+
+        mod._wait_spcs_workers_ready(
+            _ShowSession(), [("w0", "job_w0")], timeout_seconds=300
+        )
+        system_queries = [q for q in queries_seen if "SYSTEM$GET_SERVICE_STATUS" in q]
+        assert not system_queries, (
+            f"SYSTEM$GET_SERVICE_STATUS must not be called when SHOW succeeds; "
+            f"queries: {queries_seen}"
+        )
+        show_queries = [q for q in queries_seen if "SHOW SERVICE CONTAINERS" in q]
+        assert show_queries, "SHOW SERVICE CONTAINERS IN SERVICE must have been called"
+
+    def test_falls_back_to_system_function_when_show_raises(self, monkeypatch):
+        """If SHOW SERVICE CONTAINERS raises, must fall back to SYSTEM$GET_SERVICE_STATUS."""
+        import run_synthetic_regression_evaluation as mod
+
+        class _FallbackSession:
+            def sql(self, query):
+                self._q = query
+                return self
+            def collect(self):
+                if "SHOW SERVICE CONTAINERS" in self._q:
+                    raise RuntimeError("SHOW not supported")
+                # Return valid READY JSON for fallback path
+                import json
+                class _Row:
+                    def __getitem__(self, i):
+                        return json.dumps([{"status": "READY"}])
+                return [_Row()]
+
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
+
+        # Should succeed via fallback, not raise.
+        mod._wait_spcs_workers_ready(
+            _FallbackSession(), [("w0", "job_w0")], timeout_seconds=300
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Worker connect timeout formula
+# ---------------------------------------------------------------------------
+
+class TestSPCSTimeoutAlignment:
+    """Verify _spcs_worker_connect_timeout() formula and its use in env vars."""
+
+    def test_worker_connect_timeout_exceeds_placement_plus_300(self, monkeypatch):
+        """With defaults (placement=900, ray_start=600): result is max(600, 900+300)=1200."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", 900)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", 600)
+        result = mod._spcs_worker_connect_timeout()
+        assert result == 1200, (
+            f"Expected max(600, 900+300)=1200, got {result}"
+        )
+
+    def test_ray_start_timeout_dominates_when_larger(self, monkeypatch):
+        """With placement=400, ray_start=900: result is max(900, 400+300)=900."""
+        import run_synthetic_regression_evaluation as mod
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", 400)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", 900)
+        result = mod._spcs_worker_connect_timeout()
+        assert result == 900, (
+            f"Expected max(900, 400+300)=900, got {result}"
+        )
+
+    def test_synreg_worker_env_uses_connect_timeout_formula(self, monkeypatch):
+        """SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS in submitted worker env must equal
+        str(_spcs_worker_connect_timeout()), not a hardcoded constant."""
+        import run_synthetic_regression_evaluation as mod
+
+        submitted_envs = []
+
+        def _mock_submit(session, *, label, compute_pool, env_vars, image,
+                         entrypoint_path, resource_role, endpoints=None):
+            submitted_envs.append((label, env_vars.copy()))
+            return label.upper()
+
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", _mock_submit)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(mod, "COMBINED_SUITE_ID", "linear_all_v1")
+        monkeypatch.setattr(mod, "COMBINED_PARTS_PREFIX", "@TEST_STAGE/parts")
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", 900)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", 600)
+
+        mod.run_synthetic_regression_combined_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+
+        expected = str(mod._spcs_worker_connect_timeout())
+        worker_envs = [(lbl, env) for lbl, env in submitted_envs if "worker" in lbl]
+        assert worker_envs, "No worker submissions found"
+        for lbl, env in worker_envs:
+            actual = env.get("SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS")
+            assert actual == expected, (
+                f"Worker {lbl!r}: SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS={actual!r}, "
+                f"expected {expected!r} from formula"
+            )
+
+    def test_nonlinear_worker_connect_timeout_uses_formula_not_hardcoded(self, monkeypatch):
+        """Nonlinear SPCS workers must not use hardcoded '600' for connect timeout."""
+        import run_synthetic_nonlinear_evaluation as nl_mod
+        import run_synthetic_regression_evaluation as mod
+
+        submitted_envs = []
+
+        def _mock_build_spec(image, args, env_vars, resource_role=None, endpoints=None):
+            # Embed env_vars in the spec string so we can inspect it
+            import json
+            return json.dumps({"args": args, "env": env_vars})
+
+        def _mock_execute(session, *, label, compute_pool, spec):
+            import json
+            try:
+                data = json.loads(spec)
+                submitted_envs.append((label, data.get("env", {})))
+            except Exception:
+                pass
+            return label.upper()
+
+        monkeypatch.setattr(nl_mod, "_build_spcs_job_spec", _mock_build_spec)
+        monkeypatch.setattr(nl_mod, "_execute_spcs_job_service", _mock_execute)
+        monkeypatch.setattr(nl_mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(nl_mod, "_wait_spcs_workers_ready", lambda *a, **k: None)
+        monkeypatch.setattr(nl_mod, "_cancel_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(nl_mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(nl_mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(nl_mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        monkeypatch.setattr(nl_mod, "_spcs_run_id", lambda: "r0")
+        monkeypatch.setattr(nl_mod, "_spcs_session_context_env", lambda s: {})
+        monkeypatch.setattr(nl_mod, "_spcs_dns_domain", lambda s: "svc.internal")
+        # Set placement timeout high so formula result != 600
+        monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", 900)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", 600)
+
+        nl_mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            object(),
+            autogluon_cluster_shards=1,
+            autogluon_workers_per_shard=1,
+            autogluon_concurrent_clusters=1,
+        )
+
+        worker_envs = [(lbl, env) for lbl, env in submitted_envs if "worker" in lbl]
+        assert worker_envs, "No nonlinear worker submissions found"
+        for lbl, env in worker_envs:
+            actual = env.get("SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS")
+            assert actual != "600", (
+                f"Nonlinear worker {lbl!r}: SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS={actual!r} "
+                "must not be the hardcoded value '600'"
+            )
+            assert actual == str(mod._spcs_worker_connect_timeout()), (
+                f"Nonlinear worker {lbl!r}: expected formula result "
+                f"{mod._spcs_worker_connect_timeout()!r}, got {actual!r}"
+            )
+
+
+class TestSPCSImportProbeUniqueNaming:
+    """Verify that run_synthetic_regression_autogluon_spcs_import_probe embeds a
+    run-id in every service label so repeated calls never collide on name."""
+
+    def _make_capture(self):
+        submitted = []
+
+        def _capture_submit(session, *, label, compute_pool, env_vars, image, entrypoint_path, resource_role):
+            submitted.append({"label": label, "env_vars": env_vars})
+            return label.upper()
+
+        return submitted, _capture_submit
+
+    def _patch(self, monkeypatch, run_id_value, capture_submit):
+        import run_synthetic_regression_evaluation as mod
+
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: run_id_value)
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", capture_submit)
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+        return mod
+
+    def test_import_probe_label_includes_run_id(self, monkeypatch):
+        submitted, capture = self._make_capture()
+        mod = self._patch(monkeypatch, "testrunid", capture)
+
+        mod.run_synthetic_regression_autogluon_spcs_import_probe(object(), probe_count=1)
+
+        assert len(submitted) == 1
+        assert submitted[0]["label"] == "spcs_ag_import_probe_testrunid_0", (
+            f"Expected run_id in label; got {submitted[0]['label']!r}"
+        )
+
+    def test_import_probe_multiple_probes_unique_labels(self, monkeypatch):
+        submitted, capture = self._make_capture()
+        mod = self._patch(monkeypatch, "testrunid", capture)
+
+        mod.run_synthetic_regression_autogluon_spcs_import_probe(object(), probe_count=2)
+
+        labels = [s["label"] for s in submitted]
+        assert labels == [
+            "spcs_ag_import_probe_testrunid_0",
+            "spcs_ag_import_probe_testrunid_1",
+        ], f"Unexpected labels: {labels!r}"
+
+    def test_import_probe_repeated_calls_different_run_ids_no_collision(self, monkeypatch):
+        import run_synthetic_regression_evaluation as mod
+
+        submitted1, capture1 = self._make_capture()
+        submitted2, capture2 = self._make_capture()
+
+        monkeypatch.setattr(mod, "_wait_spcs_job_group", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_verify_spcs_image_in_repository", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
+
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "aaa00001")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", capture1)
+        mod.run_synthetic_regression_autogluon_spcs_import_probe(object(), probe_count=1)
+
+        monkeypatch.setattr(mod, "_spcs_run_id", lambda: "bbb00002")
+        monkeypatch.setattr(mod, "_submit_spcs_synreg", capture2)
+        mod.run_synthetic_regression_autogluon_spcs_import_probe(object(), probe_count=1)
+
+        labels1 = {s["label"] for s in submitted1}
+        labels2 = {s["label"] for s in submitted2}
+        assert labels1.isdisjoint(labels2), (
+            f"Label collision between calls: {labels1 & labels2!r}"
+        )
+
+    def test_import_probe_env_var_label_includes_run_id(self, monkeypatch):
+        submitted, capture = self._make_capture()
+        mod = self._patch(monkeypatch, "testrunid", capture)
+
+        mod.run_synthetic_regression_autogluon_spcs_import_probe(object(), probe_count=2)
+
+        assert submitted[0]["env_vars"]["SYNREG_AG_IMPORT_PROBE_LABEL"] == (
+            "spcs_ag_import_probe_testrunid_0_of_2"
+        ), f"Unexpected env var for job 0: {submitted[0]['env_vars']!r}"
+        assert submitted[1]["env_vars"]["SYNREG_AG_IMPORT_PROBE_LABEL"] == (
+            "spcs_ag_import_probe_testrunid_1_of_2"
+        ), f"Unexpected env var for job 1: {submitted[1]['env_vars']!r}"

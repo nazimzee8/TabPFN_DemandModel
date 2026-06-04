@@ -436,6 +436,10 @@ All three suites expose individual phase procedures. Use these instead of the al
 | Nonlinear | Baseline eval | `run_synthetic_nonlinear_baseline_evaluation` | `DEEPSET_CPU_POOL` |
 | Nonlinear | AutoGluon eval (SPCS) | `run_synthetic_nonlinear_autogluon_spcs_evaluation` | `AUTOGLUON_CPU_POOL` |
 | Nonlinear | Aggregation | `run_synthetic_nonlinear_aggregation` | `DEEPSET_CPU_POOL` |
+| Nonlinear | SPCS import probe    | `run_synthetic_nonlinear_autogluon_spcs_import_probe`              | `AUTOGLUON_CPU_POOL` |
+| Nonlinear | SPCS session probe   | `run_synthetic_nonlinear_autogluon_spcs_session_probe`             | `AUTOGLUON_CPU_POOL` |
+| Nonlinear | SPCS capacity probe  | `run_synthetic_nonlinear_autogluon_spcs_capacity_probe`   | `AUTOGLUON_CPU_POOL` |
+| Nonlinear | SPCS worker-access probe | `run_synthetic_nonlinear_autogluon_spcs_worker_access_probe` | `AUTOGLUON_CPU_POOL` |
 
 ### Split-phase invocation pattern
 
@@ -505,9 +509,17 @@ CALL run_synthetic_nonlinear_deepset_evaluation('2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_GPU_POOL SUSPEND;
 CALL run_synthetic_nonlinear_baseline_evaluation('2.5.0-py311');
 ALTER COMPUTE POOL DEEPSET_CPU_POOL SUSPEND;
--- 6 clusters x 4 workers x 1 CPU/task; SYNREG_INDEX_TABLE injected automatically
+-- SPCS preflight probes (run before AutoGluon SPCS evaluation)
+CALL run_synthetic_nonlinear_autogluon_spcs_import_probe('<AG_IMAGE>', 1);
+CALL run_synthetic_nonlinear_autogluon_spcs_session_probe('<AG_IMAGE>', 1);
+CALL run_synthetic_nonlinear_autogluon_spcs_capacity_probe('<AG_IMAGE>', 6, 4, 6);
+CALL run_synthetic_nonlinear_autogluon_spcs_worker_access_probe('<AG_IMAGE>', 6, 4, 6);
+-- Then proceed to full evaluation:
+-- 6 clusters x 4 workers x 1 CPU/task; SYNREG_INDEX_TABLE injected automatically.
+-- <AG_IMAGE> must be the same custom AutoGluon SPCS image used by synthetic regression
+-- AutoGluon (SYNREG_AUTOGLUON_SPCS_IMAGE). Supply it explicitly or set the env var.
 CALL run_synthetic_nonlinear_autogluon_spcs_evaluation(
-  '<AG_IMAGE>', 6, 4, 1, 6, 300, 'best_quality', 600, 1
+  '<AG_IMAGE>', 6, 4, 6, 300, 'best_quality', 1, 600, 1
 );
 ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
@@ -525,14 +537,12 @@ CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
 - **Nonlinear pretrain checkpoint:** `pretrain_nonlinear_meta.pt` (vs `pretrain_gate{32,64,128}.pt` for linear).
   Created by `CALL run_pretrain_pipeline_nonlinear(...)`. Uses `use_latent_ridge_expert=True, latent_ridge_dim=64`.
 - **Nonlinear HPO:** 6-arg `run_hpo_pipeline` overload adds `HPO_PRETRAIN_CHECKPOINT_STAGE_PATH` parameter.
-  Two sweeps: `nonlinear_meta` (warm-start) then `nonlinear_architecture` (d_phi/n_sab_feat tuning).
+  Single sweep: `nonlinear_meta` tunes `latent_ridge_dim` ∈ {32, 64, 128} alongside
+  optimizer/regularization and nonlinear-specific params. The pretrain checkpoint
+  (`pretrain_nonlinear_meta.pt`, built with dim=64) warm-starts dim=64 trials; dim=32/128
+  trials cold-start on architecture mismatch.
 - **Nonlinear cold-start guard:** `run_model_training_job.py` raises `RuntimeError` when nonlinear
   `best_config` has no `_meta.pretrain_checkpoint_stage_path`. Dev-only override: `ALLOW_NONLINEAR_COLD_START=true`.
-- **`_merge_sweep_configs()` checkpoint preservation:** The nonlinear architecture merge preserves
-  `_meta.pretrain_checkpoint_stage_path` and `_meta.pretrain_checkpoint_map` from the
-  `nonlinear_meta` baseline sweep when the `nonlinear_architecture` sweep produces an empty path.
-  Precedence: arch path wins if non-empty, else baseline path. Checkpoint maps are unioned with arch
-  keys overriding on collision.
 - **SPCS AutoGluon memory defaults:** Coordinator and worker both default to 256 MiB (268435456 bytes)
   Ray object-store memory (override via `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES` /
   `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES`). Applies to both linear production evaluation
@@ -599,6 +609,30 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
   `--node-manager-port` etc.) and declared as SPCS TCP endpoints — SPCS only allows
   service-to-service traffic on declared endpoints. Do not add a separate head or driver service —
   the coordinator replaces both. Resource profile: `SYNREG_SPCS_RAY_COORDINATOR_*` (default 1/2 CPU, 4Gi/8Gi memory).
+- **SPCS per-shard barrier:** The orchestrator loops over shards one at a time. For each shard,
+  it submits all workers, then calls `_wait_spcs_workers_ready(session, shard_workers)` (a
+  **per-shard** wait, not a global all-worker barrier), then submits that shard's coordinator
+  immediately. This ensures each coordinator is submitted only after its own workers have reached
+  READY/RUNNING, giving each Ray cluster the tightest possible placement gap.
+- **SPCS worker placement semantics (`_wait_spcs_workers_ready`):**
+  Container status sets used by the placement poller:
+  - `_RUNNING_STATUSES = {"READY", "RUNNING"}` — worker is healthy; decrement pending count.
+  - `_UNEXPECTED_TERMINAL = {"DONE", "SUCCEEDED"}` — raises `RuntimeError` immediately; worker
+    exited before coordinator was submitted (premature exit, check worker logs).
+  - `_FAILED_STATUSES = {"FAILED", "FAILED_OOM", "INTERNAL_ERROR", "UNKNOWN"}` — raises
+    `RuntimeError` immediately (UNKNOWN is treated as failure, not a transient state).
+  - Consecutive empty responses: if `_get_service_container_statuses()` returns an empty list
+    for ≥ 5 consecutive polls (`MAX_CONSECUTIVE_EMPTY=5`), raises immediately (SQL/network fault).
+- **SPCS container status query:** `_get_service_container_statuses(session, job_name)` prefers
+  `SHOW SERVICE CONTAINERS IN SERVICE {job_name}` (attribute-based row access). Falls back to
+  `SELECT SYSTEM$GET_SERVICE_STATUS('{job_name}')` (JSON parse) only if SHOW raises. Timeout
+  messages include per-container details: `containerName`, `instanceId`, `message`, `restartCount`.
+- **Worker connect timeout formula:** `SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS` (env var passed
+  to each SPCS worker container) is set to `_spcs_worker_connect_timeout()`:
+  `max(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS, SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS + 300)`.
+  With defaults (placement=900 s, ray_start=600 s) this evaluates to **1200 s**. This ensures
+  workers do not time out waiting for the coordinator head port before SPCS even places the
+  coordinator container.
 - **Session-free worker dataset loading:** The Ray driver opens Snowpark only to query
   `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.presigned_url` with
   `GET_PRESIGNED_URL`. Each Ray worker receives only a compact item dict and downloads
@@ -911,6 +945,12 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   - `SYNREG_SPCS_KEEP_SUPPORT_JOBS_ON_FAILURE` (default false) — when true, worker support jobs
     are not cancelled after a coordinator failure, leaving them accessible for log inspection.
     Must be cancelled manually after diagnostics.
+  - `SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS` (default 900) — max seconds each per-shard
+    barrier waits for that shard's workers to reach READY/RUNNING before raising.
+  - `SPCS_RAY_WORKER_CONNECT_TIMEOUT_SECONDS` — computed by `_spcs_worker_connect_timeout()`:
+    `max(SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS, SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS + 300)`;
+    defaults to 1200 s. Injected into each worker container as an env var; must outlast SPCS
+    placement latency plus coordinator Ray head startup.
 - **Driver failure artifact (`@EVALUATION_RESULTS_STAGE/debug`):** If the distributed
   AutoGluon evaluation fails after Ray readiness (task submission, result collection, or CSV
   write), the coordinator driver writes a JSON artifact to `@EVALUATION_RESULTS_STAGE/debug`.
@@ -997,11 +1037,12 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   PUT file://C:/Documents/TabPFN_DemandModel/src/evaluation_metrics.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/evaluate.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/run_synthetic_nonlinear_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_ray.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_worker_access_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
+  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|run_synthetic_nonlinear_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
   ```
   Use the targeted block above when only the evaluator/helper refactor changed. Use
   the broad `src/*.py` plus `scripts/*.py` PUT block when procedure dependencies or
@@ -1137,10 +1178,13 @@ set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting t
 - Standalone pretrain and HPO submitters support purpose-specific selectors:
   `PRETRAIN_TRAINING_DATA_FAMILY` and `HPO_TRAINING_DATA_FAMILY` override
   `TRAINING_DATA_FAMILY` for zero-arg `run_pretrain_pipeline()` and
-  `run_hpo_pipeline()` respectively. `NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY`
-  overrides the zero-arg nonlinear pretrain default and otherwise falls back to
-  `PRETRAIN_TRAINING_DATA_FAMILY`, then `TRAINING_DATA_FAMILY`, then
-  `synthetic_regression_nonlinear`.
+  `run_hpo_pipeline()` respectively. `run_pretrain_pipeline_nonlinear()` always
+  uses `synthetic_regression_nonlinear` regardless of env vars — env-var overrides
+  via `NONLINEAR_PRETRAIN_TRAINING_DATA_FAMILY` or `PRETRAIN_TRAINING_DATA_FAMILY`
+  have no effect on this entrypoint. Use the 3-arg SQL form to pass explicit model
+  selectors.
+- `run_pipeline()` enforces linear-only: it raises `RuntimeError` if
+  `DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_nonlinear"`.
 - Explicit SQL procedure arguments always win over env-var defaults; use them for
   production runs when the lineage selector must be auditable in the call text.
 - Pretrain and final training in `run_training_job.py` must use the **same** value.

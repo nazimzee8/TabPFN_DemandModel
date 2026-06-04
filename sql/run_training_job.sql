@@ -18,6 +18,12 @@ USE SCHEMA TABPFN_SCHEMA;
 -- MLJobs materialize this stage into ephemeral container-local /tmp/data.
 CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
+-- META_NONLINEAR_DATASET_STAGE: nonlinear train/val/test parquet files.
+-- Separate from META_DATASET_STAGE (linear) so TRAINING_DATA_FAMILY routing
+-- in snowflake_io.py can read from @META_NONLINEAR_DATASET_STAGE/{split}/ without
+-- mixing linear and nonlinear staged data.
+CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+
 -- MODEL_STAGE: scripts, HPO config, and model checkpoints only.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
@@ -230,6 +236,16 @@ CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_DATASET_INDEX (
 )
 DATA_RETENTION_TIME_IN_DAYS = 0
 CLUSTER BY (split, hpo_bucket, prior_regime, p, n_train);
+
+-- Populate META_NONLINEAR_DATASET_INDEX from @META_NONLINEAR_DATASET_STAGE.
+-- Run once after staging nonlinear train/val/test parquets.
+CREATE OR REPLACE PROCEDURE build_meta_nonlinear_dataset_index()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/build_meta_nonlinear_dataset_index.py')
+  HANDLER = 'build_meta_nonlinear_dataset_index.main';
 
 -- Step 3b: Benchmark manifest metadata index
 -- BENCHMARK_DATASET_INDEX is rebuilt by prepare_benchmark_datasets() from
@@ -474,6 +490,36 @@ CREATE OR REPLACE PROCEDURE run_pretrain_pipeline(
   IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
   HANDLER = 'run_pretrain_job.run_pretrain_pipeline_model_gate';
 
+-- Nonlinear pretrain: writes pretrain_nonlinear_meta.pt with use_latent_ridge_expert=True.
+-- Zero-arg form uses env-var defaults; TRAINING_DATA_FAMILY is hardcoded to
+-- synthetic_regression_nonlinear regardless of env vars.
+CREATE OR REPLACE PROCEDURE run_pretrain_pipeline_nonlinear()
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_nonlinear';
+
+-- Three-arg form: MODEL_FAMILY, TRAINING_DATA_FAMILY, MODEL_DESIGN_PATTERN.
+-- TRAINING_DATA_FAMILY must equal 'synthetic_regression_nonlinear'; raises ValueError otherwise.
+--   CALL run_pretrain_pipeline_nonlinear(
+--       'market_exchangeable_icl',
+--       'synthetic_regression_nonlinear',
+--       'inductive_forecasting'
+--   );
+CREATE OR REPLACE PROCEDURE run_pretrain_pipeline_nonlinear(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_pretrain_job.py')
+  HANDLER = 'run_pretrain_job.run_pretrain_pipeline_nonlinear_model';
+
 -- run_hpo_pipeline() launches hpo.py on the GPU pool using Ray Tune for distributed HPO.
 -- Sweep-specific outputs: best_config_ridge_residual.json, best_config_architecture.json.
 -- Merged output (written by architecture sweep): best_config.json.
@@ -580,6 +626,35 @@ CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
   PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
   IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
   HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep_with_baseline';
+
+-- Six-arg overload: adds HPO_PRETRAIN_CHECKPOINT_STAGE_PATH for nonlinear warm-start.
+-- HPO_PRETRAIN_CHECKPOINT_STAGE_PATH is passed into env_vars so hpo.py can load
+-- pretrain_nonlinear_meta.pt as the warm-start checkpoint for nonlinear_meta sweeps.
+-- Pass '' for linear sweeps.
+--
+-- Nonlinear HPO (recommended):
+--   CALL run_hpo_pipeline(
+--       'market_exchangeable_icl',
+--       'synthetic_regression_nonlinear',
+--       'inductive_forecasting',
+--       'nonlinear_meta',
+--       '',
+--       '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+--   );
+CREATE OR REPLACE PROCEDURE run_hpo_pipeline(
+  MODEL_FAMILY STRING,
+  TRAINING_DATA_FAMILY STRING,
+  MODEL_DESIGN_PATTERN STRING,
+  HPO_SWEEP_MODE STRING,
+  HPO_BASELINE_CONFIG_STAGE_PATH STRING,
+  HPO_PRETRAIN_CHECKPOINT_STAGE_PATH STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = ('@MODEL_STAGE/scripts/run_hpo_job.py')
+  HANDLER = 'run_hpo_job.run_hpo_pipeline_model_sweep_with_baseline_and_pretrain';
 
 -- run_model_training() reads @MODEL_STAGE/hpo/best_config.json, passes it to
 -- train.py as BEST_CONFIG, and produces @MODEL_STAGE/checkpoints/best.pt.
@@ -1761,7 +1836,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
 -- Coordinator topology: 6 coordinators + 24 workers = 30 containers.
 -- Each coordinator merges Ray head (--num-cpus=0) + AutoGluon driver in one container.
 -- Only the 24 worker containers are schedulable AutoGluon workers; coordinators are downsized.
--- Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 4 CPU, 16Gi memory.
+-- Default resources: coordinator 1/2 CPU, 4Gi/8Gi memory; worker 1 CPU, 8Gi/16Gi memory.
 -- Override with SYNREG_SPCS_RAY_COORDINATOR_*, SYNREG_SPCS_RAY_WORKER_*,
 -- SYNREG_SPCS_SINGLE_NODE_*, or explicit
 -- *_CPU_REQUEST/*_CPU_LIMIT/*_MEMORY_REQUEST/*_MEMORY_LIMIT suffixes.
@@ -1887,7 +1962,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
 --   6, 4, 6,
 --   300, 10  -- RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS
 -- );
--- Worker-access probe (verifies compact item dict transfer and scoped_file_url access):
+-- Worker-access probe (verifies compact item dict transfer and driver_presigned_url access):
 -- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
 --   '2.5.0-py311', '2.5.0-py311',
 --   6, 4, 6

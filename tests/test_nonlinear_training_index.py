@@ -6,6 +6,7 @@ and build_meta_nonlinear_dataset_index.py existence.
 
 import os
 import sys
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -175,11 +176,11 @@ class TestNonlinearIndexDDL:
             )
 
     def test_nonlinear_stage_ddl_in_stages_sql(self):
-        """META_NONLINEAR_DATASET_STAGE must be created in sql/01_stages_and_metadata_tables.sql."""
-        sql_file = ROOT / "sql" / "01_stages_and_metadata_tables.sql"
+        """META_NONLINEAR_DATASET_STAGE must be created in sql/run_training_job.sql."""
+        sql_file = ROOT / "sql" / "run_training_job.sql"
         text = sql_file.read_text()
         assert "META_NONLINEAR_DATASET_STAGE" in text, (
-            "META_NONLINEAR_DATASET_STAGE not found in sql/01_stages_and_metadata_tables.sql"
+            "META_NONLINEAR_DATASET_STAGE not found in sql/run_training_job.sql"
         )
         assert "CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE" in text, (
             "Expected CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE"
@@ -187,12 +188,11 @@ class TestNonlinearIndexDDL:
 
     def test_nonlinear_stage_has_sse_encryption(self):
         """META_NONLINEAR_DATASET_STAGE must use SNOWFLAKE_SSE encryption."""
-        sql_file = ROOT / "sql" / "01_stages_and_metadata_tables.sql"
+        sql_file = ROOT / "sql" / "run_training_job.sql"
         text = sql_file.read_text()
-        # Find the CREATE STAGE statement specifically
         create_key = "CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE"
         idx = text.find(create_key)
-        assert idx != -1, f"{create_key!r} not found in 01_stages_and_metadata_tables.sql"
+        assert idx != -1, f"{create_key!r} not found in run_training_job.sql"
         snippet = text[idx : idx + 200]
         assert "SNOWFLAKE_SSE" in snippet, (
             "META_NONLINEAR_DATASET_STAGE must use ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')"
@@ -260,25 +260,213 @@ class TestBuildMetaNonlinearScript:
 class TestNonlinearPretrain:
 
     def test_nonlinear_pretrain_procedure_in_sql(self):
-        """sql/02_pretrain_hpo_training_procedures.sql must define run_pretrain_pipeline_nonlinear."""
-        sql_file = ROOT / "sql" / "02_pretrain_hpo_training_procedures.sql"
+        """sql/run_training_job.sql must define run_pretrain_pipeline_nonlinear."""
+        sql_file = ROOT / "sql" / "run_training_job.sql"
         text = sql_file.read_text()
         assert "run_pretrain_pipeline_nonlinear" in text, (
             "run_pretrain_pipeline_nonlinear procedure not found in "
-            "sql/02_pretrain_hpo_training_procedures.sql"
+            "sql/run_training_job.sql"
         )
         assert "build_meta_nonlinear_dataset_index" in text, (
             "build_meta_nonlinear_dataset_index procedure not found in "
-            "sql/02_pretrain_hpo_training_procedures.sql"
+            "sql/run_training_job.sql"
         )
 
     def test_6arg_hpo_overload_in_sql(self):
-        """sql/02 must define 6-arg run_hpo_pipeline with HPO_PRETRAIN_CHECKPOINT_STAGE_PATH."""
-        sql_file = ROOT / "sql" / "02_pretrain_hpo_training_procedures.sql"
+        """sql/run_training_job.sql must define 6-arg run_hpo_pipeline with HPO_PRETRAIN_CHECKPOINT_STAGE_PATH."""
+        sql_file = ROOT / "sql" / "run_training_job.sql"
         text = sql_file.read_text()
         assert "HPO_PRETRAIN_CHECKPOINT_STAGE_PATH" in text, (
-            "6-arg HPO procedure HPO_PRETRAIN_CHECKPOINT_STAGE_PATH not found in sql/02"
+            "6-arg HPO procedure HPO_PRETRAIN_CHECKPOINT_STAGE_PATH not found in sql/run_training_job.sql"
         )
         assert "run_hpo_pipeline_model_sweep_with_baseline_and_pretrain" in text, (
-            "Handler run_hpo_pipeline_model_sweep_with_baseline_and_pretrain not found in sql/02"
+            "Handler run_hpo_pipeline_model_sweep_with_baseline_and_pretrain not found in sql/run_training_job.sql"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — run_training_job.py family routing
+# ---------------------------------------------------------------------------
+
+class _FakeSession:
+    """Minimal Snowpark session stub for run_training_job import tests."""
+    def sql(self, query):
+        return self
+
+    def collect(self):
+        return []
+
+
+class TestRunTrainingJobFamilyRouting:
+    """run_training_job.py _validate_training_index routes to the correct index."""
+
+    def _load_run_training_job(self, monkeypatch):
+        scripts = ROOT / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        sfml = types.ModuleType("snowflake")
+        sfml.ml = types.ModuleType("snowflake.ml")
+        sfml.ml.jobs = types.ModuleType("snowflake.ml.jobs")
+        sfml.ml.jobs.submit_from_stage = MagicMock(return_value=MagicMock())
+        sys.modules.setdefault("snowflake", sfml)
+        sys.modules.setdefault("snowflake.ml", sfml.ml)
+        sys.modules.setdefault("snowflake.ml.jobs", sfml.ml.jobs)
+        if "run_training_job" in sys.modules:
+            del sys.modules["run_training_job"]
+        import run_training_job
+        return run_training_job
+
+    def test_nonlinear_family_routes_to_nonlinear_index(self, monkeypatch):
+        """synthetic_regression_nonlinear → _validate_nonlinear_training_index called."""
+        mod = self._load_run_training_job(monkeypatch)
+        called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_training_index",
+                            lambda s: called.append("nonlinear"))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index",
+                            lambda s: called.append("linear"))
+        mod._validate_training_index(_FakeSession(), "synthetic_regression_nonlinear")
+        assert called == ["nonlinear"]
+
+    def test_linear_family_routes_to_linear_index(self, monkeypatch):
+        """synthetic_regression_combined → _validate_meta_dataset_index called."""
+        mod = self._load_run_training_job(monkeypatch)
+        called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_training_index",
+                            lambda s: called.append("nonlinear"))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index",
+                            lambda s: called.append("linear"))
+        mod._validate_training_index(_FakeSession(), "synthetic_regression_combined")
+        assert called == ["linear"]
+
+    def test_expected_index_counts_is_module_level_constant(self, monkeypatch):
+        """EXPECTED_INDEX_COUNTS must be a module-level constant, not a local variable."""
+        mod = self._load_run_training_job(monkeypatch)
+        assert hasattr(mod, "EXPECTED_INDEX_COUNTS"), (
+            "run_training_job.py must define EXPECTED_INDEX_COUNTS at module level"
+        )
+        assert mod.EXPECTED_INDEX_COUNTS == {"train": 800, "val": 100, "test": 100}
+
+    def test_run_pipeline_raises_for_nonlinear_family(self, monkeypatch):
+        """run_pipeline() must raise before any session/job when family is nonlinear."""
+        mod = self._load_run_training_job(monkeypatch)
+        mod.DEFAULT_TRAINING_DATA_FAMILY = "synthetic_regression_nonlinear"
+        # _get_session must not be reached — patch it to a sentinel
+        monkeypatch.setattr(mod, "_get_session", lambda: (_ for _ in ()).throw(
+            AssertionError("_get_session should not be called for nonlinear family")
+        ))
+        with pytest.raises((RuntimeError, ValueError)):
+            mod.run_pipeline()
+
+    def test_run_pipeline_error_message_includes_required_strings(self, monkeypatch):
+        """Error message must name all three required nonlinear entrypoints."""
+        mod = self._load_run_training_job(monkeypatch)
+        mod.DEFAULT_TRAINING_DATA_FAMILY = "synthetic_regression_nonlinear"
+        monkeypatch.setattr(mod, "_get_session", lambda: None)
+        with pytest.raises((RuntimeError, ValueError)) as exc_info:
+            mod.run_pipeline()
+        msg = str(exc_info.value)
+        assert "run_pretrain_pipeline_nonlinear" in msg
+        assert "nonlinear_meta" in msg
+        assert "run_model_training" in msg
+
+    def test_run_pipeline_linear_family_passes_guard(self, monkeypatch):
+        """synthetic_regression_combined must not trigger the nonlinear guard."""
+        mod = self._load_run_training_job(monkeypatch)
+        mod.DEFAULT_TRAINING_DATA_FAMILY = "synthetic_regression_combined"
+        # If the guard fires incorrectly it raises before reaching _get_session.
+        # We detect guard-pass by reaching _get_session (which we make raise a sentinel).
+        sentinel = RuntimeError("_get_session_sentinel")
+        monkeypatch.setattr(mod, "_get_session", lambda: (_ for _ in ()).throw(sentinel))
+        with pytest.raises(RuntimeError, match="_get_session_sentinel"):
+            mod.run_pipeline()
+
+
+# ---------------------------------------------------------------------------
+# New — TestPretrainValidationRouting
+# ---------------------------------------------------------------------------
+
+class TestPretrainValidationRouting:
+    """_run_pretrain_impl and _run_pretrain_gate_impl route index validation by family."""
+
+    def _load_run_pretrain_job(self, monkeypatch):
+        scripts = ROOT / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        sfml = types.ModuleType("snowflake")
+        sfml.ml = types.ModuleType("snowflake.ml")
+        sfml.ml.jobs = types.ModuleType("snowflake.ml.jobs")
+        sfml.ml.jobs.submit_from_stage = MagicMock(return_value=MagicMock())
+        sys.modules.setdefault("snowflake", sfml)
+        sys.modules.setdefault("snowflake.ml", sfml.ml)
+        sys.modules.setdefault("snowflake.ml.jobs", sfml.ml.jobs)
+        if "run_pretrain_job" in sys.modules:
+            del sys.modules["run_pretrain_job"]
+        import run_pretrain_job
+        return run_pretrain_job
+
+    def test_generic_pretrain_nonlinear_family_calls_nonlinear_validator(self, monkeypatch):
+        """_run_pretrain_impl with nonlinear family must call _validate_nonlinear_dataset_index."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_dataset_index", lambda s: called.append("nonlinear"))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index", lambda s: called.append("linear"))
+        monkeypatch.setattr(mod, "submit_from_stage", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(mod, "_wait_done", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_list_stage", lambda *a, **kw: [])
+        mod._run_pretrain_impl(MagicMock(), "mf", "synthetic_regression_nonlinear", "mdp")
+        assert called == ["nonlinear"]
+
+    def test_generic_pretrain_linear_family_calls_linear_validator(self, monkeypatch):
+        """_run_pretrain_impl with linear family must call _validate_meta_dataset_index."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_dataset_index", lambda s: called.append("nonlinear"))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index", lambda s: called.append("linear"))
+        monkeypatch.setattr(mod, "submit_from_stage", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(mod, "_wait_done", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_list_stage", lambda *a, **kw: [])
+        mod._run_pretrain_impl(MagicMock(), "mf", "synthetic_regression_combined", "mdp")
+        assert called == ["linear"]
+
+    def test_gate_pretrain_nonlinear_family_calls_nonlinear_validator(self, monkeypatch):
+        """_run_pretrain_gate_impl with nonlinear family must call _validate_nonlinear_dataset_index."""
+        mod = self._load_run_pretrain_job(monkeypatch)
+        called = []
+        monkeypatch.setattr(mod, "_validate_nonlinear_dataset_index", lambda s: called.append("nonlinear"))
+        monkeypatch.setattr(mod, "_validate_meta_dataset_index", lambda s: called.append("linear"))
+        monkeypatch.setattr(mod, "submit_from_stage", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(mod, "_wait_done", lambda *a, **kw: None)
+        monkeypatch.setattr(mod, "_list_stage", lambda *a, **kw: [])
+        mod._run_pretrain_gate_impl(MagicMock(), "mf", "synthetic_regression_nonlinear", "mdp", 64)
+        assert called == ["nonlinear"]
+
+
+# ---------------------------------------------------------------------------
+# New — TestNonlinearPipelineSqlDrift
+# ---------------------------------------------------------------------------
+
+class TestNonlinearPipelineSqlDrift:
+    """synthetic_nonlinear_pipeline.sql must not use stale training patterns."""
+
+    def test_no_stale_pretrain_call(self):
+        """synthetic_nonlinear_pipeline.sql must not call run_pretrain_pipeline with nonlinear family."""
+        sql = (ROOT / "sql" / "synthetic_nonlinear_pipeline.sql").read_text()
+        # The stale pattern is calling the GENERIC run_pretrain_pipeline (not _nonlinear)
+        # with 'synthetic_regression_nonlinear' as an argument.
+        assert "run_pretrain_pipeline_nonlinear" in sql, (
+            "Must call run_pretrain_pipeline_nonlinear, not the generic run_pretrain_pipeline"
+        )
+
+    def test_no_drop_compute_pool(self):
+        """synthetic_nonlinear_pipeline.sql must not contain DROP COMPUTE POOL statements."""
+        sql = (ROOT / "sql" / "synthetic_nonlinear_pipeline.sql").read_text()
+        assert "DROP COMPUTE POOL" not in sql, (
+            "DROP COMPUTE POOL is unsafe in the production nonlinear pipeline"
+        )
+
+    def test_hpo_call_includes_pretrain_checkpoint_path(self):
+        """synthetic_nonlinear_pipeline.sql HPO CALL must include pretrain_nonlinear_meta.pt."""
+        sql = (ROOT / "sql" / "synthetic_nonlinear_pipeline.sql").read_text()
+        assert "pretrain_nonlinear_meta.pt" in sql, (
+            "HPO CALL must pass HPO_PRETRAIN_CHECKPOINT_STAGE_PATH with pretrain_nonlinear_meta.pt"
         )

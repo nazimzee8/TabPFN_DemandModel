@@ -15,11 +15,10 @@ import hpo  # noqa: E402
 from model import ModelConfig  # noqa: E402
 
 
-def test_hpo_accepts_nonlinear_modes(monkeypatch):
-    for mode in ("nonlinear_meta", "nonlinear_architecture"):
-        monkeypatch.setenv("HPO_SWEEP_MODE", mode)
-        importlib.reload(hpo)
-        assert hpo.HPO_SWEEP_MODE == mode
+def test_hpo_accepts_nonlinear_meta_mode(monkeypatch):
+    monkeypatch.setenv("HPO_SWEEP_MODE", "nonlinear_meta")
+    importlib.reload(hpo)
+    assert hpo.HPO_SWEEP_MODE == "nonlinear_meta"
     monkeypatch.delenv("HPO_SWEEP_MODE", raising=False)
     importlib.reload(hpo)
 
@@ -53,46 +52,25 @@ def test_nonlinear_meta_search_space_has_required_fields(monkeypatch):
     importlib.reload(hpo)
 
 
-def test_nonlinear_architecture_requires_baseline(monkeypatch):
-    pytest.importorskip("ray")
-    import ray.tune as tune
-
+def test_nonlinear_architecture_mode_is_rejected(monkeypatch):
+    """nonlinear_architecture mode has been removed; reloading hpo with it must raise ValueError."""
     monkeypatch.setenv("HPO_SWEEP_MODE", "nonlinear_architecture")
-    importlib.reload(hpo)
-    with pytest.raises(ValueError, match="HPO_BASELINE_CONFIG_STAGE_PATH"):
-        hpo.build_hpo_search_space(tune, baseline_config=None)
+    with pytest.raises(ValueError, match="HPO_SWEEP_MODE"):
+        importlib.reload(hpo)
     monkeypatch.delenv("HPO_SWEEP_MODE", raising=False)
     importlib.reload(hpo)
 
 
-def test_nonlinear_architecture_search_space_uses_baseline(monkeypatch):
+def test_nonlinear_meta_search_space_tunes_latent_ridge_dim(monkeypatch):
+    """nonlinear_meta now tunes latent_ridge_dim in {32, 64, 128} without requiring a baseline."""
     pytest.importorskip("ray")
     import ray.tune as tune
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "nonlinear_architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "nonlinear_meta")
     importlib.reload(hpo)
-    baseline = {
-        "lr": 1e-3,
-        "weight_decay": 1e-4,
-        "dropout": 0.1,
-        "use_ridge_expert": False,
-        "ridge_lambda": 1.0,
-        "gate_hidden_dim": 64,
-        "latent_ridge_lambda": 0.25,
-        "latent_ridge_jitter": 1e-6,
-        "latent_ridge_use_bias": True,
-        "query_context_heads": 4,
-        "ridge_mixture_mode": "convex",
-        "nonlinear_head_hidden_mult": 2,
-        "use_huber": False,
-        "huber_delta": 1.0,
-        "lambda_l1": 0.0,
-    }
-    space = hpo.build_hpo_search_space(tune, baseline_config=baseline)
-    assert space["lr"] == pytest.approx(baseline["lr"])
-    assert space["latent_ridge_lambda"] == pytest.approx(0.25)
-    assert "latent_ridge_dim" in space and not isinstance(space["latent_ridge_dim"], int)
-    assert "d_phi" in space and not isinstance(space["d_phi"], int)
+    space = hpo.build_hpo_search_space(tune)
+    assert "latent_ridge_dim" in space
+    assert not isinstance(space["latent_ridge_dim"], int), "latent_ridge_dim should be a tune.choice"
     monkeypatch.delenv("HPO_SWEEP_MODE", raising=False)
     importlib.reload(hpo)
 

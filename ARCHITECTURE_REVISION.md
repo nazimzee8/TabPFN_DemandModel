@@ -1930,8 +1930,8 @@ This fix also applies to the capacity probe and worker access probe DNS derivati
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SPCS_RAY_HEAD_DNS_SUFFIX` | `""` | Domain suffix for coordinator DNS (e.g. `myschema.mydb.snowflakecomputing.internal`) |
-| `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES` | `500000000` | Ray object store cap for coordinator (~500 MB) |
-| `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` | `2000000000` | Ray object store cap for workers (~2 GB) |
+| `SYNREG_SPCS_RAY_COORDINATOR_OBJECT_STORE_MEMORY_BYTES` | `268435456` | Ray object store cap for coordinator (256 MiB) |
+| `SYNREG_SPCS_RAY_WORKER_OBJECT_STORE_MEMORY_BYTES` | `268435456` | Ray object store cap for workers (256 MiB) |
 | `SYNREG_SPCS_RAY_COORDINATOR_CPU_REQUEST` | `1` | CPU request for coordinator container |
 | `SYNREG_SPCS_RAY_COORDINATOR_CPU_LIMIT` | `2` | CPU limit for coordinator container |
 | `SYNREG_SPCS_RAY_COORDINATOR_MEMORY_REQUEST` | `4Gi` | Memory request for coordinator container |

@@ -1,0 +1,172 @@
+{
+  "status": "success",
+  "created_at_utc": "2026-06-03T19:43:38.999013+00:00",
+  "stage": "EVALUATION_RESULTS_STAGE",
+  "input_shards": [
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard0_of_6_detailed.csv",
+      "size_bytes": 138508
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard0_of_8_detailed.csv",
+      "size_bytes": 102760
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard1_of_6_detailed.csv",
+      "size_bytes": 137921
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard2_of_6_detailed.csv",
+      "size_bytes": 137538
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard3_of_6_detailed.csv",
+      "size_bytes": 137956
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard4_of_6_detailed.csv",
+      "size_bytes": 138156
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/AutoGluon_shard5_of_6_detailed.csv",
+      "size_bytes": 137571
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard0_of_10_detailed.csv",
+      "size_bytes": 63949
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard1_of_10_detailed.csv",
+      "size_bytes": 63758
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard2_of_10_detailed.csv",
+      "size_bytes": 63903
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard3_of_10_detailed.csv",
+      "size_bytes": 63658
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard4_of_10_detailed.csv",
+      "size_bytes": 63530
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard5_of_10_detailed.csv",
+      "size_bytes": 63197
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard6_of_10_detailed.csv",
+      "size_bytes": 63614
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard7_of_10_detailed.csv",
+      "size_bytes": 63991
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard8_of_10_detailed.csv",
+      "size_bytes": 64119
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/MODEL3-ICL-MC_shard9_of_10_detailed.csv",
+      "size_bytes": 64182
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard0_of_10_detailed.csv",
+      "size_bytes": 611836
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard1_of_10_detailed.csv",
+      "size_bytes": 611780
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard2_of_10_detailed.csv",
+      "size_bytes": 613697
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard3_of_10_detailed.csv",
+      "size_bytes": 614274
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard4_of_10_detailed.csv",
+      "size_bytes": 618338
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard5_of_10_detailed.csv",
+      "size_bytes": 610284
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard6_of_10_detailed.csv",
+      "size_bytes": 615789
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard7_of_10_detailed.csv",
+      "size_bytes": 610057
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard8_of_10_detailed.csv",
+      "size_bytes": 612782
+    },
+    {
+      "name": "evaluation_results_stage/regression/linear_all_v1/baselines_shard9_of_10_detailed.csv",
+      "size_bytes": 618319
+    }
+  ],
+  "outputs": [
+    {
+      "name": "synthetic_regression_model_comparison.csv",
+      "size_bytes": 9552645,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_model_comparison_summary.csv",
+      "size_bytes": 7613,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_regime.csv",
+      "size_bytes": 24858,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_model_rank.csv",
+      "size_bytes": 176741,
+      "written": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_feature_noise.csv",
+      "size_bytes": 20719,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_training_size.csv",
+      "size_bytes": 374550,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_summary_by_regime_n_train_p.csv",
+      "size_bytes": 706244,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_noise_features.csv",
+      "size_bytes": 12224,
+      "written": true,
+      "conditional": true
+    },
+    {
+      "name": "synthetic_regression_chart_data_training_size.csv",
+      "size_bytes": 394355,
+      "written": true,
+      "conditional": true
+    }
+  ],
+  "validation": {
+    "required_columns_present": true,
+    "empty_inputs_detected": false,
+    "empty_outputs_detected": false
+  }
+}

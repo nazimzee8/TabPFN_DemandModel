@@ -391,7 +391,7 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_autogluon_import_timing_pro
 --   6, 4, 6,
 --   300, 10  -- RAY_READY_TIMEOUT_SECONDS, RAY_READY_POLL_SECONDS
 -- );
--- Worker-access probe (verifies compact item dict transfer and scoped_file_url access):
+-- Worker-access probe (verifies compact item dict transfer and driver_presigned_url access):
 -- CALL run_synthetic_regression_combined_autogluon_worker_access_probe(
 --   '2.5.0-py311', '2.5.0-py311',
 --   6, 4, 6
