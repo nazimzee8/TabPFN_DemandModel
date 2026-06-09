@@ -128,6 +128,60 @@ def predict_autogluon_timed(
             shutil.rmtree(model_dir, ignore_errors=True)
 
 
+def predict_autogluon_classification_timed(
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    *,
+    time_limit=300,
+    presets="best_quality",
+    num_cpus=1,
+    num_gpus=0,
+    verbosity=0,
+    model_dir=None,
+    cleanup=True,
+    predictor_cls=None,
+):
+    """Fit an AutoGluon classifier and return (class probabilities, fit time, predict time)."""
+    TabularPredictor = predictor_cls or get_tabular_predictor_class()
+    train_df, test_df = make_autogluon_dataframes(X_train_np, y_train_np, X_test_np)
+    if model_dir is None:
+        model_dir = tempfile.mkdtemp(prefix="autogluon_classification_", dir="/tmp")
+    else:
+        os.makedirs(model_dir, exist_ok=True)
+
+    try:
+        problem_type = "binary" if len(pd.unique(y_train_np)) == 2 else "multiclass"
+        predictor = TabularPredictor(
+            label="target",
+            path=model_dir,
+            problem_type=problem_type,
+            eval_metric="log_loss",
+            verbosity=verbosity,
+        )
+        fit_start = time.perf_counter()
+        predictor.fit(
+            train_df,
+            presets=presets,
+            time_limit=time_limit,
+            num_cpus=num_cpus,
+            num_gpus=num_gpus,
+            verbosity=verbosity,
+        )
+        fit_time_s = time.perf_counter() - fit_start
+        predict_start = time.perf_counter()
+        probabilities = predictor.predict_proba(test_df)
+        predict_time_s = time.perf_counter() - predict_start
+        if hasattr(probabilities, "to_numpy"):
+            probability_values = probabilities.to_numpy()
+        else:
+            probability_values = probabilities.values
+        return probability_values, fit_time_s, predict_time_s
+    finally:
+        if cleanup:
+            shutil.rmtree(model_dir, ignore_errors=True)
+
+
 def make_unique_autogluon_model_dir(item_meta=None, *, base_dir=None, prefix="ag_ray"):
     """Create a unique temporary model directory with human-readable context."""
     item_meta = item_meta or {}

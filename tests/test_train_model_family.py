@@ -37,11 +37,15 @@ def test_env_model_family_overrides_default(monkeypatch):
     importlib.reload(train)
 
 
-def test_training_data_family_constant_exists():
+def test_training_data_family_constant_exists(monkeypatch):
     """TRAINING_DATA_FAMILY constant exists and defaults to 'unknown'."""
+    monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
+    import importlib
     import train
+    importlib.reload(train)
     assert hasattr(train, "TRAINING_DATA_FAMILY")
     assert train.TRAINING_DATA_FAMILY == "unknown"
+    importlib.reload(train)
 
 
 def test_training_data_family_from_env(monkeypatch):
@@ -194,12 +198,14 @@ def test_check_train_val_gap_fallback_to_legacy_keys():
 # TRAINING_DATA_FAMILY validation tests
 # ---------------------------------------------------------------------------
 
-def test_training_data_family_defaults_to_unknown():
+def test_training_data_family_defaults_to_unknown(monkeypatch):
     """TRAINING_DATA_FAMILY defaults to 'unknown' when env var absent."""
+    monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
     import importlib
     import train
     importlib.reload(train)
     assert train.TRAINING_DATA_FAMILY == "unknown"
+    importlib.reload(train)
 
 
 def test_training_data_family_valid_values_accepted(monkeypatch):
@@ -207,6 +213,7 @@ def test_training_data_family_valid_values_accepted(monkeypatch):
     import importlib
     import train
     valid_values = [
+        "synthetic_linear_regression",
         "synthetic_regression_primary",
         "synthetic_regression_ood",
         "synthetic_regression_combined",

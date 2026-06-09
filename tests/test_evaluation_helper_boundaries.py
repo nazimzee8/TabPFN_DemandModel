@@ -9,21 +9,24 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 SRC_DIR = ROOT / "src"
+SCRIPTS_DIR = ROOT / "scripts"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 def test_synthetic_regression_entrypoint_does_not_import_evaluate():
-    src = (SRC_DIR / "evaluate_synthetic_regression.py").read_text()
+    src = (SCRIPTS_DIR / "evaluate_linear_regression.py").read_text()
 
     assert "from evaluate import" not in src
     assert "import evaluate" not in src
 
 
 def test_synthetic_regression_imports_when_evaluate_is_blocked(monkeypatch):
-    original_synreg = sys.modules.get("evaluate_synthetic_regression")
+    original_synreg = sys.modules.get("evaluate_linear_regression")
     original_evaluate = sys.modules.get("evaluate")
-    sys.modules.pop("evaluate_synthetic_regression", None)
+    sys.modules.pop("evaluate_linear_regression", None)
     sys.modules.pop("evaluate", None)
     real_import = builtins.__import__
 
@@ -34,15 +37,15 @@ def test_synthetic_regression_imports_when_evaluate_is_blocked(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", block_evaluate)
     try:
-        module = importlib.import_module("evaluate_synthetic_regression")
+        module = importlib.import_module("evaluate_linear_regression")
 
-        assert module._instantiate_model is not None
-        assert module.ModelConfig is not None
+        assert module.validate_checkpoint_payload is not None
+        assert module.load_best_deepset_checkpoint is not None
     finally:
-        sys.modules.pop("evaluate_synthetic_regression", None)
+        sys.modules.pop("evaluate_linear_regression", None)
         sys.modules.pop("evaluate", None)
         if original_synreg is not None:
-            sys.modules["evaluate_synthetic_regression"] = original_synreg
+            sys.modules["evaluate_linear_regression"] = original_synreg
         if original_evaluate is not None:
             sys.modules["evaluate"] = original_evaluate
 

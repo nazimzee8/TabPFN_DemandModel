@@ -11,7 +11,7 @@ the details in each section.
 | Pretrain | `train.py` | `CALL run_pretrain_pipeline()` | `@MODEL_STAGE/checkpoints/pretrain.pt` |
 | HPO | `hpo.py` | `CALL run_hpo_pipeline()` | `@MODEL_STAGE/hpo/best_config.json` |
 | Final training | `train.py` | `CALL run_model_training()` | `@MODEL_STAGE/checkpoints/best.pt` |
-| Benchmark prep | `prepare_benchmark_datasets.py` | `CALL prepare_benchmark_datasets()` | `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` |
+| Benchmark prep | `prepare_benchmark_datasets.py` | `CALL prepare_benchmark_datasets()` | `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` |
 | Evaluation | `evaluate.py` | `CALL run_evaluation_pipeline()` | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` |
 | Full pipeline | Pretrain → HPO → Final | `CALL run_training_pipeline()` | same as above |
 
@@ -59,8 +59,8 @@ CALL run_evaluation_pipeline();   -- runs prep + shards + aggregate internally
 **Run benchmark prep manually (optional — run_evaluation_pipeline calls it automatically):**
 ```sql
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/;
-SELECT $1 FROM @META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json (FILE_FORMAT => (TYPE=JSON));
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
+SELECT $1 FROM @META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json (FILE_FORMAT => (TYPE=JSON));
 CALL run_evaluation_pipeline();
 ```
 
@@ -72,7 +72,7 @@ CALL run_training_pipeline();
 **Kaggle data download (one-off setup):**
 ```sql
 CALL download_kaggle_to_stage();
-LIST @META_DATASET_STAGE/kaggle/;
+LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 ```
 
 ---
@@ -102,11 +102,11 @@ LIST @META_DATASET_STAGE/kaggle/;
 
 | Stage | Contents |
 |---|---|
-| `@META_DATASET_STAGE/train/` | Training parquet files |
-| `@META_DATASET_STAGE/val/` | Validation parquet files |
-| `@META_DATASET_STAGE/test/` | Test parquet files |
-| `@META_DATASET_STAGE/kaggle/` | Kaggle .npz benchmark datasets |
-| `@META_DATASET_STAGE/benchmark_prepared/` | `benchmark_manifest.json` + prepared `.npz` files for all benchmark datasets |
+| `@META_REGRESSION_DATASET_STAGE/train/` | Training parquet files |
+| `@META_REGRESSION_DATASET_STAGE/val/` | Validation parquet files |
+| `@META_REGRESSION_DATASET_STAGE/test/` | Test parquet files |
+| `@META_REGRESSION_DATASET_STAGE/kaggle/` | Kaggle .npz benchmark datasets |
+| `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/` | `benchmark_manifest.json` + prepared `.npz` files for all benchmark datasets |
 | `@MODEL_STAGE/scripts/` | All `src/*.py` + `scripts/*.py` (job entrypoints) |
 | `@MODEL_STAGE/hpo/` | `best_config.json` (or `hpo_failure.json`) |
 | `@MODEL_STAGE/checkpoints/` | `best.pt` |
@@ -127,7 +127,7 @@ PUT file://C:/Documents/TabPFN_DemandModel/src/*.py @EPOCH_STAGE/ AUTO_COMPRESS=
 
 ## 5b. Data Loading Architecture (Train Jobs)
 
-Training shards `META_DATASET_INDEX` directly by DDP `rank` and `world_size` in SQL.
+Training shards `META_REGRESSION_DATASET_INDEX` directly by DDP `rank` and `world_size` in SQL.
 `ShardedDataConnector` is NOT the production training path; it is only used in
 `train_epoch_test.py` for epoch calibration.
 
@@ -218,7 +218,7 @@ GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';
 |---|---|---|
 | `RuntimeError: 517003` | `scale_cluster()` called inside MLJob | Removed from `hpo.py`; never add it back. Set `target_instances` at submission time. |
 | `CUDA out of memory` | Batch too large or model too wide | Reduce `d_phi`/`d_rho`, lower `max_concurrent_trials` to 1, or switch to GPU_NV_L. |
-| `FileNotFoundError: DATA_DIR` | Stage materialization failed | Check for rank-sharded row errors. `LIST @META_DATASET_STAGE/train/`. Verify `META_DATASET_INDEX` is populated. |
+| `FileNotFoundError: DATA_DIR` | Stage materialization failed | Check for rank-sharded row errors. `LIST @META_REGRESSION_DATASET_STAGE/train/`. Verify `META_REGRESSION_DATASET_INDEX` is populated. |
 | `RuntimeError: World-size mismatch: expected 40 but ... reports N` | `STRICT_WORLD_SIZE_CHECK=true` and actual world_size ≠ 40 | Verify `target_instances` in `submit_from_stage()` equals `num_nodes` in `PyTorchScalingConfig` (both must be 10). Check pool has all nodes healthy. |
 | `ValueError: RANK expected, but not set` | `submit_from_stage(target_instances=N)` without `PyTorchDistributor` does not set `RANK` | Use `BENCHMARK_NUM_SHARDS` + `BENCHMARK_SHARD_INDEX` for CPU benchmarks. |
 | `NameError: train_job` | `submit_from_stage(...)` result not assigned | Assign: `train_job = submit_from_stage(...)`. |

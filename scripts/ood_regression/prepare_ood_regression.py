@@ -2,19 +2,19 @@
 prepare_ood_regression.py
 =========================
 MLJob entrypoint that indexes OOD datasets into
-SYNTHETIC_REGRESSION_DATASET_INDEX.
+LINEAR_REGRESSION_DATASET_INDEX.
 
 Reads the manifest from @EVALUATION_DATASET_STAGE/ood_parity/ood_manifest.json,
 selects the first OOD_N_DATASETS // 4 datasets per regime (deterministic), and
-inserts rows into the shared SYNTHETIC_REGRESSION_DATASET_INDEX table, isolated
+inserts rows into the shared LINEAR_REGRESSION_DATASET_INDEX table, isolated
 by suite_id = OOD_SUITE_ID.
 
 Safety invariants
 -----------------
-* Shared table SYNTHETIC_REGRESSION_DATASET_INDEX is NEVER DROPped.
+* Shared table LINEAR_REGRESSION_DATASET_INDEX is NEVER DROPped.
   _truncate_ood_index() uses DELETE WHERE suite_id = OOD_SUITE_ID only.
 * Production suite rows (suite_id != OOD_SUITE_ID) are never touched.
-* OOD data lives on @EVALUATION_DATASET_STAGE; @META_DATASET_STAGE is untouched.
+* OOD data lives on @EVALUATION_DATASET_STAGE; @META_REGRESSION_DATASET_STAGE is untouched.
 * create_synreg_index_table() is always called before _truncate_ood_index()
   to ensure the table exists before any DELETE.
 
@@ -85,7 +85,7 @@ if OOD_N_DATASETS % 4 != 0:
         "Set OOD_REGRESSION_N_DATASETS to a multiple of 4 (e.g. 80 for pilot, 200 for full suite)."
     )
 OOD_SPLIT_SEEDS = [0, 1, 2]
-OOD_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
+OOD_INDEX_TABLE = "LINEAR_REGRESSION_DATASET_INDEX"
 EVAL_STAGE_PREFIX = "@EVALUATION_DATASET_STAGE/ood_parity"
 OOD_MANIFEST_PATH = f"{EVAL_STAGE_PREFIX}/ood_manifest.json"
 OOD_LOCAL_DIR = os.getenv("OOD_REGRESSION_LOCAL_DIR", "/tmp/ood_reg_prep")
@@ -96,7 +96,7 @@ OOD_LOCAL_DIR = os.getenv("OOD_REGRESSION_LOCAL_DIR", "/tmp/ood_reg_prep")
 
 
 def _truncate_ood_index(session) -> None:
-    """Delete OOD suite rows from SYNTHETIC_REGRESSION_DATASET_INDEX.
+    """Delete OOD suite rows from LINEAR_REGRESSION_DATASET_INDEX.
 
     Uses DELETE WHERE suite_id = OOD_SUITE_ID only — never DROP TABLE.
     """
@@ -180,7 +180,7 @@ def _download_manifest(session) -> dict:
 
 
 def prepare_ood_regression(session=None) -> str:
-    """Index the OOD pilot subset into SYNTHETIC_REGRESSION_DATASET_INDEX.
+    """Index the OOD pilot subset into LINEAR_REGRESSION_DATASET_INDEX.
 
     Steps
     -----

@@ -9,7 +9,7 @@ Snowpark sessions.
 Ray mode:
   - attach to the Snowflake Ray cluster
   - validate expected node/CPU visibility
-  - load SYNTHETIC_REGRESSION_DATASET_INDEX metadata in the driver only
+  - load LINEAR_REGRESSION_DATASET_INDEX metadata in the driver only
   - pass small item dicts to Ray worker tasks
   - workers resolve the dataset_access descriptor and load one dataset locally
 
@@ -103,7 +103,7 @@ def _wait_for_ray_capacity(ray, *, expected_nodes: int, expected_cpus_min: int) 
 
 
 def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> list[dict]:
-    from evaluate_synthetic_regression import (
+    from evaluate_linear_regression import (
         assign_synthetic_regression_shard,
         build_compact_synreg_work_item,
         compact_work_items_serialized_bytes,
@@ -117,7 +117,7 @@ def _load_probe_items(*, shard_index: int, num_shards: int, max_items: int) -> l
     if not rows:
         suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "<unset>")
         raise RuntimeError(
-            "SYNTHETIC_REGRESSION_DATASET_INDEX returned zero rows for "
+            "LINEAR_REGRESSION_DATASET_INDEX returned zero rows for "
             f"suite_id={suite_id!r}."
         )
 
@@ -158,7 +158,7 @@ def _validate_item_access(item_meta: dict) -> dict:
     """Worker-side validation. Raises with clear messages on access failure."""
     import os
 
-    from evaluate_synthetic_regression import load_prepared_synthetic_dataset_from_access
+    from evaluate_linear_regression import load_prepared_synthetic_dataset_from_access
 
     dataset_access = item_meta.get("dataset_access") or {}
     access_mode = dataset_access.get("mode", "driver_presigned_url")

@@ -15,24 +15,34 @@ CPU_POOL = "DEEPSET_CPU_POOL"
 MODEL_STAGE = "@MODEL_STAGE"
 SCRIPTS_STAGE = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
-KAGGLE_STAGE = "@META_DATASET_STAGE/kaggle/"
+KAGGLE_STAGE = "@META_REGRESSION_DATASET_STAGE/kaggle/"
 TRAIN_NUM_NODES = 10
 LOCAL_TMP_DIR = tempfile.gettempdir()
 
 # Training data family — identifies the synthetic data suite used for this training run.
-# Production synthetic regression evaluation checkpoints use synthetic_regression_combined
+# Production synthetic regression evaluation checkpoints use synthetic_linear_regression
 # (combined suite linear_all_v1, which includes primary + OOD data).
 # Override via TRAINING_DATA_FAMILY env var when launching a different training mode.
 DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
-    "TRAINING_DATA_FAMILY", "synthetic_regression_combined"
+    "TRAINING_DATA_FAMILY", "synthetic_linear_regression"
 )
 
 # MODEL3 architecture selectors — propagated to all training/HPO MLJob env_vars.
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
+def _derive_split_counts(total: int) -> dict:
+    train = int(0.8 * total)
+    val = int(0.1 * total)
+    test = total - train - val
+    return {"train": train, "val": val, "test": test}
+
+
+_LINEAR_EXPECTED_TOTAL = int(os.getenv("META_REGRESSION_DATASET_EXPECTED_TOTAL", "1000"))
+_NONLINEAR_EXPECTED_TOTAL = int(os.getenv("META_NONLINEAR_REGRESSION_DATASET_EXPECTED_TOTAL", "1000"))
 # Module-level constant shared by both linear and nonlinear index validators.
-EXPECTED_INDEX_COUNTS = {"train": 800, "val": 100, "test": 100}
+EXPECTED_INDEX_COUNTS = _derive_split_counts(_LINEAR_EXPECTED_TOTAL)
+_NONLINEAR_EXPECTED_INDEX_COUNTS = _derive_split_counts(_NONLINEAR_EXPECTED_TOTAL)
 _NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
 
 
@@ -135,39 +145,62 @@ def run_kaggle_download() -> str:
     )
 
 
-def build_meta_dataset_index() -> str:
-    session = _get_session()
-    print("Submitting META_DATASET_INDEX build job ...")
+def _build_meta_regression_index_impl(
+    session, is_mixed_categorical: bool, expected_total: int
+) -> None:
+    """Submit the appropriate regression-index build MLJob and wait for completion.
+
+    Routes on *is_mixed_categorical*:
+      False → build_meta_dataset_index.py      → META_REGRESSION_DATASET_INDEX
+      True  → build_meta_mixed_regression_dataset_index.py → META_MIXED_REGRESSION_DATASET_INDEX
+    """
+    if is_mixed_categorical:
+        entrypoint = "build_meta_mixed_regression_dataset_index.py"
+        env_key    = "META_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL"
+        label      = "META_MIXED_REGRESSION_DATASET_INDEX build"
+    else:
+        entrypoint = "build_meta_dataset_index.py"
+        env_key    = "META_REGRESSION_DATASET_EXPECTED_TOTAL"
+        label      = "META_REGRESSION_DATASET_INDEX build"
+    print(f"Submitting {label} job (expected_total={expected_total}) ...")
     job = submit_from_stage(
         source=SCRIPTS_STAGE,
-        entrypoint="build_meta_dataset_index.py",
+        entrypoint=entrypoint,
         compute_pool=CPU_POOL,
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=1,
         pip_requirements=["pyarrow"],
-        env_vars={"HOME": "/tmp"},
+        env_vars={"HOME": "/tmp", env_key: str(expected_total)},
         session=session,
     )
-    _wait_done(job, "META_DATASET_INDEX build", session)
+    _wait_done(job, label, session)
 
+
+def _validate_regression_index(session, is_mixed_categorical: bool) -> str:
+    """Validate and return a summary string for the regression training index."""
+    if is_mixed_categorical:
+        counts = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_MIXED_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
+        ).collect()
+        return (
+            "META_MIXED_REGRESSION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+            + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        )
+    # Numeric regression — also validate HPO subset counts
     counts = session.sql(
-        """
-        SELECT split, COUNT(*) AS task_count
-        FROM META_DATASET_INDEX
-        GROUP BY split
-        ORDER BY split
-        """
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
     ).collect()
     subset_counts = session.sql(
         """
         WITH ranked AS (
-          SELECT
-            *,
+          SELECT *,
             ROW_NUMBER() OVER (
               PARTITION BY split, hpo_bucket
               ORDER BY prior_regime, p, n_train, task_id
             ) AS bucket_rank
-          FROM META_DATASET_INDEX
+          FROM META_REGRESSION_DATASET_INDEX
           WHERE split IN ('train', 'val')
         ),
         selected AS (
@@ -178,21 +211,18 @@ def build_meta_dataset_index() -> str:
             ORDER BY bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id
           ) <= IFF(split = 'train', 200, 40)
         )
-        SELECT split, COUNT(*) AS selected_rows
-        FROM selected
-        GROUP BY split
-        ORDER BY split
+        SELECT split, COUNT(*) AS selected_rows FROM selected GROUP BY split ORDER BY split
         """
     ).collect()
     subset_count_map = {str(row[0]): int(row[1]) for row in subset_counts}
     expected_subset_counts = {"train": 200, "val": 40}
     if subset_count_map != expected_subset_counts:
         raise ValueError(
-            "META_DATASET_INDEX HPO subset validation failed: "
+            "META_REGRESSION_DATASET_INDEX HPO subset validation failed: "
             f"expected {expected_subset_counts}, got {subset_count_map}"
         )
     return (
-        "META_DATASET_INDEX build complete.\n\n"
+        "META_REGRESSION_DATASET_INDEX build complete.\n\n"
         "Full split counts:\n"
         + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
         + "\n\nHPO subset counts:\n"
@@ -200,18 +230,344 @@ def build_meta_dataset_index() -> str:
     )
 
 
+def build_meta_dataset_index_with_flag(is_mixed_categorical: bool) -> str:
+    """Boolean-routed handler — rebuild regression training index.
+
+    is_mixed_categorical=FALSE → META_REGRESSION_DATASET_INDEX (numeric)
+    is_mixed_categorical=TRUE  → META_MIXED_REGRESSION_DATASET_INDEX (mixed-categorical)
+
+    Expected total is read from the corresponding env var default (1000).
+
+    Usage:
+        CALL build_meta_dataset_index(FALSE);
+        CALL build_meta_dataset_index(TRUE);
+    """
+    session = _get_session()
+    env_key = (
+        "META_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL"
+        if is_mixed_categorical
+        else "META_REGRESSION_DATASET_EXPECTED_TOTAL"
+    )
+    expected_total = int(os.getenv(env_key, str(_LINEAR_EXPECTED_TOTAL)))
+    _build_meta_regression_index_impl(session, is_mixed_categorical, expected_total)
+    return _validate_regression_index(session, is_mixed_categorical)
+
+
+def build_meta_dataset_index_with_flag_and_total(
+    is_mixed_categorical: bool, expected_total: int
+) -> str:
+    """Boolean-routed handler — rebuild regression training index with explicit total.
+
+    Usage:
+        CALL build_meta_dataset_index(FALSE, 1000);
+        CALL build_meta_dataset_index(TRUE, 500);
+    """
+    session = _get_session()
+    _build_meta_regression_index_impl(session, is_mixed_categorical, int(expected_total))
+    return _validate_regression_index(session, is_mixed_categorical)
+
+
+def _build_meta_classification_index_impl(
+    session, is_mixed_categorical: bool, expected_total: int
+) -> None:
+    """Submit the appropriate classification-index build MLJob and wait for completion."""
+    if is_mixed_categorical:
+        entrypoint = "build_meta_mixed_classification_dataset_index.py"
+        env_key    = "META_MIXED_CATEGORICAL_DATASET_EXPECTED_TOTAL"
+        label      = "META_MIXED_CATEGORICAL_DATASET_INDEX build"
+    else:
+        entrypoint = "build_meta_classification_dataset_index.py"
+        env_key    = "META_CLASSIFICATION_DATASET_EXPECTED_TOTAL"
+        label      = "META_CLASSIFICATION_DATASET_INDEX build"
+    print(f"Submitting {label} job (expected_total={expected_total}) ...")
+    job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint=entrypoint,
+        compute_pool=CPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        pip_requirements=["pyarrow"],
+        env_vars={"HOME": "/tmp", env_key: str(expected_total)},
+        session=session,
+    )
+    _wait_done(job, label, session)
+
+
+def _validate_classification_index(session, is_mixed_categorical: bool) -> str:
+    """Validate and return a summary string for the classification training index."""
+    if is_mixed_categorical:
+        counts = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_MIXED_CATEGORICAL_DATASET_INDEX GROUP BY split ORDER BY split"
+        ).collect()
+        return (
+            "META_MIXED_CATEGORICAL_DATASET_INDEX build complete.\n\nFull split counts:\n"
+            + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        )
+    counts = session.sql(
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_CLASSIFICATION_DATASET_INDEX GROUP BY split ORDER BY split"
+    ).collect()
+    return (
+        "META_CLASSIFICATION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+    )
+
+
+def build_meta_classification_dataset_index_with_flag(is_mixed_categorical: bool) -> str:
+    """Boolean-routed handler — rebuild classification training index.
+
+    is_mixed_categorical=FALSE → META_CLASSIFICATION_DATASET_INDEX (numeric)
+    is_mixed_categorical=TRUE  → META_MIXED_CATEGORICAL_DATASET_INDEX (mixed-categorical)
+
+    Usage:
+        CALL build_meta_classification_dataset_index(FALSE);
+        CALL build_meta_classification_dataset_index(TRUE);
+    """
+    session = _get_session()
+    env_key = (
+        "META_MIXED_CATEGORICAL_DATASET_EXPECTED_TOTAL"
+        if is_mixed_categorical
+        else "META_CLASSIFICATION_DATASET_EXPECTED_TOTAL"
+    )
+    expected_total = int(os.getenv(env_key, "1000"))
+    _build_meta_classification_index_impl(session, is_mixed_categorical, expected_total)
+    return _validate_classification_index(session, is_mixed_categorical)
+
+
+def build_meta_classification_dataset_index_with_flag_and_total(
+    is_mixed_categorical: bool, expected_total: int
+) -> str:
+    """Boolean-routed handler — rebuild classification training index with explicit total.
+
+    Usage:
+        CALL build_meta_classification_dataset_index(FALSE, 1000);
+        CALL build_meta_classification_dataset_index(TRUE, 500);
+    """
+    session = _get_session()
+    _build_meta_classification_index_impl(session, is_mixed_categorical, int(expected_total))
+    return _validate_classification_index(session, is_mixed_categorical)
+
+
+def build_meta_nonlinear_classification_dataset_index() -> str:
+    """Rebuild META_NONLINEAR_CLASSIFICATION_DATASET_INDEX using env-var defaults."""
+    session = _get_session()
+    expected_total = os.getenv("META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL", "1000")
+    print("Submitting META_NONLINEAR_CLASSIFICATION_DATASET_INDEX build job ...")
+    job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint="build_meta_nonlinear_classification_dataset_index.py",
+        compute_pool=CPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        pip_requirements=["pyarrow"],
+        env_vars={
+            "HOME": "/tmp",
+            "META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL": expected_total,
+        },
+        session=session,
+    )
+    _wait_done(job, "META_NONLINEAR_CLASSIFICATION_DATASET_INDEX build", session)
+    counts = session.sql(
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_NONLINEAR_CLASSIFICATION_DATASET_INDEX GROUP BY split ORDER BY split"
+    ).collect()
+    return (
+        "META_NONLINEAR_CLASSIFICATION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+    )
+
+
+def build_meta_nonlinear_classification_dataset_index_with_total(expected_total: int) -> str:
+    """Set the expected staged nonlinear-classification count and rebuild its metadata index."""
+    os.environ["META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL"] = str(int(expected_total))
+    return build_meta_nonlinear_classification_dataset_index()
+
+
+def _build_meta_nonlinear_regression_index_impl(
+    session, is_mixed_categorical: bool, expected_total: int
+) -> None:
+    """Submit the appropriate nonlinear-regression-index build MLJob and wait."""
+    if is_mixed_categorical:
+        entrypoint = "build_meta_nonlinear_mixed_regression_dataset_index.py"
+        env_key    = "META_NONLINEAR_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL"
+        label      = "META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX build"
+    else:
+        entrypoint = "build_meta_nonlinear_dataset_index.py"
+        env_key    = "META_NONLINEAR_REGRESSION_DATASET_EXPECTED_TOTAL"
+        label      = "META_NONLINEAR_REGRESSION_DATASET_INDEX build"
+    print(f"Submitting {label} job (expected_total={expected_total}) ...")
+    job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint=entrypoint,
+        compute_pool=CPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        pip_requirements=["pyarrow"],
+        env_vars={"HOME": "/tmp", env_key: str(expected_total)},
+        session=session,
+    )
+    _wait_done(job, label, session)
+
+
+def build_meta_nonlinear_dataset_index_with_flag(is_mixed_categorical: bool) -> str:
+    """Boolean-routed handler — rebuild nonlinear-regression training index.
+
+    is_mixed_categorical=FALSE → META_NONLINEAR_REGRESSION_DATASET_INDEX (numeric)
+    is_mixed_categorical=TRUE  → META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX (mixed-cat)
+
+    Usage:
+        CALL build_meta_nonlinear_dataset_index(FALSE);
+        CALL build_meta_nonlinear_dataset_index(TRUE);
+    """
+    session = _get_session()
+    env_key = (
+        "META_NONLINEAR_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL"
+        if is_mixed_categorical
+        else "META_NONLINEAR_REGRESSION_DATASET_EXPECTED_TOTAL"
+    )
+    expected_total = int(os.getenv(env_key, str(_NONLINEAR_EXPECTED_TOTAL)))
+    _build_meta_nonlinear_regression_index_impl(session, is_mixed_categorical, expected_total)
+    if is_mixed_categorical:
+        counts = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
+        ).collect()
+        return (
+            "META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+            + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        )
+    counts = session.sql(
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_NONLINEAR_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
+    ).collect()
+    return (
+        "META_NONLINEAR_REGRESSION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+    )
+
+
+def build_meta_nonlinear_dataset_index_with_flag_and_total(
+    is_mixed_categorical: bool, expected_total: int
+) -> str:
+    """Boolean-routed handler — rebuild nonlinear-regression training index with explicit total.
+
+    Usage:
+        CALL build_meta_nonlinear_dataset_index(FALSE, 1000);
+        CALL build_meta_nonlinear_dataset_index(TRUE, 500);
+    """
+    session = _get_session()
+    _build_meta_nonlinear_regression_index_impl(session, is_mixed_categorical, int(expected_total))
+    if is_mixed_categorical:
+        counts = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
+        ).collect()
+        return (
+            "META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+            + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        )
+    counts = session.sql(
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_NONLINEAR_REGRESSION_DATASET_INDEX GROUP BY split ORDER BY split"
+    ).collect()
+    return (
+        "META_NONLINEAR_REGRESSION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+    )
+
+
+def _build_meta_nonlinear_classification_index_impl(
+    session, is_mixed_categorical: bool, expected_total: int
+) -> None:
+    """Submit the appropriate nonlinear-classification-index build MLJob and wait."""
+    if is_mixed_categorical:
+        entrypoint = "build_meta_nonlinear_mixed_classification_dataset_index.py"
+        env_key    = "META_NONLINEAR_MIXED_CATEGORICAL_DATASET_EXPECTED_TOTAL"
+        label      = "META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX build"
+    else:
+        entrypoint = "build_meta_nonlinear_classification_dataset_index.py"
+        env_key    = "META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL"
+        label      = "META_NONLINEAR_CLASSIFICATION_DATASET_INDEX build"
+    print(f"Submitting {label} job (expected_total={expected_total}) ...")
+    job = submit_from_stage(
+        source=SCRIPTS_STAGE,
+        entrypoint=entrypoint,
+        compute_pool=CPU_POOL,
+        stage_name=MLJOB_PAYLOAD_STAGE,
+        target_instances=1,
+        pip_requirements=["pyarrow"],
+        env_vars={"HOME": "/tmp", env_key: str(expected_total)},
+        session=session,
+    )
+    _wait_done(job, label, session)
+
+
+def build_meta_nonlinear_classification_dataset_index_with_flag(
+    is_mixed_categorical: bool,
+) -> str:
+    """Boolean-routed handler — rebuild nonlinear-classification training index.
+
+    is_mixed_categorical=FALSE → META_NONLINEAR_CLASSIFICATION_DATASET_INDEX (numeric)
+    is_mixed_categorical=TRUE  → META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX (mixed-cat)
+
+    Usage:
+        CALL build_meta_nonlinear_classification_dataset_index(FALSE);
+        CALL build_meta_nonlinear_classification_dataset_index(TRUE);
+    """
+    session = _get_session()
+    env_key = (
+        "META_NONLINEAR_MIXED_CATEGORICAL_DATASET_EXPECTED_TOTAL"
+        if is_mixed_categorical
+        else "META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL"
+    )
+    expected_total = int(os.getenv(env_key, "1000"))
+    _build_meta_nonlinear_classification_index_impl(session, is_mixed_categorical, expected_total)
+    if is_mixed_categorical:
+        counts = session.sql(
+            "SELECT split, COUNT(*) AS task_count "
+            "FROM META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX GROUP BY split ORDER BY split"
+        ).collect()
+        return (
+            "META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX build complete.\n\nFull split counts:\n"
+            + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+        )
+    counts = session.sql(
+        "SELECT split, COUNT(*) AS task_count "
+        "FROM META_NONLINEAR_CLASSIFICATION_DATASET_INDEX GROUP BY split ORDER BY split"
+    ).collect()
+    return (
+        "META_NONLINEAR_CLASSIFICATION_DATASET_INDEX build complete.\n\nFull split counts:\n"
+        + "\n".join(f"  {row[0]}: {row[1]}" for row in counts)
+    )
+
+
+def build_meta_nonlinear_classification_dataset_index_with_flag_and_total(
+    is_mixed_categorical: bool, expected_total: int
+) -> str:
+    """Boolean-routed handler — rebuild nonlinear-classification index with explicit total.
+
+    Usage:
+        CALL build_meta_nonlinear_classification_dataset_index(FALSE, 1000);
+        CALL build_meta_nonlinear_classification_dataset_index(TRUE, 500);
+    """
+    session = _get_session()
+    _build_meta_nonlinear_classification_index_impl(session, is_mixed_categorical, int(expected_total))
+    return build_meta_nonlinear_classification_dataset_index_with_flag(is_mixed_categorical)
+
+
 def _validate_meta_dataset_index(session):
-    """Pre-flight check: raises RuntimeError if META_DATASET_INDEX is missing or has wrong counts."""
+    """Pre-flight check: raises RuntimeError if META_REGRESSION_DATASET_INDEX is missing or wrong."""
     # (uses module-level EXPECTED_INDEX_COUNTS)
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_DATASET_INDEX GROUP BY split"
+            "FROM META_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_DATASET_INDEX does not exist or cannot be queried. "
-            "Run CALL build_meta_dataset_index(); first."
+            "META_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
+            "Run CALL build_meta_dataset_index(FALSE); first."
         ) from exc
 
     counts = {str(row[0]).lower(): int(row[1]) for row in rows}
@@ -222,11 +578,11 @@ def _validate_meta_dataset_index(session):
     }
     if mismatches:
         raise RuntimeError(
-            f"META_DATASET_INDEX has wrong split counts: {mismatches}. "
-            "Run CALL build_meta_dataset_index(); to rebuild."
+            f"META_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
+            "Run CALL build_meta_dataset_index(FALSE); to rebuild."
         )
     print(
-        "META_DATASET_INDEX validated: "
+        "META_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
@@ -234,90 +590,99 @@ def _validate_meta_dataset_index(session):
     _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLUMNS} FROM META_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_DATASET_INDEX is missing one or more required columns "
+            f"META_REGRESSION_DATASET_INDEX is missing one or more required columns "
             f"({_REQUIRED_COLUMNS}). "
-            "Rebuild with CALL build_meta_dataset_index(); "
+            "Rebuild with CALL build_meta_dataset_index(FALSE); "
             f"Error: {exc}"
         ) from exc
 
-    # Stage file accessibility spot-check
+    # Stage file accessibility spot-check (numeric/ subdir)
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(
+                f"LIST @META_REGRESSION_DATASET_STAGE/numeric/{_split}/"
+            ).collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files found in @META_DATASET_STAGE/{_split}/. "
+                    f"No staged files found in @META_REGRESSION_DATASET_STAGE/numeric/{_split}/. "
                     "Re-upload training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"META_DATASET_INDEX references @META_DATASET_STAGE/{_split}/ "
+                f"META_REGRESSION_DATASET_INDEX references "
+                f"@META_REGRESSION_DATASET_STAGE/numeric/{_split}/ "
                 f"but the stage directory is inaccessible: {exc}. "
                 "Verify stage permissions and re-upload data."
             ) from exc
 
 
 def _validate_nonlinear_training_index(session) -> None:
-    """Pre-flight for META_NONLINEAR_DATASET_INDEX + @META_NONLINEAR_DATASET_STAGE."""
+    """Pre-flight for META_NONLINEAR_REGRESSION_DATASET_INDEX + @META_NONLINEAR_REGRESSION_DATASET_STAGE."""
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_NONLINEAR_DATASET_INDEX GROUP BY split"
+            "FROM META_NONLINEAR_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_NONLINEAR_DATASET_INDEX does not exist or cannot be queried. "
-            "Run CALL build_meta_nonlinear_dataset_index(); first."
+            "META_NONLINEAR_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
+            "Run CALL build_meta_nonlinear_dataset_index(FALSE); first."
         ) from exc
     counts = {str(row[0]).lower(): int(row[1]) for row in rows}
     mismatches = {
         split: {"expected": exp, "actual": counts.get(split, 0)}
-        for split, exp in EXPECTED_INDEX_COUNTS.items()
+        for split, exp in _NONLINEAR_EXPECTED_INDEX_COUNTS.items()
         if counts.get(split, 0) != exp
     }
     if mismatches:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX has wrong split counts: {mismatches}. "
-            "Run CALL build_meta_nonlinear_dataset_index(); to rebuild."
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
+            "Run CALL build_meta_nonlinear_dataset_index(FALSE); to rebuild."
         )
     print(
-        "META_NONLINEAR_DATASET_INDEX validated: "
+        "META_NONLINEAR_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
     _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLUMNS} FROM META_NONLINEAR_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_NONLINEAR_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX missing required columns ({_REQUIRED_COLUMNS}): {exc}"
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX missing required columns "
+            f"({_REQUIRED_COLUMNS}): {exc}"
         ) from exc
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_NONLINEAR_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(
+                f"LIST @META_NONLINEAR_REGRESSION_DATASET_STAGE/numeric/{_split}/"
+            ).collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files in @META_NONLINEAR_DATASET_STAGE/{_split}/. "
+                    f"No staged files in "
+                    f"@META_NONLINEAR_REGRESSION_DATASET_STAGE/numeric/{_split}/. "
                     "Re-upload nonlinear training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"@META_NONLINEAR_DATASET_STAGE/{_split}/ inaccessible: {exc}"
+                f"@META_NONLINEAR_REGRESSION_DATASET_STAGE/numeric/{_split}/ inaccessible: {exc}"
             ) from exc
 
 
 def _validate_training_index(session, training_data_family: str) -> None:
     """Route to the correct index validation based on training_data_family."""
-    if training_data_family == _NONLINEAR_TRAINING_FAMILY:
+    from task_routing import get_training_data_spec
+    spec = get_training_data_spec(training_data_family)
+    if spec.is_nonlinear:
         _validate_nonlinear_training_index(session)
     else:
         _validate_meta_dataset_index(session)
@@ -334,20 +699,20 @@ def run_pipeline() -> str:
     production training use the dedicated sequence:
       1. CALL build_meta_nonlinear_dataset_index();
       2. CALL run_pretrain_pipeline_nonlinear(...);
-      3. CALL run_hpo_pipeline(..., 'nonlinear_meta', ...);
+      3. CALL run_hpo_pipeline(..., 'nonlinear_model', ...);
       4. CALL run_model_training(...);
 
-    Step 1: Validate training dataset index (META_DATASET_INDEX for linear families)
+    Step 1: Validate training dataset index (META_REGRESSION_DATASET_INDEX for linear families)
     Step 2: Pre-training (pretrain.pt, no BEST_CONFIG — establishes warm-start baseline)
-    Step 3: HPO sweep — ridge_residual (tunes optimizer/regularization/Ridge Expert)
-            Writes best_config_ridge_residual.json.
+    Step 3: HPO sweep — linear_model (tunes optimizer/regularization/Ridge Expert)
+            Writes best_config_linear_model.json.
     Step 4: MODEL3 DDP memory probe (worst-case d_phi=256, n_blocks=2)
             Guards against OOM before the architecture HPO allocates GPU cluster.
     Step 5: HPO sweep — architecture (tunes d_phi and n_sab_feat)
-            Reads best_config_ridge_residual.json via HPO_BASELINE_CONFIG_STAGE_PATH.
-            Writes best_config_architecture.json and merged best_config.json.
+            Reads best_config_linear_model.json via HPO_BASELINE_CONFIG_STAGE_PATH.
+            Writes best_config_linear_model_architecture.json and merged best_config.json.
     Step 6: Load merged best_config.json
-    Step 7: Final training with best_config + pretrain warm-start (best.pt)
+    Step 7: Final training with best_config + pretrain warm-start (best_regression.pt)
     """
     if DEFAULT_TRAINING_DATA_FAMILY == _NONLINEAR_TRAINING_FAMILY:
         raise RuntimeError(
@@ -357,11 +722,11 @@ def run_pipeline() -> str:
             "  1. CALL build_meta_nonlinear_dataset_index();\n"
             "  2. CALL run_pretrain_pipeline_nonlinear('market_exchangeable_icl', "
             "'synthetic_regression_nonlinear', 'inductive_forecasting');\n"
-            "  3. CALL run_hpo_pipeline(..., 'nonlinear_meta', '', "
-            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt');\n"
-            "  4. -- optional: CALL run_hpo_pipeline(..., 'nonlinear_architecture', "
-            "'@MODEL_STAGE/hpo/best_config_nonlinear_meta.json', "
-            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt');\n"
+            "  3. CALL run_hpo_pipeline(..., 'nonlinear_model', '', "
+            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt');\n"
+            "  4. -- optional: CALL run_hpo_pipeline(..., 'nonlinear_model_architecture', "
+            "'@MODEL_STAGE/hpo/best_config_nonlinear_model.json', "
+            "'@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt');\n"
             "  5. CALL run_model_training('market_exchangeable_icl', "
             "'synthetic_regression_nonlinear', 'inductive_forecasting');\n"
             "Set TRAINING_DATA_FAMILY to a linear family (e.g. synthetic_regression_combined) "
@@ -375,6 +740,7 @@ def run_pipeline() -> str:
         "STRICT_WORLD_SIZE_CHECK":   "true",
         "MODEL_FAMILY":              DEFAULT_MODEL_FAMILY,
         "TRAINING_DATA_FAMILY":      DEFAULT_TRAINING_DATA_FAMILY,
+        "HPO_TRAINING_DATA_FAMILY":  DEFAULT_TRAINING_DATA_FAMILY,
         "MODEL_DESIGN_PATTERN":     DEFAULT_MODEL_DESIGN_PATTERN,
     }
 
@@ -404,8 +770,8 @@ def run_pipeline() -> str:
             f"{MODEL_STAGE}/checkpoints/. Check container logs before proceeding."
         )
 
-    # ── Step 3: HPO sweep — ridge_residual ───────────────────────────────────
-    print("Step 3: Submitting HPO ridge_residual sweep ...")
+    # ── Step 3: HPO sweep — linear_model ───────────────────────────────────
+    print("Step 3: Submitting HPO linear_model sweep ...")
     hpo_rr_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
@@ -414,15 +780,16 @@ def run_pipeline() -> str:
         target_instances=5,
         env_vars={
             **_common_env,
-            "HPO_SWEEP_MODE": "ridge_residual",
+            "HPO_SWEEP_MODE": "linear_model",
+            "HPO_PRETRAIN_CHECKPOINT_STAGE_PATH": f"{MODEL_STAGE}/checkpoints/pretrain.pt",
         },
         session=session,
     )
-    _wait_done(hpo_rr_job, "HPO ridge_residual", session)
+    _wait_done(hpo_rr_job, "HPO linear_model", session)
 
-    if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config_ridge_residual.json"):
+    if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config_linear_model.json"):
         raise RuntimeError(
-            "Step 3 (HPO ridge_residual) did not produce best_config_ridge_residual.json in "
+            "Step 3 (HPO linear_model) did not produce best_config_linear_model.json in "
             f"{MODEL_STAGE}/hpo/. Check container logs before proceeding."
         )
 
@@ -439,7 +806,7 @@ def run_pipeline() -> str:
             "TRAIN_NUM_NODES":                  str(TRAIN_NUM_NODES),
             "EXPECTED_TRAIN_WORLD_SIZE":         str(TRAIN_NUM_NODES * 4),
             "STRICT_WORLD_SIZE_CHECK":           "true",
-            "MODEL_ARCH_VERSION":               "model3",
+            "MODEL_ARCH_VERSION":               "model4",
             "MODEL_DESIGN_PATTERN":             "inductive_forecasting",
             "MODEL_FAMILY":                     "market_exchangeable_icl",
             "MODEL_PROBE_N_CONTEXT":            "200",
@@ -459,7 +826,7 @@ def run_pipeline() -> str:
     _wait_done(probe_job, "MODEL3DDPMemoryProbe (pre-architecture HPO gate)", session)
 
     # ── Step 5: HPO sweep — architecture ─────────────────────────────────────
-    print("Step 5: Submitting HPO architecture sweep ...")
+    print("Step 5: Submitting HPO linear_model_architecture sweep ...")
     hpo_arch_job = submit_from_stage(
         source=SCRIPTS_STAGE,
         entrypoint="hpo.py",
@@ -468,16 +835,16 @@ def run_pipeline() -> str:
         target_instances=5,
         env_vars={
             **_common_env,
-            "HPO_SWEEP_MODE":                    "architecture",
-            "HPO_BASELINE_CONFIG_STAGE_PATH":    f"{MODEL_STAGE}/hpo/best_config_ridge_residual.json",
+            "HPO_SWEEP_MODE":                    "linear_model_architecture",
+            "HPO_BASELINE_CONFIG_STAGE_PATH":    f"{MODEL_STAGE}/hpo/best_config_linear_model.json",
         },
         session=session,
     )
-    _wait_done(hpo_arch_job, "HPO architecture", session)
+    _wait_done(hpo_arch_job, "HPO linear_model_architecture", session)
 
     if not _stage_file_exists(session, f"{MODEL_STAGE}/hpo/", "best_config.json"):
         raise RuntimeError(
-            "Step 5 (HPO architecture) did not produce best_config.json in "
+            "Step 5 (HPO linear_model_architecture) did not produce best_config.json in "
             f"{MODEL_STAGE}/hpo/. Check container logs before proceeding."
         )
 
@@ -501,7 +868,7 @@ def run_pipeline() -> str:
             "BEST_CONFIG":              json.dumps(best_config),
             "PRETRAIN_CHECKPOINT_PATH": f"{MODEL_STAGE}/checkpoints/pretrain.pt",
             "PRETRAIN_LOAD_POLICY":     "allow_cold_start_on_arch_mismatch",
-            "CHECKPOINT_OUTPUT_NAME":   "best.pt",
+            "CHECKPOINT_OUTPUT_NAME":   "best_regression.pt",
         },
         session=session,
     )
@@ -511,10 +878,9 @@ def run_pipeline() -> str:
     checkpoint_contents = _list_stage(session, f"{MODEL_STAGE}/checkpoints/")
     return (
         "Training pipeline complete "
-        "(Validate → Pretrain → HPO ridge_residual → MemProbe → HPO architecture → Final training).\n\n"
+        "(Validate → Pretrain → HPO linear_model → MemProbe → HPO architecture → Final training).\n\n"
         "MODEL_STAGE hpo:\n"
         + "\n".join(f"  {p}" for p in hpo_contents)
         + "\n\nMODEL_STAGE checkpoints:\n"
         + "\n".join(f"  {p}" for p in checkpoint_contents)
     )
-

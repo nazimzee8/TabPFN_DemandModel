@@ -1,0 +1,108 @@
+{
+  "suite_id": "test_suite",
+  "task_family": "linear_classification",
+  "task_objective": "inductive_classification",
+  "created_at": "2026-06-09T07:22:13.865436Z",
+  "evaluation_run_id": "",
+  "suite_schema_version": "linear_classification_eval_v1",
+  "metric_schema_version": "2.0",
+  "input_shard_list": [
+    "@EVALUATION_RESULTS_STAGE/linear/classification/numeric/test_suite/parts/deepset_shard_0.parquet",
+    "@EVALUATION_RESULTS_STAGE/linear/classification/numeric/test_suite/parts/baselines_shard_0.parquet"
+  ],
+  "expected_deepset_shards": 1,
+  "expected_baseline_shards": 1,
+  "expected_ag_shards": 0,
+  "actual_deepset_shards": 1,
+  "actual_baseline_shards": 1,
+  "actual_ag_shards": 0,
+  "missing_shards": [],
+  "output_file_list": [
+    "synthetic_classification_model_comparison.csv",
+    "synthetic_classification_model_comparison_summary.csv",
+    "synthetic_classification_summary_by_regime.csv",
+    "synthetic_classification_summary_by_suite_family.csv",
+    "synthetic_classification_summary_by_feature_noise.csv",
+    "synthetic_classification_summary_by_label_noise.csv",
+    "synthetic_classification_summary_by_training_size.csv",
+    "synthetic_classification_summary_by_class_imbalance.csv",
+    "synthetic_classification_summary_by_margin.csv",
+    "synthetic_classification_summary_by_num_classes.csv",
+    "synthetic_classification_summary_by_sample_complexity.csv",
+    "synthetic_classification_hidden_summary.csv",
+    "synthetic_classification_eval_only_summary.csv",
+    "synthetic_classification_id_ood_hidden_summary.csv",
+    "synthetic_classification_distribution_degradation.csv",
+    "synthetic_classification_summary_by_p_quartile_n_quartile.csv",
+    "synthetic_classification_chart_data_model_rank.csv",
+    "synthetic_classification_chart_data_noise_features.csv",
+    "synthetic_classification_chart_data_label_noise.csv",
+    "synthetic_classification_chart_data_training_size.csv",
+    "synthetic_classification_chart_data_calibration.csv",
+    "synthetic_classification_method_completeness_audit.csv",
+    "synthetic_classification_bootstrap_confidence_intervals.csv",
+    "synthetic_classification_ranking_summary.csv",
+    "synthetic_classification_ranking_summary_k2.csv",
+    "synthetic_classification_ranking_summary_primary.csv"
+  ],
+  "result_stage_root": "@EVALUATION_RESULTS_STAGE/linear/classification/numeric/test_suite",
+  "checkpoint_path": "@MODEL_STAGE/checkpoints/best_classification.pt",
+  "feature_selector": "train_f_classif",
+  "feature_selector_protocol": "train_selected_features",
+  "baseline_feature_modes": [
+    "raw",
+    "selected"
+  ],
+  "method_completeness_audit": [
+    {
+      "model_name": "LogisticRegression",
+      "expected_task_count": 5,
+      "successful_task_count": 5,
+      "failed_or_skipped_rows": 0,
+      "completion_rate": 1.0
+    },
+    {
+      "model_name": "RandomForestClassifier",
+      "expected_task_count": 5,
+      "successful_task_count": 5,
+      "failed_or_skipped_rows": 0,
+      "completion_rate": 1.0
+    },
+    {
+      "model_name": "RidgeClassifier",
+      "expected_task_count": 5,
+      "successful_task_count": 5,
+      "failed_or_skipped_rows": 0,
+      "completion_rate": 1.0
+    },
+    {
+      "model_name": "tabpfn_deepset",
+      "expected_task_count": 5,
+      "successful_task_count": 5,
+      "failed_or_skipped_rows": 0,
+      "completion_rate": 1.0
+    }
+  ],
+  "bootstrap_replicates": 2000,
+  "bootstrap_seed": 42,
+  "expected_shard_topology": {
+    "deepset": 1,
+    "baseline": 1,
+    "autogluon": 0
+  },
+  "actual_shard_topology": {
+    "deepset": 1,
+    "baseline": 1,
+    "autogluon": 0
+  },
+  "runtime_variables": {
+    "SYNTHETIC_CLASSIFICATION_SUITE_ID": "test_suite",
+    "SYNCLS_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/linear/classification/numeric/test_suite",
+    "SYNCLS_DEEPSET_CHECKPOINT_STAGE_PATH": "@MODEL_STAGE/checkpoints/best_classification.pt",
+    "SYNTHETIC_CLASSIFICATION_FEATURE_SELECTOR": "train_f_classif",
+    "SYNCLS_CLUSTER_SHARDS": 0
+  },
+  "validation_status": "ok",
+  "total_datasets": 5,
+  "total_rows": 20
+}

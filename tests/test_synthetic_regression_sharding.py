@@ -1,7 +1,7 @@
 """
 tests/test_synthetic_regression_sharding.py
 =============================================
-Tests for shard assignment logic in evaluate_synthetic_regression.py.
+Tests for shard assignment logic in evaluate_linear_regression.py.
 
 Verifies that:
   - Sharding happens BEFORE any payload download
@@ -49,7 +49,7 @@ def _make_index_rows(n: int, suite_family: str = "primary") -> list[dict]:
 
 class TestShardAssignment:
     def test_assign_shard_basic(self):
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(10)
         shard0 = assign_synthetic_regression_shard(rows, shard_index=0, num_shards=3)
         shard1 = assign_synthetic_regression_shard(rows, shard_index=1, num_shards=3)
@@ -63,7 +63,7 @@ class TestShardAssignment:
         We verify by checking that shard assignment uses only the index rows list,
         not any file I/O.
         """
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
 
         call_order = []
 
@@ -88,7 +88,7 @@ class TestShardAssignment:
 
     def test_no_shard_owns_duplicate_rows(self):
         """Across 10 shards, no dataset_id appears in more than one shard."""
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(100)
         shards = [
             assign_synthetic_regression_shard(rows, shard_index=i, num_shards=10)
@@ -102,7 +102,7 @@ class TestShardAssignment:
 
     def test_all_rows_covered_exactly_once_across_shards(self):
         """Union of all shards == full index rows (no row missed, no duplicate)."""
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(200)
         all_shards = []
         for i in range(10):
@@ -114,7 +114,7 @@ class TestShardAssignment:
         assert ids_in_shards == expected_ids
 
     def test_all_rows_covered_3_shards(self):
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(30)
         combined = []
         for i in range(3):
@@ -123,7 +123,7 @@ class TestShardAssignment:
         assert ids == list(range(30))
 
     def test_all_rows_covered_30_shards(self):
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(300)
         combined = []
         for i in range(30):
@@ -133,20 +133,20 @@ class TestShardAssignment:
         assert ids == list(range(300))
 
     def test_single_shard_gets_all_rows(self):
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(50)
         shard = assign_synthetic_regression_shard(rows, shard_index=0, num_shards=1)
         assert len(shard) == 50
 
     def test_empty_index_returns_empty(self):
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         result = assign_synthetic_regression_shard([], shard_index=0, num_shards=5)
         assert result == []
 
 
 class TestBuildSplitForSeed:
     def test_split_is_deterministic(self):
-        from evaluate_synthetic_regression import build_split_for_seed
+        from evaluate_linear_regression import build_split_for_seed
         import numpy as np
         data = {
             "X": np.arange(200.0).reshape(100, 2),
@@ -161,7 +161,7 @@ class TestBuildSplitForSeed:
         np.testing.assert_array_equal(split1["y_holdout"], split2["y_holdout"])
 
     def test_split_different_seeds_produce_different_splits(self):
-        from evaluate_synthetic_regression import build_split_for_seed
+        from evaluate_linear_regression import build_split_for_seed
         import numpy as np
         data = {
             "X": np.arange(200.0).reshape(100, 2),
@@ -176,7 +176,7 @@ class TestBuildSplitForSeed:
         assert not np.array_equal(split0["X_train"], split1["X_train"])
 
     def test_split_respects_n_train_override(self):
-        from evaluate_synthetic_regression import build_split_for_seed
+        from evaluate_linear_regression import build_split_for_seed
         import numpy as np
         n_total = 6203
         data = {
@@ -191,7 +191,7 @@ class TestBuildSplitForSeed:
         assert split["X_train"].shape[0] == 25
 
     def test_split_sizes_sum_correctly(self):
-        from evaluate_synthetic_regression import build_split_for_seed
+        from evaluate_linear_regression import build_split_for_seed
         import numpy as np
         data = {
             "X": np.ones((100, 5)),
@@ -240,7 +240,7 @@ def _make_ood_rows(n_per_regime: int = 20) -> list[dict]:
 class TestShardDeterminism:
     def test_shard_assignment_stable_across_identical_calls(self):
         """Same ordered rows in → same shard assignment on every call."""
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_index_rows(60)
         shard_a = assign_synthetic_regression_shard(rows, shard_index=2, num_shards=5)
         shard_b = assign_synthetic_regression_shard(rows, shard_index=2, num_shards=5)
@@ -251,7 +251,7 @@ class TestShardDeterminism:
     def test_ood_rows_deterministic_with_repeated_dataset_id(self):
         """OOD rows with same dataset_id but different prior_regime land in
         distinct enumeration positions, so each row goes to exactly one shard."""
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         rows = _make_ood_rows(n_per_regime=20)  # 80 rows: dataset_id 0-19 × 4 regimes
         num_shards = 5
         all_stage_paths = []
@@ -265,7 +265,7 @@ class TestShardDeterminism:
 
     def test_all_shards_cover_all_rows_exactly_once_with_ood_mixed(self):
         """80 OOD + 200 in-distribution rows; all 280 rows covered exactly once across 10 shards."""
-        from evaluate_synthetic_regression import assign_synthetic_regression_shard
+        from evaluate_linear_regression import assign_synthetic_regression_shard
         indist_rows = _make_index_rows(200)
         ood_rows = _make_ood_rows(n_per_regime=20)
         mixed = indist_rows + ood_rows
@@ -311,7 +311,7 @@ def _make_training_size_rows(n: int) -> list[dict]:
 class TestExpandWorkItems:
     def test_expand_primary_suite_seeds_x_one_condition(self):
         """Primary suite: N rows × S seeds × 1 condition = N×S items."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_index_rows(5)  # each has split_seeds=[0,1,2]
         items = expand_synreg_work_items(rows, train_size_grid=[])
         # 5 rows × 3 seeds × 1 condition = 15 items
@@ -319,7 +319,7 @@ class TestExpandWorkItems:
 
     def test_expand_training_size_suite_produces_conditions(self):
         """Training size suite: each row gets len(seeds) × len(grid) items."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_training_size_rows(2)  # 2 rows, split_seeds=[0,1]
         grid = [25, 50, 100, 200]
         items = expand_synreg_work_items(rows, train_size_grid=grid)
@@ -328,7 +328,7 @@ class TestExpandWorkItems:
 
     def test_each_item_has_split_seed_and_n_train_override(self):
         """Every expanded item has split_seed and n_train_override fields."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_index_rows(3)
         items = expand_synreg_work_items(rows, train_size_grid=[])
         for item in items:
@@ -338,7 +338,7 @@ class TestExpandWorkItems:
 
     def test_primary_suite_n_train_override_is_none(self):
         """Primary suite work items have n_train_override=None."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_index_rows(2)
         items = expand_synreg_work_items(rows, train_size_grid=[])
         for item in items:
@@ -346,7 +346,7 @@ class TestExpandWorkItems:
 
     def test_training_size_n_train_override_matches_grid(self):
         """Training size work items have n_train_override matching the grid value."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_training_size_rows(1)  # 1 row, split_seeds=[0,1]
         grid = [25, 50, 100]
         items = expand_synreg_work_items(rows, train_size_grid=grid)
@@ -355,7 +355,7 @@ class TestExpandWorkItems:
 
     def test_work_items_cover_all_seeds(self):
         """Expanded items include all seeds from split_seeds."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_index_rows(1)  # split_seeds=[0,1,2]
         items = expand_synreg_work_items(rows, train_size_grid=[])
         seeds = sorted(item["split_seed"] for item in items)
@@ -364,7 +364,7 @@ class TestExpandWorkItems:
     def test_work_items_shardable_by_assign_shard(self):
         """expand_synreg_work_items output can be sharded by assign_synthetic_regression_shard
         with no items lost."""
-        from evaluate_synthetic_regression import expand_synreg_work_items, assign_synthetic_regression_shard
+        from evaluate_linear_regression import expand_synreg_work_items, assign_synthetic_regression_shard
         rows = _make_index_rows(10)
         all_items = expand_synreg_work_items(rows, train_size_grid=[])
         n_total = len(all_items)
@@ -376,7 +376,7 @@ class TestExpandWorkItems:
 
     def test_expand_deterministic(self):
         """Same input produces same expansion on every call."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         rows = _make_index_rows(8)
         items_a = expand_synreg_work_items(rows, train_size_grid=[])
         items_b = expand_synreg_work_items(rows, train_size_grid=[])
@@ -387,6 +387,6 @@ class TestExpandWorkItems:
 
     def test_empty_index_produces_empty_items(self):
         """Empty rows → empty work items."""
-        from evaluate_synthetic_regression import expand_synreg_work_items
+        from evaluate_linear_regression import expand_synreg_work_items
         items = expand_synreg_work_items([], train_size_grid=[])
         assert items == []

@@ -14,7 +14,7 @@ Strategy: Ray work-item distribution (SYNREG_AUTOGLUON_DISTRIBUTED_MODE=ray_work
     trades extra local I/O for lower Ray object-store and driver memory pressure.
   - Each Ray task runs one bounded local AutoGluon fit.
   - The DRIVER is the only process that writes the output CSV. Worker tasks return
-    canonical row dicts; they never query SYNTHETIC_REGRESSION_DATASET_INDEX or write
+    canonical row dicts; they never query LINEAR_REGRESSION_DATASET_INDEX or write
     stage files. Current worker dataset access mode is driver_presigned_url:
     the driver derives presigned HTTPS URLs and workers download with urllib
     without Snowpark sessions.
@@ -167,7 +167,7 @@ def _resolve_runtime_globals() -> None:
     SHARD_INDEX = _env_int("SYNTHETIC_REGRESSION_SHARD_INDEX", 0)
     RESULTS_STAGE = _require_env(
         "SYNREG_RESULTS_STAGE",
-        "Example: @EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
+        "Example: @EVALUATION_RESULTS_STAGE/linear/regression/numeric/linear_all_v1",
     )
     DISTRIBUTED_MODE = os.getenv("SYNREG_AUTOGLUON_DISTRIBUTED_MODE", "ray_work_items")
     CLUSTER_SHARDS = _env_int("SYNREG_AUTOGLUON_CLUSTER_SHARDS", NUM_SHARDS)
@@ -214,14 +214,14 @@ def _validate_runtime_globals() -> None:
         raise RuntimeError(
             "[ag_ray] Ray is not installed in this environment. "
             "The AutoGluon distributed work-item entrypoint requires Ray. "
-            "Install it or use evaluate_synthetic_regression.py for single-node mode."
+            "Install it or use evaluate_linear_regression.py for single-node mode."
         )
 
     if DISTRIBUTED_MODE != "ray_work_items":
         raise RuntimeError(
             f"[ag_ray] SYNREG_AUTOGLUON_DISTRIBUTED_MODE={DISTRIBUTED_MODE!r} but this "
             "entrypoint only implements 'ray_work_items'. "
-            "Use evaluate_synthetic_regression.py for single-node mode."
+            "Use evaluate_linear_regression.py for single-node mode."
         )
 
     if NUM_SHARDS != CLUSTER_SHARDS:
@@ -255,8 +255,8 @@ def _validate_runtime_globals() -> None:
 
 import numpy as np
 
-# Shared helpers from evaluate_synthetic_regression.py (co-located in @MODEL_STAGE/scripts/)
-from evaluate_synthetic_regression import (
+# Shared helpers from evaluate_linear_regression.py (co-located in @MODEL_STAGE/scripts/)
+from evaluate_linear_regression import (
     create_snowpark_session,
     load_synthetic_regression_index,
     assign_synthetic_regression_shard,
@@ -365,7 +365,7 @@ def _autogluon_work_item(item_meta: dict) -> dict:
         make_unique_autogluon_model_dir,
         predict_autogluon_timed,
     )
-    from evaluate_synthetic_regression import (
+    from evaluate_linear_regression import (
         load_prepared_synthetic_dataset_from_access,
         build_split_for_seed,
         preprocess_train_only,
@@ -672,7 +672,7 @@ def main() -> None:
     if not my_work_items:
         raise RuntimeError(
             f"[ag_ray] Shard {SHARD_INDEX}/{NUM_SHARDS} has zero work items. "
-            f"Check that SYNTHETIC_REGRESSION_DATASET_INDEX has rows for suite_id={SUITE_ID!r}."
+            f"Check that LINEAR_REGRESSION_DATASET_INDEX has rows for suite_id={SUITE_ID!r}."
         )
 
     # Finding 7: Presigned URL expiry validation.

@@ -17,7 +17,7 @@ Ground every explanation in the current code:
 - `generate_dgp.py` generates many single-task parquet files under `data/train`, `data/val`, and `data/test`.
 - `train.py` trains a `DeepSetICLModel` (MODEL3 ICL) over the train split, uses the validation split for early stopping, writes `best.pt`, and uploads that checkpoint to `@MODEL_STAGE/checkpoints/` when running inside SPCS.
 - `hpo.py` selects a deterministic 200 train / 40 validation subset from
-  `META_DATASET_INDEX`, runs a Ray worker Snowpark/session/stage preflight,
+  `META_REGRESSION_DATASET_INDEX`, runs a Ray worker Snowpark/session/stage preflight,
   materializes only those staged parquet payloads, and tunes only `lr`,
   `weight_decay`, and `dropout` with fixed architecture
   `d_phi=128`, `d_rho=256`, `pool="pna"`.
@@ -34,18 +34,18 @@ State the generation contract from `generate_dgp.py`:
 - With `--n_datasets 1000`, the script writes 800 training tasks, 100 validation tasks, and 100 test tasks.
 
 When describing Snowflake execution, note that these parquet files are uploaded to
-`@META_DATASET_STAGE`, indexed in `META_DATASET_INDEX`, and explicitly materialized
+`@META_REGRESSION_DATASET_STAGE`, indexed in `META_REGRESSION_DATASET_INDEX`, and explicitly materialized
 by MLJobs into ephemeral container-local `DATA_DIR` (default `/tmp/data`). HPO,
 production training, and epoch calibration all choose files through
-`META_DATASET_INDEX`; staged parquet remains the payload storage. Do not describe
-local workstation downloads of `@META_DATASET_STAGE`.
+`META_REGRESSION_DATASET_INDEX`; staged parquet remains the payload storage. Do not describe
+local workstation downloads of `@META_REGRESSION_DATASET_STAGE`.
 
 ## Explain The SPCS Execution Flow
 
 Use this flow when summarizing the end-to-end pipeline:
 
 1. Generate synthetic datasets locally with `python generate_dgp.py --n_datasets 1000 --out_dir data/`.
-2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_DATASET_STAGE`.
+2. Upload `data/train/*.parquet`, `data/val/*.parquet`, and `data/test/*.parquet` to `@META_REGRESSION_DATASET_STAGE`.
 3. Upload Python scripts (`*.py`) to `@MODEL_STAGE/scripts/` via SnowSQL `PUT`.
 4. Create and call the `run_training_pipeline()` Snowpark stored procedure (step 4 in
    `run_training_job.sql`). The procedure imports `run_training_job.py` from the stage
@@ -82,11 +82,11 @@ When documenting or patching Snowflake execution, include these runtime constrai
 - Snowflake MLJobs explicitly materialize staged parquet into container-local
   `/tmp/data`; `stage_name` is the payload stage, not a dataset mount.
 - Snowflake HPO, production training, and epoch calibration must materialize
-  through `META_DATASET_INDEX`. If an active Snowflake session exists, missing,
+  through `META_REGRESSION_DATASET_INDEX`. If an active Snowflake session exists, missing,
   empty, incomplete, or insufficient index rows are fatal startup errors.
 - `submit_from_stage(source=...)` points at `@MODEL_STAGE/scripts/`, but `stage_name` is the bare MLJob payload stage name `MLJOB_PAYLOAD_STAGE`, not `@MODEL_STAGE`.
 - Snowflake compute pools cannot use `MIN_NODES = 0`; set CPU pools to `MIN_NODES = 1` and use `AUTO_SUSPEND_SECS` and/or `INITIALLY_SUSPENDED` for cost control.
-- Kaggle benchmark `.npz` files persist in `@META_DATASET_STAGE/kaggle/`.
+- Kaggle benchmark `.npz` files persist in `@META_REGRESSION_DATASET_STAGE/kaggle/`.
 - Kaggle MLJob secrets must use Snowflake service spec syntax under `spec.containers[].secrets[]` with `snowflakeSecret`, `secretKeyRef`, and `envVarName`; do not use Kubernetes-style `env.valueFrom`.
 - OpenML benchmark datasets are fetched at benchmark runtime inside Snowflake.
 - OpenML/Kaggle benchmark rows are OOD smoke/generalization evidence, not strict
@@ -162,7 +162,7 @@ Describe `train.py` as training across many tasks, not rows from one dataset.
 
 Call out these implementation details:
 - `DATA_DIR` defaults to `/tmp/data`.
-- Training selects every `train` and `val` row from `META_DATASET_INDEX`, ordered
+- Training selects every `train` and `val` row from `META_REGRESSION_DATASET_INDEX`, ordered
   by `split, task_id`, materializes those `stage_path` payloads into `/tmp/data`,
   then reads every selected parquet file in `/tmp/data/train`; validation reads
   every selected parquet file in `/tmp/data/val`.
@@ -185,7 +185,7 @@ parameters with a fixed architecture, not as a six-parameter architecture sweep.
 
 Call out these implementation details:
 - HPO uses a table-backed pruning layer over staged parquet payloads. It should
-  select train/validation candidates from `META_DATASET_INDEX`, then materialize
+  select train/validation candidates from `META_REGRESSION_DATASET_INDEX`, then materialize
   only the selected parquet files into container-local `DATA_DIR`.
 - The default HPO search subset is deterministic and balanced: 200 train tasks
   and 40 validation tasks. Full production training still uses the full train
@@ -195,11 +195,11 @@ Call out these implementation details:
   `bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id`.
 - Before launching trials, HPO must run a Ray worker Snowpark/session preflight:
   each Ray node calls `Session.builder.getOrCreate()`, verifies `SELECT 1`,
-  verifies `LIST @META_DATASET_STAGE`, and downloads one selected HPO parquet to
+  verifies `LIST @META_REGRESSION_DATASET_STAGE`, and downloads one selected HPO parquet to
   `/tmp`. Failures here are startup failures in Snowpark/session/stage access,
   not GPU capacity failures.
-- Avoid per-trial full downloads or scans of `@META_DATASET_STAGE`; each trial
-  materializes only the selected HPO subset from `META_DATASET_INDEX`.
+- Avoid per-trial full downloads or scans of `@META_REGRESSION_DATASET_STAGE`; each trial
+  materializes only the selected HPO subset from `META_REGRESSION_DATASET_INDEX`.
 - Before constructing the Ray Tune search space, HPO reads the scalar metadata
   needed for cardinality bounds, including `p`, `n_train`, `prior_regime`,
   `split`, and `hpo_bucket`.
@@ -349,7 +349,7 @@ Prefer wording like:
 - "The MODEL3 ICL model (`DeepSetICLModel`) is trained over many synthetic regression tasks stored as parquet meta-datasets."
 - "`run_training_pipeline()` submits only HPO and training; `run_evaluation_pipeline()` separately consumes `@MODEL_STAGE/checkpoints/best.pt` for synthetic evaluation and benchmarks."
 - "`PyTorchDistributor` manages Ray, DDP, and result collection; `train_fn` receives hyperparameters and a distributed context via `get_context()`."
-- "HPO runs RandomSearch over `lr`, `weight_decay`, and `dropout`: it selects a deterministic balanced subset from `META_DATASET_INDEX`, enforces `max(p) <= 128` and `max(n_train) <= 256`, then runs 20 trials (20 concurrent, 1 round on 5 GPU_NV_M nodes) using fixed `d_phi=128`, `d_rho=256`, and `pool='pna'`."
+- "HPO runs RandomSearch over `lr`, `weight_decay`, and `dropout`: it selects a deterministic balanced subset from `META_REGRESSION_DATASET_INDEX`, enforces `max(p) <= 128` and `max(n_train) <= 256`, then runs 20 trials (20 concurrent, 1 round on 5 GPU_NV_M nodes) using fixed `d_phi=128`, `d_rho=256`, and `pool='pna'`."
 - "The compute pool uses `DEEPSET_GPU_POOL` with `MAX_NODES = 10` for 5-node HPO and 10-node DDP training; this can exceed the earlier $5/hr budget cap."
 - "Generalization is assessed by comparing MODEL3 ICL test MSE against a fixed ridge-regression baseline on unseen datasets."
 - "A ratio below 1.0 in `ratio_model_ols` indicates lower average error for MODEL3 ICL than for the baseline."

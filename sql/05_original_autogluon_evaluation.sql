@@ -1,8 +1,8 @@
 -- prepare_benchmark_datasets() fetches OpenML/Kaggle benchmark datasets once,
--- stages them to @META_DATASET_STAGE/benchmark_prepared/, and writes
+-- stages them to @META_REGRESSION_DATASET_STAGE/benchmark_prepared/, and writes
 -- benchmark_manifest.json. Run before run_evaluation_pipeline(), or let
 -- run_evaluation_pipeline() call it automatically.
--- @META_DATASET_STAGE/benchmark_prepared/ is created by this procedure.
+-- @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ is created by this procedure.
 -- It contains benchmark_manifest.json and prepared .npz files for all benchmark datasets.
 -- Benchmark shard jobs read exact prepared files from this prefix; they do not
 -- call OpenML directly and they load only one owned dataset at a time.

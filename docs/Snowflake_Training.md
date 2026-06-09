@@ -12,13 +12,13 @@ written back to Snowflake.
 
 **Steps:**
 
-1. **Create database, schema, and stages** with `run_training_job.sql`: `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, `@EVALUATION_RESULTS_STAGE`, and `@MLJOB_PAYLOAD_STAGE`.
+1. **Create database, schema, and stages** with `run_training_job.sql`: `@META_REGRESSION_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, `@EVALUATION_RESULTS_STAGE`, and `@MLJOB_PAYLOAD_STAGE`.
 2. **Create compute pools** with `run_training_job.sql`: `DEEPSET_GPU_POOL`, `DEEPSET_CPU_POOL`, and `AUTOGLUON_CPU_POOL`. Verify the pools reach `ACTIVE` state before submitting jobs.
 3. **Create network rules, `KAGGLE_API_SECRET`, and `BENCHMARK_EXTERNAL_ACCESS`**. The committed SQL uses placeholders only; never commit real Kaggle credentials.
-4. **Upload scripts and Parquet data** with SnowSQL `PUT`: `src/*.py` and `scripts/*.py` to `@MODEL_STAGE/scripts/`, and local synthetic datasets to `@META_DATASET_STAGE/{train,val,test}/`.
-5. **Call `build_meta_dataset_index()`**. This submits a CPU MLJob that lists staged synthetic parquet, reads scalar metadata inside Snowflake, rebuilds `META_DATASET_INDEX`, and validates `train=800`, `val=100`, `test=100`.
-6. **Optionally call `download_kaggle_to_stage()`**. This submits an MLJob that receives Kaggle credentials at runtime and stages raw Kaggle benchmark inputs under `@META_DATASET_STAGE/kaggle/`.
-7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_DATASET_STAGE/benchmark_prepared/`.
+4. **Upload scripts and Parquet data** with SnowSQL `PUT`: `src/*.py` and `scripts/*.py` to `@MODEL_STAGE/scripts/`, and local synthetic datasets to `@META_REGRESSION_DATASET_STAGE/{train,val,test}/`.
+5. **Call `build_meta_dataset_index()`**. This submits a CPU MLJob that lists staged synthetic parquet, reads scalar metadata inside Snowflake, rebuilds `META_REGRESSION_DATASET_INDEX`, and validates `train=800`, `val=100`, `test=100`.
+6. **Optionally call `download_kaggle_to_stage()`**. This submits an MLJob that receives Kaggle credentials at runtime and stages raw Kaggle benchmark inputs under `@META_REGRESSION_DATASET_STAGE/kaggle/`.
+7. **Call `prepare_benchmark_datasets()`**. This fetches/normalizes OpenML and staged Kaggle data once, then writes prepared `.npz` files and `benchmark_manifest.json` under `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/`.
 8. **Run gate-specific pretrain jobs** — one per `gate_hidden_dim` candidate (32, 64, 128).
    HPO tunes `gate_hidden_dim` across all three; each HPO trial warm-starts from its matching
    `pretrain_gate<N>.pt`. All three checkpoints must exist before HPO starts.
@@ -42,14 +42,14 @@ written back to Snowflake.
    Each job writes `@MODEL_STAGE/checkpoints/pretrain_gate<N>.pt` with the gate MLP of
    the matching width. Verify all three exist before starting HPO.
 
-9. **Call `run_hpo_pipeline()` — ridge_residual sweep (single sweep, production-ready).**
+9. **Call `run_hpo_pipeline()` — linear_model sweep (single sweep, production-ready).**
    HPO requires all three gate-specific pretrain checkpoints and samples `gate_hidden_dim` across
    them. Fixed architecture: `d_phi=128`, `n_sab_feat=1` (not tuned in this release).
 
    ```sql
    CALL run_hpo_pipeline(
        'market_exchangeable_icl', 'synthetic_regression_combined',
-       'inductive_forecasting', 'ridge_residual'
+       'inductive_forecasting', 'linear_model'
    );
    SELECT $1 FROM @MODEL_STAGE/hpo/best_config.json (FILE_FORMAT => (TYPE = JSON));
    ```
@@ -140,7 +140,7 @@ CALL run_evaluation_aggregation('<prep>', '<benchmark>', '<autogluon>');
 ## Current Snowflake Guardrails
 
 - `run_training_job.sql` creates `@MLJOB_PAYLOAD_STAGE` in addition to
-  `@META_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, and
+  `@META_REGRESSION_DATASET_STAGE`, `@MODEL_STAGE`, `@EVALUATION_DATASET_STAGE`, and
   `@EVALUATION_RESULTS_STAGE`.
 - CPU compute pools must use one minimum node. Use `AUTO_SUSPEND_SECS` and
   `INITIALLY_SUSPENDED` for cost control instead of a zero-node minimum.
@@ -188,7 +188,7 @@ Recommended smoke order: compile the Python scripts, create Snowflake objects wi
 `run_training_job.sql`, run `CALL build_meta_dataset_index()`, optionally run
 `CALL download_kaggle_to_stage()` for raw Kaggle staging, run
 `CALL prepare_benchmark_datasets()`, verify
-`LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';`,
+`LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';`,
 run `CALL run_hpo_pipeline()`, verify or read
 `@MODEL_STAGE/hpo/best_config.json`, run `CALL run_model_training()`, verify
 `LIST @MODEL_STAGE/checkpoints/` includes `best.pt`, optionally run
@@ -343,18 +343,18 @@ Synthetic meta-datasets are staged as Parquet files:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-REMOVE @META_DATASET_STAGE/train/;
-REMOVE @META_DATASET_STAGE/val/;
-REMOVE @META_DATASET_STAGE/test/;
-PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+REMOVE @META_REGRESSION_DATASET_STAGE/train/;
+REMOVE @META_REGRESSION_DATASET_STAGE/val/;
+REMOVE @META_REGRESSION_DATASET_STAGE/test/;
+PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 For Kaggle benchmark data, the preferred production raw-staging path is Snowflake-native:
 store the Kaggle API token in a Snowflake `SECRET`, run the one-off
 `download_kaggle_to_stage()` setup procedure, and let the MLJob upload raw Kaggle
-`.npz` files directly to `@META_DATASET_STAGE/kaggle/`. Those files are not the
+`.npz` files directly to `@META_REGRESSION_DATASET_STAGE/kaggle/`. Those files are not the
 final benchmark inputs consumed by shard jobs.
 
 Local `kaggle.json` is only needed when generating `.npz` files on your workstation
@@ -372,7 +372,7 @@ Then upload the locally downloaded benchmark files to the dataset stage:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-PUT file://C:/Documents/TabPFN_DemandModel/data/kaggle/*.npz @META_DATASET_STAGE/kaggle/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/kaggle/*.npz @META_REGRESSION_DATASET_STAGE/kaggle/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 After optional Kaggle raw staging, run the canonical preparation procedure. It
@@ -382,13 +382,13 @@ all benchmark shards:
 
 ```sql
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/;
-LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 ```
 
 Production benchmark shard jobs consume prepared staged datasets only:
-`@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
-`.npz` files under `@META_DATASET_STAGE/benchmark_prepared/{openml,kaggle}/`.
+`@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
+`.npz` files under `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/{openml,kaggle}/`.
 They load prepared files with `np.load(..., allow_pickle=False)` and must not
 fetch OpenML or Kaggle data at shard runtime. `evaluate.py` must not import,
 require, or call OpenML APIs; OpenML is a dataset-preparation dependency only,
@@ -536,10 +536,10 @@ dataset preparation and verify the prepared benchmark manifest:
 
 ```sql
 CALL download_kaggle_to_stage();
-LIST @META_DATASET_STAGE/kaggle/;
+LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/;
-LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 ```
 
 References: Snowflake [`CREATE NETWORK RULE`](https://docs.snowflake.com/en/sql-reference/sql/create-network-rule) and [`CREATE EXTERNAL ACCESS INTEGRATION`](https://docs.snowflake.com/en/sql-reference/sql/create-external-access-integration).
@@ -551,7 +551,7 @@ bare stage name passed to `submit_from_stage(stage_name=...)`; results are writt
 to `@EVALUATION_RESULTS_STAGE` before any local download:
 
 ```sql
-CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+CREATE STAGE IF NOT EXISTS META_REGRESSION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS EVALUATION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS EVALUATION_RESULTS_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
@@ -631,7 +631,7 @@ python download_results.py
 
 ```
 Local machine
-  â””â”€â”€ *.parquet â”€â”€PUTâ”€â”€â†’ @META_DATASET_STAGE
+  â””â”€â”€ *.parquet â”€â”€PUTâ”€â”€â†’ @META_REGRESSION_DATASET_STAGE
   â””â”€â”€ *.py â”€â”€PUTâ”€â”€â†’ @MODEL_STAGE/scripts/ â”€â”€vol mountâ”€â”€â†’ /opt/app/
 
 Snowsight / SnowSQL
@@ -647,7 +647,7 @@ Snowsight / SnowSQL
 
 Container Runtime - Phase 2: Training (10 nodes, DDP)
   â”œâ”€â”€ reads @MODEL_STAGE/hpo/best_config.json into BEST_CONFIG
-  â”œâ”€â”€ META_DATASET_INDEX selects full train/val stage_path rows
+  â”œâ”€â”€ META_REGRESSION_DATASET_INDEX selects full train/val stage_path rows
   â”œâ”€â”€ materialize_indexed_meta_dataset() copies selected parquet to /tmp/data/
   â”œâ”€â”€ DataLoader (4 workers, prefetch_factor=2) reads /tmp/data/train/*.parquet
   â”œâ”€â”€ trains DeepSet (phi, rho, psi + 4 equivariant scalars)
@@ -660,7 +660,7 @@ Snowsight / SnowSQL
         â””â”€â”€ run_evaluation_test.run_evaluation_pipeline(session) submits:
 
 Container Runtime - Evaluation
-  â”œâ”€â”€ prepare_benchmark_datasets.py â†’ @META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json
+  â”œâ”€â”€ prepare_benchmark_datasets.py â†’ @META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json
   â””â”€â”€ evaluate.py â†’ @EVALUATION_RESULTS_STAGE/synthetic/*.csv
                   â†’ @EVALUATION_RESULTS_STAGE/benchmark_parts/*_shard*_detailed.csv
                   â†’ @EVALUATION_RESULTS_STAGE/model_comparison.csv
@@ -678,7 +678,7 @@ Variable-shape datasets (pickle) cannot be stored in flat Snowflake tables effic
 Use an **internal named stage** with Parquet files:
 
 ```
-@META_DATASET_STAGE/
+@META_REGRESSION_DATASET_STAGE/
   train/   â† 800 parquet files (one per meta-task)
   val/     â† 100 parquet files
   test/    â† 100 parquet files
@@ -720,23 +720,23 @@ Then run the three `PUT` commands inside SnowSQL:
 USE DATABASE TABPFN_DB;
 USE SCHEMA TABPFN_SCHEMA;
 
-REMOVE @META_DATASET_STAGE/train/;
-REMOVE @META_DATASET_STAGE/val/;
-REMOVE @META_DATASET_STAGE/test/;
-PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+REMOVE @META_REGRESSION_DATASET_STAGE/train/;
+REMOVE @META_REGRESSION_DATASET_STAGE/val/;
+REMOVE @META_REGRESSION_DATASET_STAGE/test/;
+PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet @META_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet   @META_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet  @META_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 Verify the upload:
 
 ```sql
-LIST @META_DATASET_STAGE/train/;
-LIST @META_DATASET_STAGE/val/;
-LIST @META_DATASET_STAGE/test/;
+LIST @META_REGRESSION_DATASET_STAGE/train/;
+LIST @META_REGRESSION_DATASET_STAGE/val/;
+LIST @META_REGRESSION_DATASET_STAGE/test/;
 ```
 
-`META_DATASET_INDEX` is required before HPO and training. It is a metadata
+`META_REGRESSION_DATASET_INDEX` is required before HPO and training. It is a metadata
 pruning table over staged parquet payloads, not a copy of the payloads. Rebuild
 it after every synthetic parquet regeneration or restaging:
 
@@ -744,7 +744,7 @@ it after every synthetic parquet regeneration or restaging:
 CALL build_meta_dataset_index();
 
 SELECT split, COUNT(*) AS task_count
-FROM META_DATASET_INDEX
+FROM META_REGRESSION_DATASET_INDEX
 GROUP BY split
 ORDER BY split;
 -- Expected: train=800, val=100, test=100
@@ -761,7 +761,7 @@ WITH ranked AS (
       PARTITION BY split, hpo_bucket
       ORDER BY prior_regime, p, n_train, task_id
     ) AS bucket_rank
-  FROM META_DATASET_INDEX
+  FROM META_REGRESSION_DATASET_INDEX
   WHERE split IN ('train', 'val')
 ),
 selected AS (
@@ -890,7 +890,7 @@ USE SCHEMA TABPFN_SCHEMA;
 
 -- Internal stage for raw Parquet meta-datasets (train / val / test splits).
 -- MLJobs materialize this stage into ephemeral container-local /tmp/data.
-CREATE STAGE IF NOT EXISTS META_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+CREATE STAGE IF NOT EXISTS META_REGRESSION_DATASET_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- Internal stage for scripts, HPO config, and model checkpoints.
 CREATE STAGE IF NOT EXISTS MODEL_STAGE ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
@@ -961,7 +961,7 @@ one or more nodes in your GPU compute pool to run a single Python script. When
 the requested nodes, runs your entrypoint (e.g. `train.py`), writes outputs to the
 stage, then shuts the container down. The `stage_name` argument is the MLJob payload
 stage for scripts/artifacts; it is not a dataset mount. Training scripts explicitly
-materialize `@META_DATASET_STAGE/{train,val,test}/` into container-local `/tmp/data`
+materialize `@META_REGRESSION_DATASET_STAGE/{train,val,test}/` into container-local `/tmp/data`
 with Snowpark `session.file.get()`. PyTorch, Ray, and `snowflake-ml-python` are
 pre-installed - no Docker build or image management is required.
 
@@ -1044,11 +1044,11 @@ CREATE OR REPLACE PROCEDURE run_evaluation_pipeline(
 
 Procedure responsibilities:
 
-- `build_meta_dataset_index()` imports `run_training_job.py` and submits `build_meta_dataset_index.py` on `DEEPSET_CPU_POOL`; it rebuilds `META_DATASET_INDEX` from `@META_DATASET_STAGE/{train,val,test}/`.
+- `build_meta_dataset_index()` imports `run_training_job.py` and submits `build_meta_dataset_index.py` on `DEEPSET_CPU_POOL`; it rebuilds `META_REGRESSION_DATASET_INDEX` from `@META_REGRESSION_DATASET_STAGE/{train,val,test}/`.
 - `run_hpo_pipeline()` imports `run_hpo_job.py` and submits only the `hpo.py` MLJob/container.
 - `run_model_training()` imports `run_model_training_job.py`, reads `@MODEL_STAGE/hpo/best_config.json`, passes it to `train.py` as `BEST_CONFIG`, and submits only the training MLJob/container.
-- `run_training_pipeline()` is the **linear-only** convenience wrapper (Validate → Pretrain → HPO ridge_residual → MemProbe → HPO architecture → Final training); it raises `RuntimeError` for `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`. Use `run_pretrain_pipeline_nonlinear` + `run_hpo_pipeline` + `run_model_training` for the nonlinear path.
-- `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_DATASET_STAGE/benchmark_prepared/`.
+- `run_training_pipeline()` is the **linear-only** convenience wrapper (Validate → Pretrain → HPO linear_model → MemProbe → HPO architecture → Final training); it raises `RuntimeError` for `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear`. Use `run_pretrain_pipeline_nonlinear` + `run_hpo_pipeline` + `run_model_training` for the nonlinear path.
+- `prepare_benchmark_datasets()` imports `prepare_benchmark_datasets.py` and submits a single CPU preparation job that fetches/normalizes OpenML and Kaggle once into `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/`.
 - `run_evaluation_pipeline()` imports `run_evaluation_test.py`, verifies `best.pt`, `runtime_probe.py`, compute pools, and runtime-image imports by submitting and waiting on 5 serial probes including the CPU baseline probe with `pip_requirements=["catboost"]`, runs single-node GPU synthetic evaluation, always submits benchmark preparation as manifest/index validation, then launches prepared benchmark shards and aggregation.
 - `run_evaluation_runtime_probes()` imports `run_evaluation_test.py` and runs only the 5 serial preflight probes without submitting evaluation jobs. Use this to validate runtime environments before a full evaluation run.
 
@@ -1057,10 +1057,10 @@ inspect the HPO artifact, run training, verify the checkpoint, and run evaluatio
 
 ```sql
 CALL download_kaggle_to_stage();
-LIST @META_DATASET_STAGE/kaggle/;
+LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/;
-LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 CALL build_meta_dataset_index();
 CALL run_hpo_pipeline();
 LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
@@ -1081,9 +1081,9 @@ SHOW COMPUTE POOLS LIKE 'DEEPSET_CPU_POOL';
 SHOW COMPUTE POOLS LIKE 'AUTOGLUON_CPU_POOL';
 LIST @MODEL_STAGE/scripts/;
 CALL download_kaggle_to_stage();
-LIST @META_DATASET_STAGE/kaggle/;
+LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 ```
 
 If `best_config.json` is missing, training has not started; the issue is in HPO.
@@ -1124,7 +1124,7 @@ For a healthy HPO startup, the logs should include `[HPO] Pretrain checkpoint
 found`, `Ray object-store preflight success`, `HPO trial received in-memory records`,
 and `[HPO trial] Loaded pretrain checkpoint from Ray object store.`. If driver
 materialization fails before trials start, the likely failure domain is driver
-Snowpark/session/stage access to `@META_DATASET_STAGE`, not GPU capacity.
+Snowpark/session/stage access to `@META_REGRESSION_DATASET_STAGE`, not GPU capacity.
 
 If logs are unavailable, record the `SHOW JOB SERVICES` row fields `name`,
 `status`, `created_on`, `updated_on`, `current_instances`, `target_instances`,
@@ -1147,7 +1147,7 @@ passes `artifact_stage_location="TABPFN_DB.TABPFN_SCHEMA.MODEL_STAGE"` explicitl
 If service logs stop after `Loading data into a pandas dataframe`, suspect
 worker-side ShardedDataConnector shard conversion/materialization around
 `shard.to_pandas()`. The canonical path is SQL rank sharding over
-`META_DATASET_INDEX`; inspect `@MODEL_STAGE/checkpoints/train_failure.json` first,
+`META_REGRESSION_DATASET_INDEX`; inspect `@MODEL_STAGE/checkpoints/train_failure.json` first,
 then service logs if that artifact is missing or incomplete.
 
 If `CALL run_hpo_epoch_test()` fails with
@@ -1178,7 +1178,7 @@ LIST @MODEL_STAGE/hpo/ PATTERN='.*best_config[.]json';
 CALL run_model_training();
 LIST @MODEL_STAGE/checkpoints/;
 CALL prepare_benchmark_datasets();
-LIST @META_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
+LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ PATTERN='.*benchmark_manifest[.]json';
 CALL run_evaluation_runtime_probes('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
 CALL run_evaluation_pipeline('<prep_runtime>', '2.5.0-py311', '<autogluon_runtime>');
 LIST @EVALUATION_RESULTS_STAGE/;
@@ -1186,8 +1186,8 @@ GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';
 ```
 
 Kaggle download uses `compute_pool="DEEPSET_CPU_POOL"` and writes raw `.npz` files
-to `@META_DATASET_STAGE/kaggle/`. Benchmark dataset preparation uses one CPU node
-and writes `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` plus
+to `@META_REGRESSION_DATASET_STAGE/kaggle/`. Benchmark dataset preparation uses one CPU node
+and writes `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` plus
 prepared `.npz` files under `benchmark_prepared/{openml,kaggle}/`. HPO, training,
 synthetic evaluation, and MODEL3-ICL-MC benchmark use
 `compute_pool="DEEPSET_GPU_POOL"`; baseline benchmark jobs use
@@ -1210,8 +1210,8 @@ releases it, and then continues to the next owned dataset.
 
 | Phase | Entrypoint | Instances | Output |
 |---|---|---|---|
-| Optional Kaggle raw staging | `download_kaggle_to_stage.py` | 1 CPU | `@META_DATASET_STAGE/kaggle/*.npz` |
-| Benchmark dataset preparation | `prepare_benchmark_datasets.py` | 1 CPU | `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared `.npz` files |
+| Optional Kaggle raw staging | `download_kaggle_to_stage.py` | 1 CPU | `@META_REGRESSION_DATASET_STAGE/kaggle/*.npz` |
+| Benchmark dataset preparation | `prepare_benchmark_datasets.py` | 1 CPU | `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared `.npz` files |
 | HPO | `hpo.py` | 5 | `@MODEL_STAGE/hpo/best_config.json` |
 | Training | `train.py` | 10 (DDP, 40 workers) | `@MODEL_STAGE/checkpoints/best.pt` |
 | Synthetic evaluation | `evaluate.py` | 1 GPU single-node job | `@EVALUATION_RESULTS_STAGE/synthetic/test_report.csv` and `mc_report.csv` |
@@ -1324,7 +1324,7 @@ Ray, and `snowflake-ml-python` pre-installed.
   10 x GPU_NV_M nodes (four A10G GPUs each); `run_model_training_job.py` submits training with
   matching `target_instances=10`. Total world_size=40 (10 nodes x 4 workers/node).
 - `get_context()` inside `train_fn` provides `local_rank`, `rank`, and `world_size`.
-- `train_fn` shards `META_DATASET_INDEX` directly in SQL by DDP `rank` and
+- `train_fn` shards `META_REGRESSION_DATASET_INDEX` directly in SQL by DDP `rank` and
   `world_size`, using `ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1`
   and `MOD(rn, world_size) = rank`. Each worker materializes only its selected
   train/val stage paths with `materialize_indexed_meta_dataset()`.
@@ -1365,23 +1365,23 @@ Ray, and `snowflake-ml-python` pre-installed.
   `pretrain.pt`, and publishes both payloads to the Ray object store. Ray workers
   consume only these object-store payloads and do not create Snowpark sessions.
   A successful startup logs `Ray object-store preflight success`.
-- `META_DATASET_INDEX` is the pruning layer over staged parquet payloads, not a
-  replacement for `@META_DATASET_STAGE`. It stores one row per task payload and
+- `META_REGRESSION_DATASET_INDEX` is the pruning layer over staged parquet payloads, not a
+  replacement for `@META_REGRESSION_DATASET_STAGE`. It stores one row per task payload and
   is clustered by `(split, hpo_bucket, prior_regime, p, n_train)` so HPO can
   select balanced subsets before materializing data on each node.
 - `CALL build_meta_dataset_index();` is the canonical Snowflake-native population
   step. It reads metadata from staged parquet inside an MLJob, truncates/rebuilds
-  `META_DATASET_INDEX`, validates `train=800`, `val=100`, `test=100`, and should
+  `META_REGRESSION_DATASET_INDEX`, validates `train=800`, `val=100`, `test=100`, and should
   be re-run after synthetic parquet regeneration or restaging.
 - Runtime selection is index-backed. HPO ranks rows within `(split, hpo_bucket)`
   by `prior_regime, p, n_train, task_id`, then chooses each split by
   `bucket_rank, hpo_bucket, prior_regime, p, n_train, task_id`. Production
   training selects every `train` and `val` row ordered by `split, task_id`.
-- Snowflake jobs fail fast if `META_DATASET_INDEX` is missing, empty, lacks
+- Snowflake jobs fail fast if `META_REGRESSION_DATASET_INDEX` is missing, empty, lacks
   required runtime fields (`split`, `task_id`, `stage_path`, `p`, `n_train`),
   or cannot provide the required HPO subset. Local developer runs with no active
   Snowflake session use existing local parquet files instead of downloading
-  `@META_DATASET_STAGE`.
+  `@META_REGRESSION_DATASET_STAGE`.
 - HPO also fails before trials if selected HPO cardinality exceeds the fixed
   architecture. Current local data was verified at `max_p=24`,
   `max_n_train=200`, which is within the fixed `d_phi=128`, `d_rho=256` guard.
@@ -1834,7 +1834,7 @@ stratified by regime, feature count quartile, and set size quartile.
 from snowflake.snowpark import functions as F
 
 def evaluate_ood(session):
-    test_files = session.file.list("@META_DATASET_STAGE/test/")
+    test_files = session.file.list("@META_REGRESSION_DATASET_STAGE/test/")
     results = []
 
     for f in test_files:
@@ -2265,7 +2265,7 @@ This runs 5 phases sequentially:
 2. **DeepSet** — 10 GPU shards on `DEEPSET_GPU_POOL`
 3. **Baselines** — 6 CPU shards on `DEEPSET_CPU_POOL`
 4. **AutoGluon** — 60 CPU single-node shards on `AUTOGLUON_CPU_POOL` (legacy path)
-5. **Aggregation** — 1 CPU job; outputs to `@EVALUATION_RESULTS_STAGE/ood_full/`
+5. **Aggregation** — 1 CPU job; outputs to `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/`
 
 > Note: The combined suite (`linear_all_v1`) uses a different AutoGluon path: 6 distributed
 > work-item clusters × 4 workers via `autogluon_ray.py`.
@@ -2275,7 +2275,7 @@ This runs 5 phases sequentially:
 
 ```sql
 SELECT prior_regime, COUNT(*) AS n
-FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+FROM LINEAR_REGRESSION_DATASET_INDEX
 WHERE suite_id = 'ood_linear_full_v1'
 GROUP BY prior_regime ORDER BY prior_regime;
 -- Expected: E/F/G/H each with 50 rows
@@ -2284,7 +2284,7 @@ GROUP BY prior_regime ORDER BY prior_regime;
 ### Step 6 — Verify outputs
 
 ```sql
-LIST @EVALUATION_RESULTS_STAGE/ood_full/;
+LIST @EVALUATION_RESULTS_STAGE/linear/regression/numeric/;
 -- Expected files:
 --   synthetic_regression_model_comparison.csv
 --   synthetic_regression_model_comparison_summary.csv
@@ -2307,7 +2307,7 @@ LIST @EVALUATION_RESULTS_STAGE/ood_full/;
 The combined suite (`linear_all_v1`, 400 datasets) is an index-level composition of the primary
 in-distribution suite (`linear_poisson_v1_recommended`, regimes A/B/C/D, 200 datasets) and the
 OOD full suite (`ood_linear_full_v1`, regimes E/F/G/H, 200 datasets). No parquet files are merged
-or rewritten; `prepare_combined_suite()` copies rows into `SYNTHETIC_REGRESSION_DATASET_INDEX`.
+or rewritten; `prepare_combined_suite()` copies rows into `LINEAR_REGRESSION_DATASET_INDEX`.
 
 **Prerequisites:** both source suites must be indexed before running combined prep.
 
@@ -2367,14 +2367,14 @@ Each MLJob cluster runs `autogluon_ray.py` (derived internally — not a runtime
 entrypoint calls `ray.init(address="auto")` to attach to the Snowflake-provisioned multi-node
 Ray cluster and fails before writing a CSV if fewer than `SYNREG_AUTOGLUON_WORKERS_PER_SHARD`
 Ray nodes are alive. The driver process:
-1. Loads `SYNTHETIC_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
+1. Loads `LINEAR_REGRESSION_DATASET_INDEX` for `suite_id=linear_all_v1`
 2. Expands rows to explicit `(dataset, split_seed, condition)` work items
 3. Assigns this cluster's shard using `assign_synthetic_regression_shard(items, shard_index, num_shards)`
 4. Builds compact JSON item dicts and derives `dataset_access.presigned_url` with `GET_PRESIGNED_URL`
 5. Distributes only compact item dicts across Ray tasks; each worker downloads its own dataset with `urllib` (no `ray.put`, no worker Snowpark session)
 6. Writes exactly one file: `AutoGluon_shard{shard_index}_of_{num_shards}_detailed.csv`
 
-Workers never query `SYNTHETIC_REGRESSION_DATASET_INDEX` and do not create Snowpark sessions.
+Workers never query `LINEAR_REGRESSION_DATASET_INDEX` and do not create Snowpark sessions.
 The only worker data access surface is the presigned HTTPS URL in the item dict produced by the driver.
 
 Aggregation expects `SYNREG_EXPECTED_AG_SHARDS=6` (matching `SYNREG_AUTOGLUON_CLUSTER_SHARDS`).
@@ -2450,7 +2450,7 @@ ALTER COMPUTE POOL AUTOGLUON_CPU_POOL SUSPEND;
 CALL run_synthetic_regression_combined_prep('2.5.0-py311', '2.5.0-py311');
 -- Verify (expect A/B/C/D/E/F/G/H each with 50 rows, total 400):
 -- SELECT prior_regime, COUNT(*) AS n
--- FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+-- FROM LINEAR_REGRESSION_DATASET_INDEX
 -- WHERE suite_id = 'linear_all_v1'
 -- GROUP BY prior_regime ORDER BY prior_regime;
 
@@ -2492,11 +2492,11 @@ CALL run_model_training(
 
 ```sql
 -- Verify 6 AutoGluon shard files were written:
-LIST @EVALUATION_RESULTS_STAGE/regression/linear_all_v1/
+LIST @EVALUATION_RESULTS_STAGE/linear/regression/numeric/linear_all_v1/
   PATTERN='.*AutoGluon_shard[0-9]+_of_6_detailed[.]csv';
 
 -- Verify combined aggregation outputs:
-LIST @EVALUATION_RESULTS_STAGE/combined/;
+LIST @EVALUATION_RESULTS_STAGE/linear/regression/numeric/;
 -- Expected:
 --   synthetic_regression_model_comparison.csv
 --   synthetic_regression_model_comparison_summary.csv
@@ -2505,7 +2505,7 @@ LIST @EVALUATION_RESULTS_STAGE/combined/;
 
 -- Read combined summary:
 SELECT $1
-FROM @EVALUATION_RESULTS_STAGE/combined/synthetic_regression_model_comparison_summary.csv;
+FROM @EVALUATION_RESULTS_STAGE/linear/regression/numeric/synthetic_regression_model_comparison_summary.csv;
 ```
 
 ---
@@ -3092,11 +3092,11 @@ family selector:
   standalone HPO, or pass the training family explicitly in SQL.
 - `MODEL_FAMILY=market_exchangeable_icl`
 - `MODEL_DESIGN_PATTERN=inductive_forecasting`
-- `HPO_SWEEP_MODE=nonlinear_meta` — tunes `latent_ridge_dim` ∈ {32, 64, 128}
+- `HPO_SWEEP_MODE=nonlinear_model` — tunes `latent_ridge_dim` ∈ {32, 64, 128}
 
 Nonlinear HPO does not use the gate-specific `pretrain_gate<N>.pt` checkpoints
-from `ridge_residual`. For the intended warm-start path, pass
-`HPO_PRETRAIN_CHECKPOINT_STAGE_PATH=@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt`;
+from `linear_model`. For the intended warm-start path, pass
+`HPO_PRETRAIN_CHECKPOINT_STAGE_PATH=@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt`;
 dim=64 trials warm-start from the pretrain checkpoint; dim=32/128 trials cold-start on
 architecture mismatch.
 
@@ -3159,8 +3159,8 @@ PUT file://scripts/run_synthetic_regression_evaluation.py
 ### Step 4 — Create index table and register stored procedures
 
 Execute `sql/05_synthetic_nonlinear_evaluation_pipeline.sql` in Snowflake. This creates
-`SYNTHETIC_NONLINEAR_DATASET_INDEX` (transient, zero-retention, identical schema to
-`SYNTHETIC_REGRESSION_DATASET_INDEX`) and registers all stored procedures:
+`NONLINEAR_REGRESSION_DATASET_INDEX` (transient, zero-retention, identical schema to
+`LINEAR_REGRESSION_DATASET_INDEX`) and registers all stored procedures:
 `run_synthetic_nonlinear_prep`, `run_synthetic_nonlinear_deepset_evaluation`,
 `run_synthetic_nonlinear_baseline_evaluation` (3 overloads),
 `run_synthetic_nonlinear_autogluon_spcs_evaluation` (2 overloads),
@@ -3174,7 +3174,7 @@ Verify after creation (expect 100 rows per regime):
 
 ```sql
 SELECT prior_regime, COUNT(*) AS n
-FROM SYNTHETIC_NONLINEAR_DATASET_INDEX
+FROM NONLINEAR_REGRESSION_DATASET_INDEX
 WHERE suite_id = 'nonlinear_v1'
 GROUP BY prior_regime ORDER BY prior_regime;
 ```
@@ -3182,7 +3182,7 @@ GROUP BY prior_regime ORDER BY prior_regime;
 ### Step 5 — Run the evaluation pipeline
 
 ```sql
--- Phase 1: Index the 400 nonlinear datasets into SYNTHETIC_NONLINEAR_DATASET_INDEX
+-- Phase 1: Index the 400 nonlinear datasets into NONLINEAR_REGRESSION_DATASET_INDEX
 CALL run_synthetic_nonlinear_prep('2.5.0-py311');
 
 -- Phase 2: DeepSet GPU evaluation (10 shards on DEEPSET_GPU_POOL)
@@ -3217,20 +3217,20 @@ The `SYNREG_INDEX_TABLE` env var controls which index table evaluation jobs quer
 items. All nonlinear orchestration procedures inject this automatically:
 
 ```
-SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX
+SYNREG_INDEX_TABLE=NONLINEAR_REGRESSION_DATASET_INDEX
 ```
 
 This env var is read by both `evaluate_synthetic_regression.py` and `autogluon_ray.py` (via
 its import of `evaluate_synthetic_regression`). Existing linear evaluation jobs are unaffected
-because `SYNREG_INDEX_TABLE` defaults to `SYNTHETIC_REGRESSION_DATASET_INDEX` when unset.
+because `SYNREG_INDEX_TABLE` defaults to `LINEAR_REGRESSION_DATASET_INDEX` when unset.
 
 ### Verify outputs
 
 ```sql
-LIST @EVALUATION_RESULTS_STAGE/nonlinear/;
+LIST @EVALUATION_RESULTS_STAGE/nonlinear/regression/numeric/nonlinear/;
 ```
 
-Results are written to `@EVALUATION_RESULTS_STAGE/nonlinear/` by the aggregation phase.
+Results are written to `@EVALUATION_RESULTS_STAGE/nonlinear/regression/numeric/nonlinear/` by the aggregation phase.
 
 ### Nonlinear training data (DeepSet pre-training)
 
@@ -3238,6 +3238,20 @@ To generate nonlinear training data for DeepSet pre-training (separate from eval
 
 ```bash
 python src/generate_nonlinear_dgp.py --n_datasets 1000 --out_dir data/nonlinear/
+```
+
+The default profile is `nonlinear_stat_aware`. It keeps the nonlinear target
+families `I/J/K/L` and broadens them across feature regimes:
+`gaussian_dense`, `gaussian_sparse`, `noise_features`, `high_dim_dense`,
+`high_dim_sparse`, `correlated_ar`, `block_correlated`, `equicorrelated`, and
+`feature_noise`. To include the underdetermined `low_n_high_p` feature regime,
+run with `--allow_underdetermined`. For deterministic coverage of target-family
+and feature-regime combinations, add `--balanced`.
+
+Legacy Poisson/Gaussian nonlinear data remains available:
+
+```bash
+python src/generate_nonlinear_dgp.py --profile legacy --n_datasets 1000 --out_dir data/nonlinear/
 ```
 
 Output:
@@ -3261,21 +3275,25 @@ changing code; explicit SQL procedure arguments still take precedence.
 
 ### Infrastructure
 
-- **Stage:** `@META_NONLINEAR_DATASET_STAGE` — upload train/val/test nonlinear parquets here
-- **Index table:** `META_NONLINEAR_DATASET_INDEX` — schema identical to `META_DATASET_INDEX`
+- **Stage:** `@META_NONLINEAR_REGRESSION_DATASET_STAGE` — upload train/val/test nonlinear parquets here
+- **Index table:** `META_NONLINEAR_REGRESSION_DATASET_INDEX` — contains the legacy runtime
+  columns plus nonlinear curriculum metadata: `profile`, `feature_regime`,
+  `p_signal`, `p_noise`, `p_total`, `active_s`, `sparsity_ratio`,
+  `covariance_type`, `rho`, `target_noise_scale`, `feature_noise_level`,
+  `sample_complexity_bucket`, `has_noise_features`, and `has_feature_noise`
 - Created by `sql/01_stages_and_metadata_tables.sql` and `sql/run_training_job.sql`
 
 ### Step 1 — Upload training data (SnowSQL)
 
 ```sql
 -- Clear stale files first
-REMOVE @META_NONLINEAR_DATASET_STAGE/train/;
-REMOVE @META_NONLINEAR_DATASET_STAGE/val/;
-REMOVE @META_NONLINEAR_DATASET_STAGE/test/;
+REMOVE @META_NONLINEAR_REGRESSION_DATASET_STAGE/train/;
+REMOVE @META_NONLINEAR_REGRESSION_DATASET_STAGE/val/;
+REMOVE @META_NONLINEAR_REGRESSION_DATASET_STAGE/test/;
 -- Upload parquets
-PUT file://data/nonlinear/train/*.parquet @META_NONLINEAR_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/nonlinear/val/*.parquet   @META_NONLINEAR_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://data/nonlinear/test/*.parquet  @META_NONLINEAR_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear/train/*.parquet @META_NONLINEAR_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear/val/*.parquet   @META_NONLINEAR_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://data/nonlinear/test/*.parquet  @META_NONLINEAR_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 ```
 
 ### Step 2 — Build index
@@ -3284,13 +3302,20 @@ PUT file://data/nonlinear/test/*.parquet  @META_NONLINEAR_DATASET_STAGE/test/  A
 CALL build_meta_nonlinear_dataset_index();
 ```
 
-This submits a CPU MLJob that lists `@META_NONLINEAR_DATASET_STAGE/{train,val,test}/`,
-reads scalar metadata, rebuilds `META_NONLINEAR_DATASET_INDEX`, and validates `train=800`,
+This submits a CPU MLJob that lists `@META_NONLINEAR_REGRESSION_DATASET_STAGE/{train,val,test}/`,
+reads scalar metadata, rebuilds `META_NONLINEAR_REGRESSION_DATASET_INDEX`, and validates `train=800`,
 `val=100`, `test=100`.
+
+`build_meta_nonlinear_dataset_index()` is backward-compatible with legacy
+nonlinear parquet files. Missing enriched metadata is filled with legacy
+defaults such as `profile='legacy'` and `feature_regime='legacy_gaussian'`.
+For `nonlinear_model` HPO, Snowflake row selection uses both `prior_regime` and
+`feature_regime` so the selected train/val subset covers the nonlinear
+curriculum before applying the configured HPO split limits.
 
 ### Step 3 — Nonlinear pretrain
 
-Writes `@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt` with
+Writes `@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt` with
 `use_latent_ridge_expert=True` and `latent_ridge_dim=64`.
 
 ```sql
@@ -3303,20 +3328,20 @@ CALL run_pretrain_pipeline_nonlinear(
 
 ### Step 4 — Nonlinear HPO (single sweep)
 
-**nonlinear_meta** — tunes `latent_ridge_dim` ∈ {32, 64, 128} (warm-start from pretrain checkpoint):
+**nonlinear_model** — tunes `latent_ridge_dim` ∈ {32, 64, 128} (warm-start from pretrain checkpoint):
 
 ```sql
 CALL run_hpo_pipeline(
     'market_exchangeable_icl',
     'synthetic_regression_nonlinear',
     'inductive_forecasting',
-    'nonlinear_meta',
+    'nonlinear_model',
     '',
-    '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+    '@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt'
 );
 ```
 
-Produces `best_config_nonlinear_meta.json` and `best_config.json`.
+Produces `best_config_nonlinear_model.json` and `best_config.json`.
 
 ### Step 5 — Final training
 
@@ -3339,14 +3364,15 @@ For development-only cold-start: set `ALLOW_NONLINEAR_COLD_START=true`.
 
 ```
 generate_nonlinear_dgp.py
-    └─ @META_NONLINEAR_DATASET_STAGE/{train,val,test}/
-           └─ build_meta_nonlinear_dataset_index()  →  META_NONLINEAR_DATASET_INDEX
-                  └─ run_pretrain_pipeline_nonlinear(...)  →  pretrain_nonlinear_meta.pt
-                         └─ run_hpo_pipeline(... nonlinear_meta ...)  →  best_config.json
+    └─ @META_NONLINEAR_REGRESSION_DATASET_STAGE/{train,val,test}/
+           └─ build_meta_nonlinear_dataset_index()  →  META_NONLINEAR_REGRESSION_DATASET_INDEX
+                  └─ run_pretrain_pipeline_nonlinear(...)  →  pretrain_nonlinear_model.pt
+                         └─ run_hpo_pipeline(... nonlinear_model ...)  →  best_config.json
                                 └─ run_model_training(...)  →  best.pt
 ```
 
 ### SYNREG_INDEX_TABLE injection
 
 When evaluation procedures submit SPCS or MLJob containers, they automatically inject
-`SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX`. No manual step is required.
+`SYNREG_INDEX_TABLE=NONLINEAR_REGRESSION_DATASET_INDEX`. No manual step is required.
+

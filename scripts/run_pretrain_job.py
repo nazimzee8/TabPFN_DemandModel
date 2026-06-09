@@ -10,7 +10,23 @@ import os
 
 from snowflake.ml.jobs import submit_from_stage
 
-EXPECTED_INDEX_COUNTS = {"train": 800, "val": 100, "test": 100}
+def _derive_split_counts(total: int) -> dict:
+    train = int(0.8 * total)
+    val = int(0.1 * total)
+    test = total - train - val
+    return {"train": train, "val": val, "test": test}
+
+
+_LINEAR_EXPECTED_TOTAL = int(os.getenv("META_DATASET_EXPECTED_TOTAL", "1000"))
+_NONLINEAR_EXPECTED_TOTAL = int(os.getenv("META_NONLINEAR_DATASET_EXPECTED_TOTAL", "1000"))
+_CLASSIFICATION_EXPECTED_TOTAL = int(
+    os.getenv("META_CLASSIFICATION_DATASET_EXPECTED_TOTAL", "1000")
+)
+EXPECTED_INDEX_COUNTS = _derive_split_counts(_LINEAR_EXPECTED_TOTAL)
+_NONLINEAR_EXPECTED_INDEX_COUNTS = _derive_split_counts(_NONLINEAR_EXPECTED_TOTAL)
+_CLASSIFICATION_EXPECTED_INDEX_COUNTS = _derive_split_counts(
+    _CLASSIFICATION_EXPECTED_TOTAL
+)
 
 # Nonlinear pretrain defaults: enable latent ridge expert, disable linear ridge expert.
 NONLINEAR_PRETRAIN_DEFAULTS = {
@@ -23,6 +39,7 @@ NONLINEAR_PRETRAIN_DEFAULTS = {
 }
 NONLINEAR_PRETRAIN_CHECKPOINT = "pretrain_nonlinear_meta.pt"
 NONLINEAR_TRAINING_DATA_FAMILY = "synthetic_regression_nonlinear"
+CLASSIFICATION_TRAINING_DATA_FAMILY = "synthetic_linear_classification"
 
 GPU_POOL            = "DEEPSET_GPU_POOL"
 MODEL_STAGE         = "@MODEL_STAGE"
@@ -35,7 +52,7 @@ TRAIN_NUM_NODES             = 10
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
     "PRETRAIN_TRAINING_DATA_FAMILY",
-    os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined"),
+    os.getenv("TRAINING_DATA_FAMILY", "synthetic_linear_regression"),
 )
 
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
@@ -67,15 +84,15 @@ def _list_stage(session, stage_path):
 
 
 def _validate_meta_dataset_index(session):
-    """Pre-flight check: raises RuntimeError if META_DATASET_INDEX is missing or has wrong counts."""
+    """Pre-flight check: raises RuntimeError if META_REGRESSION_DATASET_INDEX is missing or has wrong counts."""
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_DATASET_INDEX GROUP BY split"
+            "FROM META_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_DATASET_INDEX does not exist or cannot be queried. "
+            "META_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
             "Run CALL build_meta_dataset_index(); first."
         ) from exc
 
@@ -87,11 +104,11 @@ def _validate_meta_dataset_index(session):
     }
     if mismatches:
         raise RuntimeError(
-            f"META_DATASET_INDEX has wrong split counts: {mismatches}. "
+            f"META_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
             "Run CALL build_meta_dataset_index(); to rebuild."
         )
     print(
-        "META_DATASET_INDEX validated: "
+        "META_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
@@ -99,11 +116,11 @@ def _validate_meta_dataset_index(session):
     _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLUMNS} FROM META_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_DATASET_INDEX is missing one or more required columns "
+            f"META_REGRESSION_DATASET_INDEX is missing one or more required columns "
             f"({_REQUIRED_COLUMNS}). "
             "Rebuild with CALL build_meta_dataset_index(); "
             f"Error: {exc}"
@@ -112,28 +129,66 @@ def _validate_meta_dataset_index(session):
     # Stage file accessibility spot-check — catches empty/missing staged data
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(f"LIST @META_REGRESSION_DATASET_STAGE/{_split}/").collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files found in @META_DATASET_STAGE/{_split}/. "
+                    f"No staged files found in @META_REGRESSION_DATASET_STAGE/{_split}/. "
                     "Re-upload training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"META_DATASET_INDEX references @META_DATASET_STAGE/{_split}/ "
+                f"META_REGRESSION_DATASET_INDEX references @META_REGRESSION_DATASET_STAGE/{_split}/ "
                 f"but the stage directory is inaccessible: {exc}. "
                 "Verify stage permissions and re-upload data."
             ) from exc
 
 
 def _validate_training_dataset_index(session, training_data_family: str) -> None:
-    """Route index validation to the nonlinear or linear table by training family."""
+    """Route index validation to the table selected by TRAINING_DATA_FAMILY."""
     if training_data_family == NONLINEAR_TRAINING_DATA_FAMILY:
         _validate_nonlinear_dataset_index(session)
+    elif training_data_family == CLASSIFICATION_TRAINING_DATA_FAMILY:
+        _validate_classification_dataset_index(session)
     else:
         _validate_meta_dataset_index(session)
+
+
+def _validate_classification_dataset_index(session) -> None:
+    table = "META_CLASSIFICATION_DATASET_INDEX"
+    stage = "@META_CLASSIFICATION_DATASET_STAGE"
+    try:
+        rows = session.sql(
+            f"SELECT split, COUNT(*) AS task_count FROM {table} GROUP BY split"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} does not exist or cannot be queried. "
+            "Build the classification index before starting training."
+        ) from exc
+    counts = {str(row[0]).lower(): int(row[1]) for row in rows}
+    mismatches = {
+        split: {"expected": expected, "actual": counts.get(split, 0)}
+        for split, expected in _CLASSIFICATION_EXPECTED_INDEX_COUNTS.items()
+        if counts.get(split, 0) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"{table} has wrong split counts: {mismatches}.")
+    required = (
+        "split, task_id, stage_path, p, n_train, hpo_bucket, "
+        "prior_regime, num_classes"
+    )
+    try:
+        session.sql(f"SELECT {required} FROM {table} LIMIT 1").collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} is missing required columns ({required}): {exc}"
+        ) from exc
+    for split in ("train", "val"):
+        files = session.sql(f"LIST {stage}/{split}/").collect()
+        if not files:
+            raise RuntimeError(f"No staged files found in {stage}/{split}/.")
 
 
 def _run_pretrain_impl(
@@ -143,6 +198,11 @@ def _run_pretrain_impl(
     model_design_pattern: str,
 ) -> str:
     _validate_training_dataset_index(session, training_data_family)
+    checkpoint_name = (
+        "pretrain_classification.pt"
+        if training_data_family == CLASSIFICATION_TRAINING_DATA_FAMILY
+        else "pretrain.pt"
+    )
     print("Submitting pre-training job ...")
     pretrain_job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -151,14 +211,19 @@ def _run_pretrain_impl(
         stage_name=MLJOB_PAYLOAD_STAGE,
         target_instances=TRAIN_NUM_NODES,
         env_vars={
-            "CHECKPOINT_OUTPUT_NAME":    "pretrain.pt",
-            "TRAIN_NUM_NODES":           str(TRAIN_NUM_NODES),
-            "HOME":                      "/tmp",
-            "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),
-            "STRICT_WORLD_SIZE_CHECK":   "true",
-            "MODEL_FAMILY":              model_family,
-            "TRAINING_DATA_FAMILY":      training_data_family,
-            "MODEL_DESIGN_PATTERN":     model_design_pattern,
+            "CHECKPOINT_OUTPUT_NAME":                checkpoint_name,
+            "TRAIN_NUM_NODES":                       str(TRAIN_NUM_NODES),
+            "HOME":                                  "/tmp",
+            "EXPECTED_TRAIN_WORLD_SIZE":             str(TRAIN_NUM_NODES * 4),
+            "STRICT_WORLD_SIZE_CHECK":               "true",
+            "MODEL_FAMILY":                          model_family,
+            "TRAINING_DATA_FAMILY":                  training_data_family,
+            "MODEL_DESIGN_PATTERN":                  model_design_pattern,
+            "META_DATASET_EXPECTED_TOTAL":           str(_LINEAR_EXPECTED_TOTAL),
+            "META_NONLINEAR_DATASET_EXPECTED_TOTAL": str(_NONLINEAR_EXPECTED_TOTAL),
+            "META_CLASSIFICATION_DATASET_EXPECTED_TOTAL": str(
+                _CLASSIFICATION_EXPECTED_TOTAL
+            ),
         },
         session=session,
     )
@@ -191,7 +256,11 @@ def _run_pretrain_gate_impl(
             f"gate_hidden_dim={gate_dim} is not a valid HPO candidate. "
             "Allowed values: 32, 64, 128."
         )
-    checkpoint_name = f"pretrain_gate{gate_dim}.pt"
+    checkpoint_name = (
+        f"pretrain_classification_gate{gate_dim}.pt"
+        if training_data_family == CLASSIFICATION_TRAINING_DATA_FAMILY
+        else f"pretrain_gate{gate_dim}.pt"
+    )
     print(f"Submitting pre-training job for gate_hidden_dim={gate_dim} ({checkpoint_name}) ...")
     pretrain_job = submit_from_stage(
         source=SCRIPTS_STAGE,
@@ -209,6 +278,9 @@ def _run_pretrain_gate_impl(
             "MODEL_FAMILY":              model_family,
             "TRAINING_DATA_FAMILY":      training_data_family,
             "MODEL_DESIGN_PATTERN":     model_design_pattern,
+            "META_CLASSIFICATION_DATASET_EXPECTED_TOTAL": str(
+                _CLASSIFICATION_EXPECTED_TOTAL
+            ),
         },
         session=session,
     )
@@ -244,7 +316,7 @@ def run_pretrain_pipeline_model(
     Usage:
         CALL run_pretrain_pipeline(
             'market_exchangeable_icl',
-            'synthetic_regression_combined',
+            'synthetic_linear_regression',
             'inductive_forecasting'
         );
     """
@@ -272,7 +344,7 @@ def run_pretrain_pipeline_model_gate(
     Usage:
         CALL run_pretrain_pipeline(
             'market_exchangeable_icl',
-            'synthetic_regression_combined',
+            'synthetic_linear_regression',
             'inductive_forecasting',
             64
         );
@@ -288,42 +360,42 @@ def run_pretrain_pipeline_model_gate(
 
 
 def _validate_nonlinear_dataset_index(session):
-    """Pre-flight check: raises RuntimeError if META_NONLINEAR_DATASET_INDEX is missing or has wrong counts."""
+    """Pre-flight check: raises RuntimeError if META_NONLINEAR_REGRESSION_DATASET_INDEX is missing or has wrong counts."""
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_NONLINEAR_DATASET_INDEX GROUP BY split"
+            "FROM META_NONLINEAR_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_NONLINEAR_DATASET_INDEX does not exist or cannot be queried. "
+            "META_NONLINEAR_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
             "Run CALL build_meta_nonlinear_dataset_index(); first."
         ) from exc
 
     counts = {str(row[0]).lower(): int(row[1]) for row in rows}
     mismatches = {
         split: {"expected": expected, "actual": counts.get(split, 0)}
-        for split, expected in EXPECTED_INDEX_COUNTS.items()
+        for split, expected in _NONLINEAR_EXPECTED_INDEX_COUNTS.items()
         if counts.get(split, 0) != expected
     }
     if mismatches:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX has wrong split counts: {mismatches}. "
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
             "Run CALL build_meta_nonlinear_dataset_index(); to rebuild."
         )
     print(
-        "META_NONLINEAR_DATASET_INDEX validated: "
+        "META_NONLINEAR_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
     _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLUMNS} FROM META_NONLINEAR_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_NONLINEAR_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX is missing one or more required columns "
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX is missing one or more required columns "
             f"({_REQUIRED_COLUMNS}). "
             "Rebuild with CALL build_meta_nonlinear_dataset_index(); "
             f"Error: {exc}"
@@ -331,17 +403,17 @@ def _validate_nonlinear_dataset_index(session):
 
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_NONLINEAR_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(f"LIST @META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/").collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files found in @META_NONLINEAR_DATASET_STAGE/{_split}/. "
+                    f"No staged files found in @META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/. "
                     "Re-upload nonlinear training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"META_NONLINEAR_DATASET_INDEX references @META_NONLINEAR_DATASET_STAGE/{_split}/ "
+                f"META_NONLINEAR_REGRESSION_DATASET_INDEX references @META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/ "
                 f"but the stage directory is inaccessible: {exc}. "
                 "Verify stage permissions and re-upload data."
             ) from exc

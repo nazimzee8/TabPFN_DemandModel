@@ -368,8 +368,8 @@ Required metadata fields:
     "model_arch_version": "model3",
     "model_design_pattern": "inductive_forecasting",  # or "transductive_completion"
     "model_family": "market_exchangeable_icl",         # or "market_exchangeable_completion"
-    "training_data_family": "...",
-    "task_objective": "...",
+    "training_data_family": "linear_poisson_v1",       # must match training prior
+    "task_objective": "inductive_regression",          # or "transductive_completion"
     "checkpoint_format_version": 4,
 }
 ```

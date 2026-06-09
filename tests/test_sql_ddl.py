@@ -13,17 +13,34 @@ import pytest
 
 ROOT = Path(__file__).parent.parent
 
+SQL_DIR = ROOT / "sql"
+_ALL_SQL_FILES = [
+    "synthetic_linear_pipeline.sql",
+    "03_synthetic_regression_probes.sql",
+    "04_synthetic_regression_evaluation_pipeline.sql",
+]
+
+
+def _read_all_sql() -> str:
+    """Concatenate the main SQL DDL files (formerly run_training_job.sql)."""
+    parts = []
+    for name in _ALL_SQL_FILES:
+        path = SQL_DIR / name
+        if path.exists():
+            parts.append(path.read_text())
+    return "\n".join(parts)
+
 
 class TestSQLStoredProcedures:
     def _sql(self) -> str:
-        return (ROOT / "sql" / "run_training_job.sql").read_text()
+        return _read_all_sql()
 
     def test_ood_full_procedure_exists(self):
         assert "run_synthetic_regression_ood_full_evaluation" in self._sql()
 
     def test_ood_full_handler_is_correct(self):
         assert (
-            "run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_evaluation"
+            "run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_prep"
             in self._sql()
         )
 
@@ -34,12 +51,12 @@ class TestSQLStoredProcedures:
         assert "run_synthetic_regression_evaluation.py" in sql
 
     def test_synthetic_regression_index_ddl_exists(self):
-        assert "SYNTHETIC_REGRESSION_DATASET_INDEX" in self._sql()
+        assert "LINEAR_REGRESSION_DATASET_INDEX" in self._sql()
 
     def test_synthetic_regression_index_has_logical_dataset_key(self):
         sql = self._sql()
         assert "logical_dataset_key" in sql
-        assert "SYNTHETIC_REGRESSION_DATASET_INDEX" in sql
+        assert "LINEAR_REGRESSION_DATASET_INDEX" in sql
 
     def test_ood_full_procedure_has_runbook(self):
         sql = self._sql()
@@ -49,7 +66,7 @@ class TestSQLStoredProcedures:
 
 class TestSplitPhaseStoredProcedures:
     def _sql(self) -> str:
-        return (ROOT / "sql" / "run_training_job.sql").read_text()
+        return _read_all_sql()
 
     @pytest.mark.parametrize("name", [
         "run_synthetic_regression_runtime_probes",
@@ -57,21 +74,18 @@ class TestSplitPhaseStoredProcedures:
         "run_synthetic_regression_baseline_capacity_probe",
         "run_synthetic_regression_autogluon_capacity_probe",
         "run_synthetic_regression_prep",
-        "run_synthetic_regression_deepset_evaluation",
-        "run_synthetic_regression_baseline_evaluation",
-        "run_synthetic_regression_autogluon_evaluation",
-        "run_synthetic_regression_aggregation",
-        "run_synthetic_regression_pipeline",
+        "run_synthetic_regression_combined_deepset_evaluation",
+        "run_synthetic_regression_combined_baseline_evaluation",
+        "run_synthetic_regression_combined_autogluon_evaluation",
+        "run_synthetic_regression_combined_aggregation",
+        "run_synthetic_regression_linear_pipeline",
     ])
     def test_main_pipeline_procedure_exists(self, name):
         assert name in self._sql(), f"Procedure '{name}' not found in SQL DDL"
 
     @pytest.mark.parametrize("name", [
         "run_synthetic_regression_ood_full_prep",
-        "run_synthetic_regression_ood_full_deepset_evaluation",
-        "run_synthetic_regression_ood_full_baseline_evaluation",
-        "run_synthetic_regression_ood_full_autogluon_evaluation",
-        "run_synthetic_regression_ood_full_aggregation",
+        "run_synthetic_regression_ood_deepset_pilot",
     ])
     def test_ood_full_phase_procedure_exists(self, name):
         assert name in self._sql(), f"Procedure '{name}' not found in SQL DDL"
@@ -150,23 +164,24 @@ class TestSplitPhaseStoredProcedures:
 
     def test_concurrency_comments_document_single_wave_rejection(self):
         sql = self._sql()
-        assert "Single-wave execution is enforced" in sql
+        # Comment text may wrap across lines with '-- ' continuation
+        sql_no_comment_prefix = sql.replace("\n-- ", " ")
+        assert "Single-wave execution is enforced" in sql_no_comment_prefix
         assert "Lower values fail fast" in sql or "Lower values are rejected" in sql
         assert "AUTOGLUON_CONCURRENT_CLUSTERS must equal AUTOGLUON_CLUSTER_SHARDS" in sql
 
     def test_existing_synthetic_regression_signatures_remain(self):
         sql = self._sql()
+        # Combined baseline evaluation — 1-arg default overload
         assert (
-            "run_synthetic_regression_baseline_evaluation(\n"
-            "  PREP_RUNTIME_ENVIRONMENT STRING,\n"
-            "  BENCHMARK_RUNTIME_ENVIRONMENT STRING,\n"
-            "  AUTOGLUON_RUNTIME_ENVIRONMENT STRING\n"
+            "run_synthetic_regression_combined_baseline_evaluation(\n"
+            "  BENCH_RUNTIME_ENVIRONMENT STRING\n"
             ")"
         ) in sql
+        # Combined autogluon evaluation — 2-arg default overload
         assert (
-            "run_synthetic_regression_autogluon_evaluation(\n"
-            "  PREP_RUNTIME_ENVIRONMENT STRING,\n"
-            "  BENCHMARK_RUNTIME_ENVIRONMENT STRING,\n"
+            "run_synthetic_regression_combined_autogluon_evaluation(\n"
+            "  BENCH_RUNTIME_ENVIRONMENT STRING,\n"
             "  AUTOGLUON_RUNTIME_ENVIRONMENT STRING\n"
             ")"
         ) in sql
@@ -202,7 +217,7 @@ class TestSQLEnvVarRenames:
     """Verify MODEL_FAMILY / MODEL_ARCH_VERSION rename in stored procedure signatures."""
 
     def _sql(self) -> str:
-        return (ROOT / "sql" / "run_training_job.sql").read_text()
+        return _read_all_sql()
 
     def test_model_family_param_present(self):
         """MODEL_FAMILY STRING must appear in the SQL."""
@@ -250,27 +265,25 @@ class TestSQLEnvVarRenames:
                 f"Runbook must include CALL run_pretrain_pipeline(..., {gate_dim})"
             )
 
-    def test_architecture_sweep_enabled_comment(self):
-        """SQL must document that architecture HPO is enabled and describe two-sweep strategy."""
+    def test_hpo_sweep_mode_documented(self):
+        """SQL must document the HPO sweep mode."""
         sql = self._sql()
-        assert "architecture" in sql, (
-            "SQL must reference architecture sweep mode"
+        assert "HPO_SWEEP_MODE STRING" in sql, (
+            "SQL must define HPO_SWEEP_MODE parameter"
         )
-        # architecture sweep is now enabled — no 'NotImplementedError' guard should exist
+        assert "linear_model" in sql, (
+            "SQL must reference 'linear_model' sweep mode"
+        )
+        # No NotImplementedError guard should exist
         assert "NotImplementedError" not in sql, (
-            "SQL must not reference NotImplementedError for architecture sweep "
-            "(architecture sweep is now enabled)"
+            "SQL must not reference NotImplementedError"
         )
 
-    def test_architecture_recommended_as_two_sweep_path(self):
-        """SQL must describe two-sweep HPO (ridge_residual → architecture) as recommended."""
+    def test_hpo_pipeline_model_sweep_handler(self):
+        """SQL HPO handler must route to run_hpo_pipeline_model_sweep."""
         sql = self._sql()
-        # Two-sweep HPO is now the recommended path
-        assert "Two-sweep HPO" in sql or "two-sweep" in sql.lower(), (
-            "SQL must describe two-sweep HPO strategy"
-        )
-        assert "architecture" in sql, (
-            "SQL must reference architecture sweep as part of the recommended path"
+        assert "run_hpo_job.run_hpo_pipeline_model_sweep" in sql, (
+            "SQL must reference run_hpo_pipeline_model_sweep handler"
         )
 
     def test_pretrain_pt_not_required_for_hpo(self):
@@ -286,10 +299,10 @@ class TestSQLEnvVarRenames:
 
 
 class TestAutogluonImportTimingProbeSQLDDL:
-    """Tests that run_training_job.sql contains the import timing probe DDL."""
+    """Tests that the SQL DDL contains the import timing probe DDL."""
 
     def _sql(self) -> str:
-        return (ROOT / "sql" / "run_training_job.sql").read_text()
+        return _read_all_sql()
 
     def test_default_handler_exists(self):
         assert (
@@ -315,13 +328,14 @@ class TestAutogluonImportTimingProbeSQLDDL:
 
 
 class TestSPCSSQLDDL:
-    """Tests that run_training_job.sql and related SQL files contain SPCS DDL."""
+    """Tests that the SQL DDL files contain SPCS DDL."""
 
     def _sql(self) -> str:
-        return (ROOT / "sql" / "run_training_job.sql").read_text()
+        return _read_all_sql()
 
     def _repo_sql(self) -> str:
-        return (ROOT / "sql" / "create_autogluon_spcs_image_repository.sql").read_text()
+        # The image repository DDL is now in 04_synthetic_regression_evaluation_pipeline.sql
+        return (ROOT / "sql" / "04_synthetic_regression_evaluation_pipeline.sql").read_text()
 
     def test_image_repository_ddl_exists(self):
         assert "AUTOGLUON_IMAGE_REPOSITORY" in self._repo_sql()

@@ -261,7 +261,7 @@ class TestManifestIdempotency:
 
         # LIST returns the expected stage file
         list_row = MagicMock()
-        list_row.__getitem__ = lambda self, k: "@META_DATASET_STAGE/.../file1.npz"
+        list_row.__getitem__ = lambda self, k: "@META_REGRESSION_DATASET_STAGE/.../file1.npz"
         session.sql.return_value.collect.return_value = [
             type("Row", (), {"name": "file1.npz"})()
         ]
@@ -726,7 +726,7 @@ class TestOODLogicalDatasetKey:
         assert len(keys) == len(set(keys)), "OOD logical_dataset_key must differ per regime"
 
     def test_evaluation_uses_index_key_when_available(self):
-        import evaluate_synthetic_regression as evsr
+        import evaluate_linear_regression as evsr
         row = {
             "logical_dataset_key": "X:A:0001",
             "suite_id": "linear_poisson_v1_recommended",
@@ -741,7 +741,7 @@ class TestOODLogicalDatasetKey:
         assert key == "X:A:0001"
 
     def test_evaluation_falls_back_to_zero_padded_key(self):
-        import evaluate_synthetic_regression as evsr
+        import evaluate_linear_regression as evsr
         row = {
             "suite_id": "linear_poisson_v1_recommended",
             "prior_regime": "A",

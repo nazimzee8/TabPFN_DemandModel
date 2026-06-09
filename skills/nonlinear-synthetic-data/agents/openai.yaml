@@ -1,0 +1,4 @@
+interface:
+  display_name: "Nonlinear Synthetic Data"
+  short_description: "Generate diverse nonlinear DeepSet regression data"
+  default_prompt: "Use $nonlinear-synthetic-data to generate and validate diverse nonlinear synthetic regression datasets for DeepSet training."

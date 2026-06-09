@@ -237,7 +237,11 @@ _VALID_AUTOGLUON_EXECUTION_BACKENDS = {"mljob", "spcs_job"}
 SYNREG_CHECKPOINT_LOADING_MODES = {"deepset", "baselines"}
 SYNREG_DEEPSET_CKPT_STAGE = os.getenv(
     "SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH",
-    "@MODEL_STAGE/checkpoints/best.pt",
+    (
+        "@MODEL_STAGE/checkpoints/best_classification.pt"
+        if os.getenv("TRAINING_DATA_FAMILY", "").startswith("synthetic_linear_classification")
+        else "@MODEL_STAGE/checkpoints/best_regression.pt"
+    ),
 )
 
 # Runtime environment keys (passed as positional args to handlers)
@@ -731,7 +735,7 @@ class _AutoGluonExecutionPlan:
     mode="single_node_shards":
         output_shards = concurrent_units (= AUTOGLUON_CONCURRENT_CLUSTERS)
         workers_per_shard = 1 (enforced)
-        entrypoint = evaluate_synthetic_regression.py
+        entrypoint = evaluate_linear_regression.py
         target_instances = 1
         capacity_probe_entrypoint = capacity_probe.py
         uses_ray = False
@@ -788,7 +792,7 @@ def _resolve_combined_autogluon_execution_plan(
         - AUTOGLUON_CLUSTER_SHARDS == 0
         - AUTOGLUON_WORKERS_PER_SHARD must equal 1
         - AUTOGLUON_CONCURRENT_CLUSTERS is interpreted as concurrent single-node shard count
-        - entrypoint is always evaluate_synthetic_regression.py (derived internally)
+        - entrypoint is always evaluate_linear_regression.py (derived internally)
         - target_instances = 1
         - output_shards = concurrent_clusters
 
@@ -828,13 +832,13 @@ def _resolve_combined_autogluon_execution_plan(
             env_var="SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS",
             default=SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS_DEFAULT,
         )
-        # Entrypoint is derived internally — single-node mode always uses evaluate_synthetic_regression.py.
+        # Entrypoint is derived internally — single-node mode always uses evaluate_linear_regression.py.
         return _AutoGluonExecutionPlan(
             mode="single_node_shards",
             output_shards=concurrent_shards,
             workers_per_shard=1,
             concurrent_units=concurrent_shards,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             capacity_probe_entrypoint="capacity_probe.py",
             uses_ray=False,
@@ -926,11 +930,21 @@ def _synreg_shard_env(
 ) -> dict[str, str]:
     """Build env vars for synthetic regression evaluation shard jobs."""
     env = {
+        "TRAINING_DATA_FAMILY": os.getenv(
+            "TRAINING_DATA_FAMILY", "synthetic_linear_regression"
+        ),
         "SYNTHETIC_REGRESSION_MODE": mode,
         "SYNTHETIC_REGRESSION_SUITE_ID": suite_id,
         "SYNTHETIC_REGRESSION_NUM_SHARDS": str(num_shards),
         "SYNTHETIC_REGRESSION_SHARD_INDEX": str(shard_index),
         "SYNREG_RESULTS_STAGE": results_stage,
+        # Explicit flag propagation (mixed-cat + index table)
+        "SYNREG_IS_MIXED_CATEGORICAL": os.getenv(
+            "SYNREG_IS_MIXED_CATEGORICAL", "false"
+        ),
+        "SYNREG_INDEX_TABLE": os.getenv(
+            "SYNREG_INDEX_TABLE", "LINEAR_REGRESSION_DATASET_INDEX"
+        ),
     }
     if extra_env:
         env.update(extra_env)
@@ -977,7 +991,7 @@ def _submit_synreg(
     compute_pool: str,
     env_vars: dict,
     runtime_environment: str,
-    entrypoint: str = "evaluate_synthetic_regression.py",
+    entrypoint: str = "evaluate_linear_regression.py",
     target_instances: int = 1,
     pip_requirements: list[str] | None = None,
     external_access_integrations: list[str] | None = None,
@@ -1835,7 +1849,7 @@ def run_synthetic_regression_prep(
     """Submit prepare_synthetic_regression.py on DEEPSET_CPU_POOL (prep_rt).
 
     Indexes the in-distribution suite (default suite_id = linear_poisson_v1_recommended,
-    200 datasets × 5 split seeds) into SYNTHETIC_REGRESSION_DATASET_INDEX.
+    200 datasets × 5 split seeds) into LINEAR_REGRESSION_DATASET_INDEX.
 
     OOD indexing is handled exclusively by run_synthetic_regression_ood_deepset_pilot.
     """
@@ -1875,6 +1889,10 @@ def run_synthetic_regression_deepset_evaluation(
     No pip, no EAI.
     """
     suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
+    results_stage = os.getenv(
+        "SYNREG_RESULTS_STAGE",
+        f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}",
+    )
 
     # Preflight: verify checkpoint exists before wasting GPU quota.
     _ckpt_filename = SYNREG_DEEPSET_CKPT_STAGE.rsplit("/", 1)[-1]
@@ -1899,7 +1917,7 @@ def run_synthetic_regression_deepset_evaluation(
                 suite_id=suite_id,
                 num_shards=SYNREG_GPU_SHARDS,
                 shard_index=i,
-                results_stage=f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}",
+                results_stage=results_stage,
                 extra_env={
                     "MC_K": "8",
                     "SYNTHETIC_REGRESSION_CONTEXT_SIZE": "200",
@@ -1913,7 +1931,7 @@ def run_synthetic_regression_deepset_evaluation(
                 },
             ),
             runtime_environment=benchmark_runtime_environment,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=None,
             external_access_integrations=None,
@@ -1942,6 +1960,10 @@ def run_synthetic_regression_baseline_evaluation(
     """
     proc = "run_synthetic_regression_baseline_evaluation"
     suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
+    results_stage = os.getenv(
+        "SYNREG_RESULTS_STAGE",
+        f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}",
+    )
     shard_count = _resolve_baseline_shard_count(proc, baseline_shards)
     _resolve_baseline_concurrent_nodes(proc, baseline_concurrent_nodes, shard_count=shard_count)
 
@@ -1957,10 +1979,10 @@ def run_synthetic_regression_baseline_evaluation(
                 suite_id=suite_id,
                 num_shards=shard_count,
                 shard_index=i,
-                results_stage=f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}",
+                results_stage=results_stage,
             ),
             runtime_environment=benchmark_runtime_environment,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=SYNREG_BASELINE_PIP,
             external_access_integrations=SYNREG_PYPI_EAI,
@@ -2020,6 +2042,10 @@ def run_synthetic_regression_autogluon_evaluation(
     pip=autogluon.tabular==1.3.0, EAI=TABPFN_PYPI_EAI.
     """
     suite_id = os.getenv("SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended")
+    results_stage = os.getenv(
+        "SYNREG_RESULTS_STAGE",
+        f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}",
+    )
     ag_time_limit = os.getenv("AUTOGLUON_TIME_LIMIT", "300")
     ag_presets = os.getenv("AUTOGLUON_PRESETS", "best_quality")
     autogluon_concurrency = _resolve_autogluon_concurrent_nodes(
@@ -2039,14 +2065,14 @@ def run_synthetic_regression_autogluon_evaluation(
                 suite_id=suite_id,
                 num_shards=SYNREG_AUTOGLUON_SHARDS,
                 shard_index=i,
-                results_stage=f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}",
+                results_stage=results_stage,
                 extra_env={
                     "AUTOGLUON_TIME_LIMIT": ag_time_limit,
                     "AUTOGLUON_PRESETS": ag_presets,
                 },
             ),
             runtime_environment=autogluon_runtime_environment,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=SYNREG_AG_PIP,
             external_access_integrations=SYNREG_PYPI_EAI,
@@ -2092,6 +2118,19 @@ def run_synthetic_regression_aggregation(
     suite_id = os.getenv(
         "SYNTHETIC_REGRESSION_SUITE_ID", "linear_poisson_v1_recommended"
     )
+    results_stage = os.getenv(
+        "SYNREG_RESULTS_STAGE",
+        f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}",
+    )
+    expected_deepset = os.getenv(
+        "SYNREG_EXPECTED_DEEPSET_SHARDS", str(SYNREG_GPU_SHARDS)
+    )
+    expected_baselines = os.getenv(
+        "SYNREG_EXPECTED_BASELINE_SHARDS", str(SYNREG_CPU_SHARDS)
+    )
+    expected_ag = os.getenv(
+        "SYNREG_EXPECTED_AG_SHARDS", str(SYNREG_AUTOGLUON_SHARDS)
+    )
     job = _submit_synreg(
         session=session,
         label="synreg_aggregate",
@@ -2099,13 +2138,13 @@ def run_synthetic_regression_aggregation(
         env_vars={
             "SYNTHETIC_REGRESSION_MODE": "aggregate",
             "SYNTHETIC_REGRESSION_SUITE_ID": suite_id,
-            "SYNREG_RESULTS_STAGE": f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}",
-            "SYNREG_EXPECTED_DEEPSET_SHARDS":  str(SYNREG_GPU_SHARDS),
-            "SYNREG_EXPECTED_BASELINE_SHARDS": str(SYNREG_CPU_SHARDS),
-            "SYNREG_EXPECTED_AG_SHARDS":       str(SYNREG_AUTOGLUON_SHARDS),
+            "SYNREG_RESULTS_STAGE": results_stage,
+            "SYNREG_EXPECTED_DEEPSET_SHARDS": expected_deepset,
+            "SYNREG_EXPECTED_BASELINE_SHARDS": expected_baselines,
+            "SYNREG_EXPECTED_AG_SHARDS": expected_ag,
         },
         runtime_environment=benchmark_runtime_environment,
-        entrypoint="evaluate_synthetic_regression.py",
+        entrypoint="evaluate_linear_regression.py",
         target_instances=1,
         pip_requirements=None,
         external_access_integrations=None,
@@ -2124,14 +2163,14 @@ def run_synthetic_regression_aggregation(
 # ---------------------------------------------------------------------------
 
 OOD_PILOT_SUITE_ID  = "ood_linear_pilot_v1"    # pilot (80 datasets, DeepSet only)
-OOD_PILOT_PARTS_PREFIX = "@EVALUATION_RESULTS_STAGE/ood_parity"
+OOD_PILOT_PARTS_PREFIX = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric/ood_parity"
 OOD_PILOT_GPU_SHARDS = 5
 
 OOD_FULL_SUITE_ID      = "ood_linear_full_v1"   # full suite (200 datasets, all methods)
 OOD_FULL_GPU_SHARDS    = SYNREG_GPU_SHARDS       # 10, same as main pipeline
 OOD_FULL_N_DATASETS    = 200                     # all 50/regime × 4 regimes
-OOD_FULL_PARTS_PREFIX  = f"@EVALUATION_RESULTS_STAGE/regression/{OOD_FULL_SUITE_ID}"
-OOD_FULL_OUTPUT_STAGE  = "@EVALUATION_RESULTS_STAGE/ood_full"
+OOD_FULL_PARTS_PREFIX  = f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{OOD_FULL_SUITE_ID}"
+OOD_FULL_OUTPUT_STAGE  = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
 
 
 def _submit_ood_prep(session, suite_id: str, n_datasets: int, bench_rt: str):
@@ -2157,10 +2196,10 @@ def run_synthetic_regression_ood_deepset_pilot(session, bench_rt: str) -> str:
     """Prep + DeepSet-only OOD pilot. DeepSet shards only — no CPU evaluators, no external AutoML.
 
     Phase 1 — OOD prep: indexes 80 pilot datasets (20 per regime) into
-    SYNTHETIC_REGRESSION_DATASET_INDEX under suite_id=ood_linear_pilot_v1.
+    LINEAR_REGRESSION_DATASET_INDEX under suite_id=ood_linear_pilot_v1.
 
     Phase 2 — DeepSet shards: 5 GPU shards on DEEPSET_GPU_POOL, each writing
-    result parts to @EVALUATION_RESULTS_STAGE/ood_parity/.
+    result parts to @EVALUATION_RESULTS_STAGE/linear/regression/numeric/ood_parity/.
     """
     _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
     _ensure_compute_pool_usable(session, DEEPSET_GPU_POOL)
@@ -2197,7 +2236,7 @@ def run_synthetic_regression_ood_deepset_pilot(session, bench_rt: str) -> str:
                 "SYNREG_CHECKPOINT_GATE_STRICT": "true",
             },
             runtime_environment=bench_rt,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
         )
         for i in range(OOD_PILOT_GPU_SHARDS)
@@ -2268,7 +2307,7 @@ def run_synthetic_regression_ood_full_deepset_evaluation(
                 },
             ),
             runtime_environment=bench_rt,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=None,
             external_access_integrations=None,
@@ -2301,7 +2340,7 @@ def run_synthetic_regression_ood_full_aggregation(
             "SYNREG_EXPECTED_AG_SHARDS":       str(SYNREG_AUTOGLUON_SHARDS),
         },
         runtime_environment=bench_rt,
-        entrypoint="evaluate_synthetic_regression.py",
+        entrypoint="evaluate_linear_regression.py",
         target_instances=1,
         pip_requirements=None,
         external_access_integrations=None,
@@ -2352,14 +2391,59 @@ def run_synthetic_regression_pipeline(
 
 COMBINED_SUITE_ID      = "linear_all_v1"
 COMBINED_N_DATASETS    = 400
-COMBINED_PARTS_PREFIX  = f"@EVALUATION_RESULTS_STAGE/regression/{COMBINED_SUITE_ID}"
-COMBINED_OUTPUT_STAGE  = "@EVALUATION_RESULTS_STAGE/combined"
+COMBINED_PARTS_PREFIX  = f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{COMBINED_SUITE_ID}"
+COMBINED_OUTPUT_STAGE  = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
+
+
+def _configure_combined_training_data_family(training_data_family=None) -> str:
+    """Set one explicit task-family context for all submitted evaluation jobs."""
+    global COMBINED_SUITE_ID
+    global COMBINED_PARTS_PREFIX
+    global COMBINED_OUTPUT_STAGE
+    global SYNREG_DEEPSET_CKPT_STAGE
+
+    family = (
+        str(training_data_family).strip()
+        if training_data_family is not None
+        else os.getenv("TRAINING_DATA_FAMILY", "synthetic_linear_regression").strip()
+    )
+    if family not in {
+        "synthetic_linear_regression",
+        "synthetic_regression_combined",
+        "synthetic_linear_classification",
+    }:
+        raise ValueError(
+            "Combined evaluation supports TRAINING_DATA_FAMILY in "
+            "{'synthetic_linear_regression', 'synthetic_regression_combined', "
+            "'synthetic_linear_classification'}; "
+            f"got {family!r}."
+        )
+    os.environ["TRAINING_DATA_FAMILY"] = family
+    if family == "synthetic_linear_classification":
+        COMBINED_SUITE_ID = os.getenv(
+            "SYNTHETIC_CLASSIFICATION_SUITE_ID",
+            "linear_classification_stat_aware",
+        )
+        COMBINED_PARTS_PREFIX = (
+            f"@EVALUATION_RESULTS_STAGE/linear/classification/numeric/{COMBINED_SUITE_ID}"
+        )
+        COMBINED_OUTPUT_STAGE = "@EVALUATION_RESULTS_STAGE/linear/classification/numeric"
+        SYNREG_DEEPSET_CKPT_STAGE = "@MODEL_STAGE/checkpoints/best_classification.pt"
+    else:
+        COMBINED_SUITE_ID = "linear_all_v1"
+        COMBINED_PARTS_PREFIX = (
+            f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{COMBINED_SUITE_ID}"
+        )
+        COMBINED_OUTPUT_STAGE = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
+        SYNREG_DEEPSET_CKPT_STAGE = "@MODEL_STAGE/checkpoints/best_regression.pt"
+    return family
 
 
 def run_synthetic_regression_combined_prep(
     session,
     bench_rt: str = "2.5.0-py311",
     ag_rt: str = "2.5.0-py311",
+    training_data_family=None,
 ) -> str:
     """Phase 1: Submit prepare_synthetic_regression.py with SYNTHETIC_REGRESSION_SUITE_ID=linear_all_v1.
 
@@ -2367,6 +2451,22 @@ def run_synthetic_regression_combined_prep(
     copies index rows from both the primary in-distribution suite and the OOD full suite.
     Both source suites must be indexed before calling this procedure.
     """
+    family = _configure_combined_training_data_family(training_data_family)
+    if family == "synthetic_linear_classification":
+        rows = session.sql(
+            "SELECT COUNT(*) FROM LINEAR_CLASSIFICATION_DATASET_INDEX "
+            f"WHERE suite_id = '{COMBINED_SUITE_ID}'"
+        ).collect()
+        count = int(rows[0][0])
+        if count <= 0:
+            raise RuntimeError(
+                "LINEAR_CLASSIFICATION_DATASET_INDEX has no rows for "
+                f"suite_id={COMBINED_SUITE_ID!r}."
+            )
+        return (
+            "run_synthetic_regression_combined_prep: classification index ready "
+            f"suite_id={COMBINED_SUITE_ID} rows={count}"
+        )
     _ensure_compute_pool_usable(session, DEEPSET_CPU_POOL)
     job = _submit_synreg(
         session=session,
@@ -2388,7 +2488,9 @@ def run_synthetic_regression_combined_prep(
 def run_synthetic_regression_combined_deepset_evaluation(
     session,
     bench_rt: str = "2.5.0-py311",
+    training_data_family=None,
 ) -> str:
+    family = _configure_combined_training_data_family(training_data_family)
     """Phase 2: DeepSet — 10 GPU shards on DEEPSET_GPU_POOL."""
     _ensure_compute_pool_usable(session, DEEPSET_GPU_POOL)
 
@@ -2420,7 +2522,11 @@ def run_synthetic_regression_combined_deepset_evaluation(
                     "SYNTHETIC_REGRESSION_CONTEXT_SIZE": "200",
                     "SYNTHETIC_REGRESSION_CONTEXT_ENSEMBLES": "5",
                     "SYNTHETIC_REGRESSION_TEST_BATCH_SIZE": "128",
-                    "SYNTHETIC_REGRESSION_FEATURE_SELECTOR": "train_f_regression",
+                    "SYNTHETIC_REGRESSION_FEATURE_SELECTOR": (
+                        "train_f_classif"
+                        if family == "synthetic_linear_classification"
+                        else "train_f_regression"
+                    ),
                     "BENCHMARK_REQUIRE_CUDA": "true",
                     "SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH": SYNREG_DEEPSET_CKPT_STAGE,
                     "SYNREG_RUN_CHECKPOINT_GATES": "true",
@@ -2428,7 +2534,7 @@ def run_synthetic_regression_combined_deepset_evaluation(
                 },
             ),
             runtime_environment=bench_rt,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=None,
             external_access_integrations=None,
@@ -2448,7 +2554,9 @@ def run_synthetic_regression_combined_aggregation(
     expected_ag_shards=None,
     expected_baseline_shards=None,
     expected_deepset_shards=None,
+    training_data_family=None,
 ) -> str:
+    family = _configure_combined_training_data_family(training_data_family)
     """Phase 5: Aggregation — 1 CPU job; outputs to COMBINED_OUTPUT_STAGE."""
     proc = "run_synthetic_regression_combined_aggregation"
     resolved_deepset = _resolve_positive_int_runtime_param(
@@ -2477,6 +2585,7 @@ def run_synthetic_regression_combined_aggregation(
         label="combined_aggregate",
         compute_pool=DEEPSET_CPU_POOL,
         env_vars={
+            "TRAINING_DATA_FAMILY": family,
             "SYNTHETIC_REGRESSION_MODE": "aggregate",
             "SYNTHETIC_REGRESSION_SUITE_ID": COMBINED_SUITE_ID,
             "SYNREG_RESULTS_STAGE": COMBINED_PARTS_PREFIX,
@@ -2486,7 +2595,7 @@ def run_synthetic_regression_combined_aggregation(
             "SYNREG_EXPECTED_AG_SHARDS":       str(resolved_ag),
         },
         runtime_environment=bench_rt,
-        entrypoint="evaluate_synthetic_regression.py",
+        entrypoint="evaluate_linear_regression.py",
         target_instances=1,
         pip_requirements=None,
         external_access_integrations=None,
@@ -2531,7 +2640,7 @@ def _run_baseline_shards_single_wave(
                 results_stage=results_stage,
             ),
             runtime_environment=runtime_environment,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=SYNREG_BASELINE_PIP,
             external_access_integrations=SYNREG_PYPI_EAI,
@@ -2570,7 +2679,7 @@ def _run_autogluon_shards_single_wave(
                 results_stage=results_stage,
             ),
             runtime_environment=runtime_environment,
-            entrypoint="evaluate_synthetic_regression.py",
+            entrypoint="evaluate_linear_regression.py",
             target_instances=1,
             pip_requirements=SYNREG_AG_PIP,
             external_access_integrations=SYNREG_PYPI_EAI,
@@ -2704,7 +2813,9 @@ def run_synthetic_regression_combined_baseline_evaluation(
     bench_rt: str = "2.5.0-py311",
     baseline_concurrent_nodes=None,
     baseline_shards=None,
+    training_data_family=None,
 ) -> str:
+    _configure_combined_training_data_family(training_data_family)
     proc = "run_synthetic_regression_combined_baseline_evaluation"
     _resolved_shards = _resolve_baseline_shard_count(proc, baseline_shards)
     _resolve_baseline_concurrent_nodes(proc, baseline_concurrent_nodes, shard_count=_resolved_shards)
@@ -2746,6 +2857,22 @@ def run_synthetic_regression_combined_baseline_evaluation_with_shards(
     )
 
 
+def run_synthetic_regression_combined_baseline_evaluation_with_family(
+    session,
+    bench_rt: str,
+    baseline_shards,
+    baseline_concurrent_nodes,
+    training_data_family: str,
+) -> str:
+    return run_synthetic_regression_combined_baseline_evaluation(
+        session,
+        bench_rt,
+        baseline_concurrent_nodes=baseline_concurrent_nodes,
+        baseline_shards=baseline_shards,
+        training_data_family=training_data_family,
+    )
+
+
 def run_synthetic_regression_combined_autogluon_evaluation(
     session,
     bench_rt: str = "2.5.0-py311",
@@ -2758,6 +2885,7 @@ def run_synthetic_regression_combined_autogluon_evaluation(
     autogluon_presets=None,
     ray_ready_timeout_seconds=None,
     ray_ready_poll_seconds=None,
+    training_data_family=None,
 ) -> str:
     """Phase 4: AutoGluon evaluation on AUTOGLUON_CPU_POOL.
 
@@ -2772,11 +2900,11 @@ def run_synthetic_regression_combined_autogluon_evaluation(
 
     Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS == 0):
         Each logical shard is submitted as a single-container MLJob with
-        target_instances=1, using evaluate_synthetic_regression.py (mode=autogluon).
+        target_instances=1, using evaluate_linear_regression.py (mode=autogluon).
         AUTOGLUON_WORKERS_PER_SHARD must equal 1.
         AUTOGLUON_CONCURRENT_CLUSTERS is interpreted as the number of single-node shards.
         N = concurrent_clusters (= number of single-node shards). No Ray, no object store.
-        Entrypoint is always evaluate_synthetic_regression.py (derived internally).
+        Entrypoint is always evaluate_linear_regression.py (derived internally).
 
     SQL callers:
       CALL run_synthetic_regression_combined_autogluon_evaluation(bench_rt, ag_rt,
@@ -2785,6 +2913,7 @@ def run_synthetic_regression_combined_autogluon_evaluation(
       Optional extended form adds ray_ready_timeout_seconds and ray_ready_poll_seconds.
     """
     proc = "run_synthetic_regression_combined_autogluon_evaluation"
+    family = _configure_combined_training_data_family(training_data_family)
 
     plan = _resolve_combined_autogluon_execution_plan(
         procedure_name=proc,
@@ -2792,6 +2921,12 @@ def run_synthetic_regression_combined_autogluon_evaluation(
         workers_per_shard_arg=autogluon_workers_per_shard,
         concurrent_clusters_arg=autogluon_concurrent_clusters,
     )
+    if family == "synthetic_linear_classification" and plan.mode != "single_node_shards":
+        raise ValueError(
+            "Classification AutoGluon evaluation uses the existing single-node "
+            "combined path. Set AUTOGLUON_CLUSTER_SHARDS=0 and "
+            "AUTOGLUON_WORKERS_PER_SHARD=1."
+        )
     task_cpus = _resolve_positive_int_runtime_param(
         procedure_name=proc, name="AUTOGLUON_TASK_CPUS",
         sql_arg=autogluon_task_cpus, env_var="AUTOGLUON_TASK_CPUS",
@@ -3019,6 +3154,7 @@ def run_synthetic_regression_combined_evaluation(
     autogluon_concurrent_clusters=None,
     autogluon_time_limit=None,
     autogluon_presets=None,
+    training_data_family=None,
 ) -> str:
     """All-in-one combined suite wrapper — runs all 5 phases in sequence.
 
@@ -3030,6 +3166,7 @@ def run_synthetic_regression_combined_evaluation(
     expects the same resolved baseline shard count.
     """
     proc = "run_synthetic_regression_combined_evaluation"
+    family = _configure_combined_training_data_family(training_data_family)
     # Resolve baseline shard count early so aggregation gets the same value.
     resolved_baseline_shards = _resolve_baseline_shard_count(proc, baseline_shards)
     # Resolve the AutoGluon execution plan early so aggregation gets plan.output_shards.
@@ -3047,12 +3184,17 @@ def run_synthetic_regression_combined_evaluation(
         shard_count=resolved_baseline_shards,
     )
 
-    run_synthetic_regression_combined_prep(session, bench_rt, ag_rt)
-    run_synthetic_regression_combined_deepset_evaluation(session, bench_rt)
+    run_synthetic_regression_combined_prep(
+        session, bench_rt, ag_rt, training_data_family=family
+    )
+    run_synthetic_regression_combined_deepset_evaluation(
+        session, bench_rt, training_data_family=family
+    )
     run_synthetic_regression_combined_baseline_evaluation(
         session, bench_rt,
         baseline_concurrent_nodes=baseline_concurrent_nodes,
         baseline_shards=baseline_shards,
+        training_data_family=family,
     )
     run_synthetic_regression_combined_autogluon_evaluation(
         session, bench_rt, ag_rt,
@@ -3062,11 +3204,13 @@ def run_synthetic_regression_combined_evaluation(
         autogluon_concurrent_clusters=autogluon_concurrent_clusters,
         autogluon_time_limit=autogluon_time_limit,
         autogluon_presets=autogluon_presets,
+        training_data_family=family,
     )
     run_synthetic_regression_combined_aggregation(
         session, bench_rt,
         expected_ag_shards=ag_plan.output_shards,
         expected_baseline_shards=resolved_baseline_shards,
+        training_data_family=family,
     )
     return (
         f"run_synthetic_regression_combined_evaluation: ok "
@@ -3084,6 +3228,44 @@ def run_synthetic_regression_combined_evaluation_default(
     ag_rt: str = "2.5.0-py311",
 ) -> str:
     return run_synthetic_regression_combined_evaluation(session, bench_rt, ag_rt)
+
+
+def run_synthetic_regression_combined_evaluation_for_family(
+    session,
+    bench_rt: str,
+    ag_rt: str,
+    training_data_family: str,
+) -> str:
+    kwargs = {"training_data_family": training_data_family}
+    if training_data_family == "synthetic_linear_classification":
+        kwargs.update({
+            "autogluon_cluster_shards": 0,
+            "autogluon_workers_per_shard": 1,
+            "autogluon_concurrent_clusters": SYNREG_AUTOGLUON_SHARDS,
+        })
+    return run_synthetic_regression_combined_evaluation(
+        session, bench_rt, ag_rt, **kwargs
+    )
+
+
+def run_synthetic_regression_combined_aggregation_for_family(
+    session,
+    bench_rt: str,
+    ag_rt: str,
+    expected_ag_shards,
+    expected_baseline_shards,
+    expected_deepset_shards,
+    training_data_family: str,
+) -> str:
+    del ag_rt
+    return run_synthetic_regression_combined_aggregation(
+        session,
+        bench_rt,
+        expected_ag_shards=expected_ag_shards,
+        expected_baseline_shards=expected_baseline_shards,
+        expected_deepset_shards=expected_deepset_shards,
+        training_data_family=training_data_family,
+    )
 
 
 def run_synthetic_regression_combined_evaluation_legacy_concurrency(
@@ -3671,7 +3853,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
 
     Single-node mode (AUTOGLUON_CLUSTER_SHARDS == 0):
         One SPCS job service per shard. No Ray.
-        Entrypoint: /app/src/evaluate_synthetic_regression.py
+        Entrypoint: /app/scripts/evaluate_linear_regression.py
 
     Ray distributed mode (AUTOGLUON_CLUSTER_SHARDS > 0):
         Per cluster shard: one head SPCS service + N worker SPCS services + one driver job.
@@ -3760,7 +3942,7 @@ def run_synthetic_regression_combined_autogluon_spcs_evaluation(
                 compute_pool=AUTOGLUON_CPU_POOL,
                 env_vars=env,
                 image=image,
-                entrypoint_path="/app/src/evaluate_synthetic_regression.py",
+                entrypoint_path="/app/scripts/evaluate_linear_regression.py",
                 resource_role=SPCS_SINGLE_NODE_RESOURCES,
             )
             jobs.append((lbl, job_name))
@@ -3986,7 +4168,7 @@ def run_synthetic_regression_autogluon_spcs_session_probe(
 
     Run this after the import probe and before the capacity probe.
     A successful run confirms that the AutoGluon driver containers can create Snowpark
-    sessions inside SPCS — required for querying SYNTHETIC_REGRESSION_DATASET_INDEX and
+    sessions inside SPCS — required for querying LINEAR_REGRESSION_DATASET_INDEX and
     calling GET_PRESIGNED_URL().
     """
     proc = "run_synthetic_regression_autogluon_spcs_session_probe"
@@ -4201,7 +4383,7 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(
 ) -> str:
     """SPCS backend worker dataset-access probe.
 
-    Driver queries SYNTHETIC_REGRESSION_DATASET_INDEX and builds compact item dicts.
+    Driver queries LINEAR_REGRESSION_DATASET_INDEX and builds compact item dicts.
     Workers validate dataset access using the same production path.
     No AutoGluon training.
     """
@@ -4366,6 +4548,174 @@ def run_synthetic_regression_combined_autogluon_spcs_worker_access_probe_default
     ag_rt: str = "spcs_job",
 ) -> str:
     return run_synthetic_regression_combined_autogluon_spcs_worker_access_probe(session, ag_rt)
+
+
+# ---------------------------------------------------------------
+# Regression-linear checkpoint resolution
+# ---------------------------------------------------------------
+
+def _resolve_regression_linear_checkpoint(session) -> str:
+    """Return best_regression.pt if it exists on stage; raise if not found."""
+    explicit = os.environ.get("SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH")
+    if explicit:
+        return explicit
+    preferred = "@MODEL_STAGE/checkpoints/best_regression.pt"
+    try:
+        rows = session.sql(f"LIST {preferred}").collect()
+        if rows:
+            return preferred
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"{preferred} not found on stage. "
+        "Upload best_regression.pt or set SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH explicitly."
+    )
+
+
+def _set_regression_linear_env(suite_id: str, session=None, *, is_mixed_categorical: bool = False) -> str:
+    """
+    Set env vars for regression-linear suite and return the results stage path.
+    Must be called at the start of each regression-linear handler.
+    When is_mixed_categorical=True, switches to the mixed-categorical data family
+    and evaluation index table.
+    """
+    global SYNREG_DEEPSET_CKPT_STAGE
+    if is_mixed_categorical:
+        results_stage = f"@EVALUATION_RESULTS_STAGE/linear/regression/mixed/{suite_id}"
+        os.environ["TRAINING_DATA_FAMILY"] = "synthetic_linear_regression_mixed_categorical"
+        os.environ["SYNREG_INDEX_TABLE"] = "LINEAR_MIXED_REGRESSION_DATASET_INDEX"
+        os.environ["SYNREG_IS_MIXED_CATEGORICAL"] = "true"
+    else:
+        results_stage = f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}"
+        os.environ["TRAINING_DATA_FAMILY"] = "synthetic_linear_regression"
+        os.environ["SYNREG_IS_MIXED_CATEGORICAL"] = "false"
+        os.environ["SYNREG_INDEX_TABLE"] = "LINEAR_REGRESSION_DATASET_INDEX"
+    os.environ["SYNTHETIC_REGRESSION_SUITE_ID"] = suite_id
+    os.environ["SYNREG_RESULTS_STAGE"] = results_stage
+    os.environ["SYNTHETIC_REGRESSION_FEATURE_SELECTOR"] = "train_f_regression"
+    if session is not None:
+        ckpt = _resolve_regression_linear_checkpoint(session)
+        os.environ["SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH"] = ckpt
+        SYNREG_DEEPSET_CKPT_STAGE = ckpt
+    if is_mixed_categorical:
+        assert "/linear/regression/mixed/" in results_stage
+    else:
+        assert "/linear/regression/numeric/" in results_stage
+    return results_stage
+
+
+# ---------------------------------------------------------------
+# Public handlers — targets of SQL HANDLER = '...' in SQL
+# ---------------------------------------------------------------
+
+def run_synthetic_regression_linear_prep(
+    session, prep_rt: str, bench_rt: str, ag_rt: str,
+    suite_id: str = "linear_all_v1",
+    is_mixed_categorical=False,
+) -> str:
+    _set_regression_linear_env(suite_id, is_mixed_categorical=is_mixed_categorical)
+    return run_synthetic_regression_prep(session, prep_rt, bench_rt, ag_rt)
+
+
+def run_synthetic_regression_linear_deepset_evaluation(
+    session, bench_rt: str, suite_id: str = "linear_all_v1",
+    is_mixed_categorical=False,
+) -> str:
+    _set_regression_linear_env(suite_id, session, is_mixed_categorical=is_mixed_categorical)
+    return run_synthetic_regression_deepset_evaluation(
+        session, bench_rt, bench_rt, bench_rt
+    )
+
+
+def run_synthetic_regression_linear_baseline_evaluation(
+    session, bench_rt: str, suite_id: str = "linear_all_v1",
+    baseline_shards=None, baseline_concurrent_nodes=None,
+    is_mixed_categorical=False,
+) -> str:
+    _set_regression_linear_env(suite_id, is_mixed_categorical=is_mixed_categorical)
+    return run_synthetic_regression_baseline_evaluation(
+        session,
+        bench_rt,
+        bench_rt,
+        bench_rt,
+        baseline_concurrent_nodes=baseline_concurrent_nodes,
+        baseline_shards=baseline_shards,
+    )
+
+
+def run_synthetic_regression_linear_autogluon_evaluation(
+    session, bench_rt: str, ag_rt: str, suite_id: str = "linear_all_v1",
+    autogluon_cluster_shards=None, autogluon_workers_per_shard=None,
+    autogluon_task_cpus=None, autogluon_concurrent_clusters=None,
+    autogluon_time_limit=None, autogluon_presets=None,
+    is_mixed_categorical=False,
+) -> str:
+    _set_regression_linear_env(suite_id, is_mixed_categorical=is_mixed_categorical)
+    if autogluon_time_limit is not None:
+        os.environ["AUTOGLUON_TIME_LIMIT"] = str(autogluon_time_limit)
+    if autogluon_presets is not None:
+        os.environ["AUTOGLUON_PRESETS"] = str(autogluon_presets)
+    if autogluon_task_cpus is not None:
+        os.environ["AUTOGLUON_TASK_CPUS"] = str(autogluon_task_cpus)
+    return run_synthetic_regression_autogluon_evaluation(
+        session,
+        bench_rt,
+        bench_rt,
+        ag_rt,
+        autogluon_concurrent_nodes=autogluon_concurrent_clusters,
+    )
+
+
+def run_synthetic_regression_linear_aggregation(
+    session, bench_rt: str, ag_rt: str, suite_id: str = "linear_all_v1",
+    expected_ag_shards=None, expected_baseline_shards=None,
+    expected_deepset_shards=None,
+    is_mixed_categorical=False,
+) -> str:
+    _set_regression_linear_env(suite_id, is_mixed_categorical=is_mixed_categorical)
+    if expected_ag_shards is not None:
+        os.environ["SYNREG_EXPECTED_AG_SHARDS"] = str(expected_ag_shards)
+    if expected_baseline_shards is not None:
+        os.environ["SYNREG_EXPECTED_BASELINE_SHARDS"] = str(
+            expected_baseline_shards
+        )
+    if expected_deepset_shards is not None:
+        os.environ["SYNREG_EXPECTED_DEEPSET_SHARDS"] = str(
+            expected_deepset_shards
+        )
+    return run_synthetic_regression_aggregation(
+        session, bench_rt, bench_rt, ag_rt
+    )
+
+
+def run_synthetic_regression_linear_pipeline(
+    session, prep_rt: str, bench_rt: str, ag_rt: str,
+    suite_id: str = "linear_all_v1",
+    baseline_shards=None, baseline_concurrent_nodes=None,
+    autogluon_cluster_shards=None, autogluon_workers_per_shard=None,
+    autogluon_task_cpus=None, autogluon_concurrent_clusters=None,
+    autogluon_time_limit=None, autogluon_presets=None,
+    is_mixed_categorical=False,
+) -> str:
+    """End-to-end regression-linear pipeline: prep → deepset → baselines → ag → aggregate."""
+    results = []
+    results.append(run_synthetic_regression_linear_prep(
+        session, prep_rt, bench_rt, ag_rt, suite_id, is_mixed_categorical=is_mixed_categorical))
+    results.append(run_synthetic_regression_linear_deepset_evaluation(
+        session, bench_rt, suite_id, is_mixed_categorical=is_mixed_categorical))
+    results.append(run_synthetic_regression_linear_baseline_evaluation(
+        session, bench_rt, suite_id, baseline_shards, baseline_concurrent_nodes,
+        is_mixed_categorical=is_mixed_categorical))
+    results.append(run_synthetic_regression_linear_autogluon_evaluation(
+        session, bench_rt, ag_rt, suite_id,
+        autogluon_cluster_shards, autogluon_workers_per_shard,
+        autogluon_task_cpus, autogluon_concurrent_clusters,
+        autogluon_time_limit, autogluon_presets,
+        is_mixed_categorical=is_mixed_categorical))
+    results.append(run_synthetic_regression_linear_aggregation(
+        session, bench_rt, ag_rt, suite_id,
+        is_mixed_categorical=is_mixed_categorical))
+    return "\n".join(results)
 
 
 # Main (for direct invocation / stored proc driver entry)

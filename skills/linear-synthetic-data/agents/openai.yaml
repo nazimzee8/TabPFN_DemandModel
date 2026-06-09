@@ -1,0 +1,4 @@
+interface:
+  display_name: "Linear Synthetic Data"
+  short_description: "Design linear regression and classification task suites"
+  default_prompt: "Use $linear-synthetic-data to design or audit separate linear regression and linear classification datasets for DeepSet training."

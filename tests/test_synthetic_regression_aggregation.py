@@ -1,7 +1,7 @@
 """
 tests/test_synthetic_regression_aggregation.py
 ================================================
-Unit tests for the aggregation logic in evaluate_synthetic_regression.py
+Unit tests for the aggregation logic in evaluate_linear_regression.py
 (run_synthetic_regression_aggregation mode).
 
 All tests operate on in-memory data structures without Snowflake connectivity.
@@ -24,7 +24,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import evaluate_synthetic_regression as evsr
+import evaluate_linear_regression as evsr
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +42,7 @@ def _make_part_rows(
     mse_values: dict of (dataset_id, method) -> mse override
     """
     if methods is None:
-        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
     if mse_values is None:
         mse_values = {}
 
@@ -75,8 +75,8 @@ def _make_part_rows(
                     "selected_features": 5,
                     "feature_selector": "none",
                     "feature_cap": 128,
-                    "context_windows": 5 if method == "MODEL3-ICL-MC" else None,
-                    "context_window_size": 200 if method == "MODEL3-ICL-MC" else None,
+                    "context_windows": 5 if method == "MODEL-ICL-MC" else None,
+                    "context_window_size": 200 if method == "MODEL-ICL-MC" else None,
                     "mse_betaX": mse,
                     "rmse_betaX": rmse,
                     "mae_betaX": rmse * 0.8,
@@ -131,8 +131,8 @@ def _run_agg_on_rows(rows: list[dict]) -> dict[str, pd.DataFrame]:
         df_out = pd.read_csv(local_path)
         outputs[name] = df_out
 
-    with patch("evaluate_synthetic_regression._upload_csv", side_effect=_mock_upload):
-        with patch("evaluate_synthetic_regression._MATPLOTLIB_AVAILABLE", False):
+    with patch("evaluate_linear_regression._upload_csv", side_effect=_mock_upload):
+        with patch("evaluate_linear_regression._MATPLOTLIB_AVAILABLE", False):
             # Patch the session + stage listing + file download
             mock_session = MagicMock()
             mock_session.sql.return_value.collect.return_value = [
@@ -146,10 +146,10 @@ def _run_agg_on_rows(rows: list[dict]) -> dict[str, pd.DataFrame]:
             mock_session.file.get.side_effect = _mock_file_get
             mock_session.file.put = MagicMock()
 
-            with patch("evaluate_synthetic_regression.Session") as MockSess:
+            with patch("evaluate_linear_regression.Session") as MockSess:
                 MockSess.builder.getOrCreate.return_value = mock_session
-                with patch("evaluate_synthetic_regression.SYNREG_RESULTS_STAGE",
-                           "@EVALUATION_RESULTS_STAGE/regression"):
+                with patch("evaluate_linear_regression.SYNREG_RESULTS_STAGE",
+                           "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"):
                     # Redirect tmp output dir
                     with patch("tempfile.mkdtemp", return_value=tmp_dir):
                         evsr.run_synthetic_regression_aggregation()
@@ -176,7 +176,7 @@ class TestAggregationIngest:
         mock_session = MagicMock()
         mock_session.sql.return_value.collect.return_value = []
 
-        with patch("evaluate_synthetic_regression.Session") as MockSess:
+        with patch("evaluate_linear_regression.Session") as MockSess:
             MockSess.builder.getOrCreate.return_value = mock_session
             with pytest.raises(RuntimeError, match="No shard part files found"):
                 evsr.run_synthetic_regression_aggregation()
@@ -186,7 +186,7 @@ class TestAggregationIngest:
         DeepSet part has context_windows=5; baseline part missing context_windows.
         After concat: baseline rows should have NaN/None for context_windows.
         """
-        rows_ds = _make_part_rows(1, 1, ["MODEL3-ICL-MC"])
+        rows_ds = _make_part_rows(1, 1, ["MODEL-ICL-MC"])
         rows_bl = _make_part_rows(1, 1, ["FixedRidgeLambda1"])
         # Remove context_windows from baseline
         for r in rows_bl:
@@ -202,10 +202,10 @@ class TestAggregationIngest:
 class TestAggregationStatusPreservation:
     def test_aggregation_preserves_skipped_rows(self):
         """status='skipped' rows must be preserved in the canonical output."""
-        rows = _make_part_rows(2, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"])
+        rows = _make_part_rows(2, 1, ["MODEL-ICL-MC", "FixedRidgeLambda1"])
         # Mark first dataset DeepSet as skipped
         for r in rows:
-            if r["dataset_id"] == 0 and r["method"] == "MODEL3-ICL-MC":
+            if r["dataset_id"] == 0 and r["method"] == "MODEL-ICL-MC":
                 r["status"] = "skipped"
                 r["skip_reason"] = "gpu_oom:memory_exceeded"
                 r["mse_betaX"] = float("nan")
@@ -238,7 +238,7 @@ class TestAggregationStatusPreservation:
 class TestRanking:
     def test_ranking_uses_valid_rows_only(self):
         """NaN mse_betaX rows get rank=NaN; valid rows get integer ranks."""
-        rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"])
+        rows = _make_part_rows(1, 1, ["MODEL-ICL-MC", "FixedRidgeLambda1"])
         # Make DeepSet invalid
         rows[0]["mse_betaX"] = float("nan")
         rows[0]["rmse_betaX"] = float("nan")
@@ -351,13 +351,13 @@ class TestRanking:
 class TestReferenceRatios:
     def test_ratio_to_fixed_ridge_correct(self):
         """FixedRidge mse=1.0, DeepSet mse=0.5 → ratio=0.5."""
-        rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC", "FixedRidgeLambda1"],
-                               mse_values={(0, "MODEL3-ICL-MC"): 0.5,
+        rows = _make_part_rows(1, 1, ["MODEL-ICL-MC", "FixedRidgeLambda1"],
+                               mse_values={(0, "MODEL-ICL-MC"): 0.5,
                                            (0, "FixedRidgeLambda1"): 1.0})
         df = pd.DataFrame(rows)
 
         ref = df[df["method"] == "FixedRidgeLambda1"]["mse_betaX"].values[0]
-        ds_mse = df[df["method"] == "MODEL3-ICL-MC"]["mse_betaX"].values[0]
+        ds_mse = df[df["method"] == "MODEL-ICL-MC"]["mse_betaX"].values[0]
         ratio = ds_mse / ref
         assert math.isclose(ratio, 0.5, rel_tol=1e-9)
 
@@ -398,7 +398,7 @@ class TestFeatureNoiseStability:
             noise_levels = [0, 10, 25, 50, 75, 100]
         rows = []
         for nl in noise_levels:
-            for method in ["MODEL3-ICL-MC", "FixedRidgeLambda1"]:
+            for method in ["MODEL-ICL-MC", "FixedRidgeLambda1"]:
                 rows.append({
                     "suite_family": "feature_noise",
                     "dataset_id": 0,
@@ -412,7 +412,7 @@ class TestFeatureNoiseStability:
                     "mse_betaX": 0.5 + nl * 0.01,
                     "rmse_betaX": math.sqrt(0.5 + nl * 0.01),
                     "r2_betaX": max(0, 0.8 - nl * 0.005),
-                    "rank_mse_betaX": 1.0 if method == "MODEL3-ICL-MC" else 2.0,
+                    "rank_mse_betaX": 1.0 if method == "MODEL-ICL-MC" else 2.0,
                     "processed_features": 5 + nl,
                     "selected_features": min(5 + nl, 128),
                     "feature_cap": 128,
@@ -465,7 +465,7 @@ class TestTrainingSizeSummary:
             n_train_values = [25, 50, 100, 200, 500, 1000, 2000, 4832]
         rows = []
         for nt in n_train_values:
-            for method in ["MODEL3-ICL-MC", "FixedRidgeLambda1"]:
+            for method in ["MODEL-ICL-MC", "FixedRidgeLambda1"]:
                 is_anchor = (nt == 4832)
                 rows.append({
                     "suite_family": "training_size",
@@ -482,7 +482,7 @@ class TestTrainingSizeSummary:
                     "mse_betaX": max(0.01, 1.0 - math.log(nt) * 0.05),
                     "rmse_betaX": math.sqrt(max(0.01, 1.0 - math.log(nt) * 0.05)),
                     "r2_betaX": min(0.99, math.log(nt) * 0.05),
-                    "rank_mse_betaX": 1.0 if method == "MODEL3-ICL-MC" else 2.0,
+                    "rank_mse_betaX": 1.0 if method == "MODEL-ICL-MC" else 2.0,
                     "status": "ok",
                 })
         return rows
@@ -594,7 +594,7 @@ class TestAggregationSmokeTest:
         2 datasets × 2 seeds × 4 methods.
         model_comparison_summary must have 4 rows (one per method).
         """
-        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
         rows = _make_part_rows(2, 2, methods)
         df = pd.DataFrame(rows)
 
@@ -611,16 +611,16 @@ class TestAggregationSmokeTest:
 
     def test_deepset_ratio_columns_computable(self):
         """DeepSet ratio columns can be computed when FixedRidgeLambda1 is present."""
-        methods = ["MODEL3-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
+        methods = ["MODEL-ICL-MC", "FixedRidgeLambda1", "XGBoost", "AutoGluon"]
         rows = _make_part_rows(1, 1, methods, mse_values={
-            (0, "MODEL3-ICL-MC"): 0.3,
+            (0, "MODEL-ICL-MC"): 0.3,
             (0, "FixedRidgeLambda1"): 0.6,
             (0, "XGBoost"): 0.4,
             (0, "AutoGluon"): 0.35,
         })
         df = pd.DataFrame(rows)
         fr_mse = df[df["method"] == "FixedRidgeLambda1"]["mse_betaX"].values[0]
-        ds_mse = df[df["method"] == "MODEL3-ICL-MC"]["mse_betaX"].values[0]
+        ds_mse = df[df["method"] == "MODEL-ICL-MC"]["mse_betaX"].values[0]
         ratio = ds_mse / fr_mse
         assert math.isclose(ratio, 0.5, rel_tol=1e-9)
 
@@ -634,8 +634,8 @@ class TestAggregationIsolation:
         """SYNREG_RESULTS_STAGE must contain the suite_id substring."""
         suite_id = evsr.SYNREG_SUITE_ID
         # The env var default or any override must embed the suite_id
-        # When set by the orchestrator it will be @EVALUATION_RESULTS_STAGE/regression/{suite_id}
-        stage = f"@EVALUATION_RESULTS_STAGE/regression/{suite_id}"
+        # When set by the orchestrator it will be @EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}
+        stage = f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}"
         assert suite_id in stage
 
     def test_aggregation_fails_on_mismatched_suite_id_in_rows(self):
@@ -643,8 +643,8 @@ class TestAggregationIsolation:
         import tempfile
         import shutil
 
-        good_rows = _make_part_rows(2, 1, ["MODEL3-ICL-MC"])
-        bad_rows = _make_part_rows(1, 1, ["MODEL3-ICL-MC"])
+        good_rows = _make_part_rows(2, 1, ["MODEL-ICL-MC"])
+        bad_rows = _make_part_rows(1, 1, ["MODEL-ICL-MC"])
         for r in bad_rows:
             r["suite_id"] = "some_other_suite"
 
@@ -686,12 +686,12 @@ class TestAggregationIsolation:
         mock_session.file.get.side_effect = _mock_file_get
         mock_session.file.put = MagicMock()
 
-        with patch("evaluate_synthetic_regression.Session") as MockSess:
+        with patch("evaluate_linear_regression.Session") as MockSess:
             MockSess.builder.getOrCreate.return_value = mock_session
             correct_suite = good_rows[0]["suite_id"]
-            with patch("evaluate_synthetic_regression.SYNREG_SUITE_ID", correct_suite):
-                with patch("evaluate_synthetic_regression.SYNREG_RESULTS_STAGE",
-                           f"@EVALUATION_RESULTS_STAGE/regression/{correct_suite}"):
+            with patch("evaluate_linear_regression.SYNREG_SUITE_ID", correct_suite):
+                with patch("evaluate_linear_regression.SYNREG_RESULTS_STAGE",
+                           f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{correct_suite}"):
                     with patch("tempfile.mkdtemp", return_value=tmp_dir):
                         with pytest.raises(RuntimeError, match="suite_id"):
                             evsr.run_synthetic_regression_aggregation()
@@ -701,7 +701,7 @@ class TestAggregationIsolation:
         mock_session = MagicMock()
         mock_session.sql.return_value.collect.return_value = []
 
-        with patch("evaluate_synthetic_regression.Session") as MockSess:
+        with patch("evaluate_linear_regression.Session") as MockSess:
             MockSess.builder.getOrCreate.return_value = mock_session
             with pytest.raises(RuntimeError, match="No shard part files found"):
                 evsr.run_synthetic_regression_aggregation()
@@ -717,22 +717,22 @@ class TestSynregOutputStage:
         import importlib
         import os
         os.environ.pop("SYNREG_OUTPUT_STAGE", None)
-        m = importlib.reload(importlib.import_module("evaluate_synthetic_regression"))
+        m = importlib.reload(importlib.import_module("evaluate_linear_regression"))
         assert m.SYNREG_OUTPUT_STAGE == "@EVALUATION_RESULTS_STAGE"
 
     def test_custom_output_stage_is_respected(self):
         """When SYNREG_OUTPUT_STAGE is set, the module constant must reflect that value."""
         import importlib
         import os
-        custom = "@EVALUATION_RESULTS_STAGE/ood_full"
+        custom = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
         os.environ["SYNREG_OUTPUT_STAGE"] = custom
         try:
-            m = importlib.reload(importlib.import_module("evaluate_synthetic_regression"))
+            m = importlib.reload(importlib.import_module("evaluate_linear_regression"))
             assert m.SYNREG_OUTPUT_STAGE == custom
         finally:
             os.environ.pop("SYNREG_OUTPUT_STAGE", None)
             # Restore default by reloading without the env var
-            importlib.reload(importlib.import_module("evaluate_synthetic_regression"))
+            importlib.reload(importlib.import_module("evaluate_linear_regression"))
 
 
 # ---------------------------------------------------------------------------
@@ -744,10 +744,10 @@ class TestShardCompleteness:
 
     def _make_file_list(self, names: list[str]) -> list[str]:
         """Return a list of stage path strings mimicking LIST output names."""
-        return [f"@EVALUATION_RESULTS_STAGE/regression/suite/{n}" for n in names]
+        return [f"@EVALUATION_RESULTS_STAGE/linear/regression/numeric/suite/{n}" for n in names]
 
     def _all_deepset(self, n: int) -> list[str]:
-        return [f"MODEL3-ICL-MC_shard{i}_of_{n}_detailed.csv" for i in range(n)]
+        return [f"MODEL-ICL-MC_shard{i}_of_{n}_detailed.csv" for i in range(n)]
 
     def _all_baseline(self, n: int) -> list[str]:
         return [f"baselines_shard{i}_of_{n}_detailed.csv" for i in range(n)]
@@ -757,10 +757,10 @@ class TestShardCompleteness:
 
     def _run(self, found_names, suite_id, n_ds=0, n_bl=0, n_ag=0):
         """Invoke _check_shard_completeness under patched env."""
-        with patch("evaluate_synthetic_regression.SYNREG_SUITE_ID", suite_id):
-            with patch("evaluate_synthetic_regression.SYNREG_EXPECTED_DEEPSET_SHARDS", n_ds):
-                with patch("evaluate_synthetic_regression.SYNREG_EXPECTED_BASELINE_SHARDS", n_bl):
-                    with patch("evaluate_synthetic_regression.SYNREG_EXPECTED_AG_SHARDS", n_ag):
+        with patch("evaluate_linear_regression.SYNREG_SUITE_ID", suite_id):
+            with patch("evaluate_linear_regression.SYNREG_EXPECTED_DEEPSET_SHARDS", n_ds):
+                with patch("evaluate_linear_regression.SYNREG_EXPECTED_BASELINE_SHARDS", n_bl):
+                    with patch("evaluate_linear_regression.SYNREG_EXPECTED_AG_SHARDS", n_ag):
                         evsr._check_shard_completeness(found_names, "@stage/parts")
 
     def test_missing_deepset_shard_fails(self):

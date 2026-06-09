@@ -15,10 +15,13 @@ import torch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC_DIR = os.path.join(REPO_ROOT, "src")
+SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
 
-# Patch heavy imports before importing evaluate_synthetic_regression
+# Patch heavy imports before importing evaluate_linear_regression
 _snowflake_mock = MagicMock()
 sys.modules.setdefault("snowflake", _snowflake_mock)
 sys.modules.setdefault("snowflake.snowpark", _snowflake_mock.snowpark)
@@ -34,8 +37,8 @@ sys.modules.setdefault("autogluon_models", MagicMock())
 sys.modules.setdefault("baseline_models", MagicMock())
 # deepset_inference is NOT mocked — it only uses numpy/torch/sklearn (no heavy deps).
 
-import evaluate_synthetic_regression as esr
-from evaluate_synthetic_regression import validate_checkpoint_payload, SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH
+import evaluate_linear_regression as esr
+from evaluate_linear_regression import validate_checkpoint_payload, SYNREG_DEEPSET_CHECKPOINT_STAGE_PATH
 
 
 def _make_valid_payload(
@@ -140,10 +143,23 @@ def test_model_family_mismatch_fails():
 
 
 def test_no_metadata_warns():
-    """Payload with no metadata → UserWarning."""
-    payload = _make_valid_payload(include_metadata=False)
+    """Payload with no metadata and fmt<4 for MODEL3 family → RuntimeError for wrong format version.
+
+    MODEL3 families (market_exchangeable_icl) require fmt=4. Even before reaching the
+    task_type/task_objective checks, the format-version guard fires at fmt=3.
+    The test name is preserved for historical context; the assertion reflects current behavior.
+    """
+    payload = _make_valid_payload(include_metadata=False, fmt=3)
     payload["metadata"] = None
-    with pytest.warns(UserWarning, match="no 'metadata'"):
+    with pytest.raises(RuntimeError, match="checkpoint_format_version"):
+        validate_checkpoint_payload(payload, "/tmp/test.pt")
+
+
+def test_no_metadata_format4_raises():
+    """Payload with no metadata and fmt=4 → RuntimeError (hard failure)."""
+    payload = _make_valid_payload(include_metadata=False, fmt=4)
+    payload["metadata"] = None
+    with pytest.raises(RuntimeError, match="format version 4"):
         validate_checkpoint_payload(payload, "/tmp/test.pt")
 
 

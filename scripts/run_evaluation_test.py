@@ -29,7 +29,7 @@ SCRIPTS_STAGE      = f"{MODEL_STAGE}/scripts/"
 MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 EVAL_RESULTS_STAGE = "@EVALUATION_RESULTS_STAGE"
 
-BENCHMARK_PREPARED_STAGE      = "@META_DATASET_STAGE/benchmark_prepared/"
+BENCHMARK_PREPARED_STAGE      = "@META_REGRESSION_DATASET_STAGE/benchmark_prepared/"
 BENCHMARK_MANIFEST_STAGE_PATH = f"{BENCHMARK_PREPARED_STAGE}benchmark_manifest.json"
 
 # Shard counts â€" match compute pool MAX_NODES capacities.
@@ -53,6 +53,7 @@ BASELINE_METHODS = [
     "MLP",
 ]
 AUTOGLUON_METHOD = "AutoGluon"
+DEEPSET_METHOD   = "MODEL-ICL-MC"
 
 BENCHMARK_REQUIRED_IMPORTS = (
     "torch,pyarrow,pandas,scipy,sklearn,"
@@ -566,9 +567,9 @@ def _run_deepset_phase(session, runtimes):
     manifest_env = _benchmark_manifest_env()
     deepset_jobs = []
     for shard_idx in range(GPU_BENCHMARK_SHARDS):
-        label = f"MODEL3-ICL-MC benchmark shard {shard_idx + 1}/{GPU_BENCHMARK_SHARDS}"
+        label = f"{DEEPSET_METHOD} benchmark shard {shard_idx + 1}/{GPU_BENCHMARK_SHARDS}"
         job = _submit_eval(session, label, GPU_POOL, {
-            "EVAL_MODE": "benchmark", "BENCHMARK_METHOD": "MODEL3-ICL-MC",
+            "EVAL_MODE": "benchmark", "BENCHMARK_METHOD": DEEPSET_METHOD,
             "MC_K": "8",
             "BENCHMARK_DEEPSET_CONTEXT_SIZE": "200",
             "BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES": "5",

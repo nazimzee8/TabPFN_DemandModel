@@ -52,7 +52,7 @@ def test_normalize_cfg_rejects_deepset_family():
     """normalize_checkpoint_cfg raises RuntimeError for retired model_family='deepset'."""
     sys.path.insert(0, SRC_DIR)
 
-    # Patch heavy imports for evaluate_synthetic_regression
+    # Patch heavy imports for evaluate_linear_regression
     import unittest.mock as mock
     _snowflake_mock = mock.MagicMock()
     for mod in ("snowflake", "snowflake.snowpark", "snowflake.snowpark.Session",
@@ -61,7 +61,7 @@ def test_normalize_cfg_rejects_deepset_family():
         if mod not in sys.modules:
             sys.modules[mod] = mock.MagicMock()
 
-    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+    from evaluate_linear_regression import normalize_checkpoint_cfg
 
     payload = {"cfg": {"model_family": "deepset", "d_phi": 64, "d_rho": 128,
                        "pool": "pna", "n_heads": 4, "n_sab_feat": 1,
@@ -81,7 +81,7 @@ def test_normalize_cfg_rejects_market_aware_family():
         if mod not in sys.modules:
             sys.modules[mod] = mock.MagicMock()
 
-    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+    from evaluate_linear_regression import normalize_checkpoint_cfg
 
     payload = {"cfg": {"model_family": "market_aware", "d_phi": 64, "d_rho": 128,
                        "pool": "pna", "n_heads": 4, "n_sab_feat": 1,
@@ -101,7 +101,7 @@ def test_normalize_cfg_accepts_model3_icl_family():
         if mod not in sys.modules:
             sys.modules[mod] = mock.MagicMock()
 
-    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+    from evaluate_linear_regression import normalize_checkpoint_cfg
 
     payload = {"cfg": {
         "model_family": "market_exchangeable_icl",
@@ -126,7 +126,7 @@ def test_normalize_cfg_strips_legacy_fields():
         if mod not in sys.modules:
             sys.modules[mod] = mock.MagicMock()
 
-    from evaluate_synthetic_regression import normalize_checkpoint_cfg
+    from evaluate_linear_regression import normalize_checkpoint_cfg
 
     payload = {"cfg": {
         "model_family": "market_exchangeable_icl",

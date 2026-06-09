@@ -1,0 +1,5 @@
+model_name,log_loss_mean_rank,log_loss_median_rank,log_loss_strict_win_rate,log_loss_tie_aware_win_rate,log_loss_top_3_rate,log_loss_task_count,log_loss_valid_metric_task_count,log_loss_completion_rate
+LogisticRegression,2.5,2.0,0.0,0.0,0.8,5,5,1.0
+RandomForestClassifier,2.2,2.0,0.4,0.4,0.8,5,5,1.0
+RidgeClassifier,2.0,1.0,0.6,0.6,0.8,5,5,1.0
+tabpfn_deepset,3.3,3.5,0.0,0.0,0.4,5,5,1.0

@@ -1,0 +1,187 @@
+{
+  "allocation": {
+    "class_count_targets": {
+      "2": 3,
+      "3": 0,
+      "5": 1,
+      "10": 0
+    },
+    "imbalance_targets": {
+      "balanced": 2,
+      "mild": 1,
+      "moderate": 1,
+      "severe": 0
+    },
+    "realized_class_counts": {
+      "2": 3,
+      "3": 0,
+      "5": 1,
+      "10": 0
+    },
+    "realized_imbalance_counts": {
+      "balanced": 2,
+      "mild": 1,
+      "moderate": 1,
+      "severe": 0
+    },
+    "regime_counts": {
+      "A_iid_dense_logistic": 1,
+      "B_iid_sparse_logistic": 1,
+      "C_label_noise_margin": 1,
+      "D_correlated_ar_logistic": 1
+    }
+  },
+  "allow_underdetermined": false,
+  "base_seed": 19,
+  "configured_profile_weights": {
+    "A_iid_dense_logistic": 0.25,
+    "B_iid_sparse_logistic": 0.25,
+    "C_label_noise_margin": 0.25,
+    "D_correlated_ar_logistic": 0.25
+  },
+  "created_at": "2026-06-07T03:05:31.510279+00:00",
+  "file_checksums": {
+    "test/dataset_0000.parquet": "e4220390f839454af40d2e2bde986f71e861fe077207f989b64cca030a24064a",
+    "train/dataset_0000.parquet": "192434efb0b8146c0c8afe8c48a6da491f28e6ef60d069c8e8bcc7877a4d5f60",
+    "train/dataset_0001.parquet": "e95b82f146212faaa5b1f119c96a704a5b6f4597ebfa2ef9b9c716f906733538",
+    "train/dataset_0002.parquet": "53949878a1eea1814610b3cfbaabbc00232afa74d33cb503876d1fa78d3e2a9a"
+  },
+  "generation_command": [
+    "C:\\Documents\\TabPFN_DemandModel\\src\\generate_dgp.py",
+    "--task_family",
+    "linear_classification",
+    "--profile",
+    "classification_legacy_debug",
+    "--n_datasets",
+    "4",
+    "--out_dir",
+    "C:\\Documents\\TabPFN_DemandModel\\tmp_pytest\\test_manifest_checksums_determ0\\second",
+    "--base_seed",
+    "19",
+    "--n_grid",
+    "64",
+    "--p_signal_grid",
+    "8",
+    "--p_noise_grid",
+    "8",
+    "--active_s_grid",
+    "2,4"
+  ],
+  "git_revision": "401de9b662701c2e5172bf5bda8f9eb49cb2e4ea",
+  "grid_values": {
+    "active_s_grid": [
+      2,
+      4
+    ],
+    "class_imbalance_grid": [
+      "balanced",
+      "mild",
+      "moderate",
+      "severe"
+    ],
+    "coefficient_scale_grid": [
+      0.5,
+      1.0,
+      2.0
+    ],
+    "feature_noise_grid": [
+      0.0,
+      0.05,
+      0.1,
+      0.25
+    ],
+    "intercept_scale_grid": [
+      0.0,
+      0.5,
+      1.0,
+      2.0
+    ],
+    "label_noise_grid": [
+      0.0,
+      0.02,
+      0.05,
+      0.1
+    ],
+    "margin_grid": [
+      "low",
+      "medium",
+      "high"
+    ],
+    "n_grid": [
+      64
+    ],
+    "num_classes_grid": [
+      2,
+      3,
+      5,
+      10
+    ],
+    "p_noise_grid": [
+      8
+    ],
+    "p_signal_grid": [
+      8
+    ],
+    "rho_grid": [
+      0.0,
+      0.3,
+      0.6,
+      0.9
+    ],
+    "temperature_grid": [
+      0.5,
+      1.0,
+      2.0,
+      4.0
+    ]
+  },
+  "n_datasets": 4,
+  "outer_split_counts": {
+    "test": 1,
+    "train": 3,
+    "val": 0
+  },
+  "output_checksum": "0bcad10c02691bdd43afaed87b3f6975bfcc8a4107d34ffddadfcfe4456bac40",
+  "profile": "classification_legacy_debug",
+  "profile_weights": {
+    "A_iid_dense_logistic": 0.25,
+    "B_iid_sparse_logistic": 0.25,
+    "C_label_noise_margin": 0.25,
+    "D_correlated_ar_logistic": 0.25
+  },
+  "realized_K_counts": {
+    "2": 3,
+    "5": 1
+  },
+  "realized_imbalance_counts": {
+    "balanced": 2,
+    "mild": 1,
+    "moderate": 1
+  },
+  "realized_label_noise_counts": {
+    "0.0": 2,
+    "0.05": 1,
+    "0.1": 1
+  },
+  "realized_margin_counts": {
+    "low": 2,
+    "medium": 2
+  },
+  "realized_regime_counts": {
+    "A_iid_dense_logistic": 1,
+    "B_iid_sparse_logistic": 1,
+    "C_label_noise_margin": 1,
+    "D_correlated_ar_logistic": 1
+  },
+  "realized_temperature_counts": {
+    "0.5": 2,
+    "2.0": 2
+  },
+  "require_class_teachers": false,
+  "schema_version": "linear_classification_v1",
+  "store_class_params": true,
+  "store_class_teacher_preds": false,
+  "suite_id": "linear_classification-classification_legacy_debug-linear_classification_v1-19-6230ff186ae2",
+  "task_family": "linear_classification",
+  "task_objective": "inductive_classification"
+}

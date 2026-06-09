@@ -79,7 +79,7 @@ def _patch_submit(collector: JobCollector):
     from contextlib import ExitStack
 
     def _mock_submit_synreg(session, label, compute_pool, env_vars, runtime_environment,
-                             entrypoint="evaluate_synthetic_regression.py",
+                             entrypoint="evaluate_linear_regression.py",
                              target_instances=1, pip_requirements=None,
                              external_access_integrations=None):
         return collector.submit(
@@ -263,7 +263,7 @@ def _patch_submit_with_ckpt(collector: JobCollector, checkpoint_exists: bool):
     from contextlib import ExitStack
 
     def _mock_submit_synreg(session, label, compute_pool, env_vars, runtime_environment,
-                             entrypoint="evaluate_synthetic_regression.py",
+                             entrypoint="evaluate_linear_regression.py",
                              target_instances=1, pip_requirements=None,
                              external_access_integrations=None):
         return collector.submit(

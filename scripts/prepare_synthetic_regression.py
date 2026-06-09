@@ -4,7 +4,7 @@ prepare_synthetic_regression.py
 Synthetic-regression equivalent of src/prepare_benchmark_datasets.py.
 
 Generates and stages all synthetic payloads for the split-phase evaluation suite;
-creates/refreshes SYNTHETIC_REGRESSION_DATASET_INDEX.
+creates/refreshes LINEAR_REGRESSION_DATASET_INDEX.
 
 Idempotent by default; full rebuild when SYNTHETIC_REGRESSION_FORCE_REBUILD=true.
 
@@ -59,8 +59,9 @@ SYNREG_FORCE_REBUILD = _env_flag("SYNTHETIC_REGRESSION_FORCE_REBUILD", "false")
 SYNREG_DROP_INDEX_TABLE = _env_flag("SYNTHETIC_REGRESSION_DROP_INDEX_TABLE", "false")
 SYNREG_STAGE_PREFIX = "@EVALUATION_DATASET_STAGE"
 SYNREG_MANIFEST_PATH = f"{SYNREG_STAGE_PREFIX}/synthetic_regression_manifest.json"
-SYNREG_INDEX_TABLE = "SYNTHETIC_REGRESSION_DATASET_INDEX"
+SYNREG_INDEX_TABLE = os.getenv("SYNREG_INDEX_TABLE", "LINEAR_REGRESSION_DATASET_INDEX")
 SYNREG_LOCAL_DIR = os.getenv("SYNTHETIC_REGRESSION_LOCAL_DIR", "/tmp/synreg_prep")
+SYNREG_IS_MIXED_CATEGORICAL = _env_flag("SYNREG_IS_MIXED_CATEGORICAL", "false")
 
 # Primary suite
 PRIMARY_N_DATASETS = int(os.getenv("SYNTHETIC_REGRESSION_PRIMARY_DATASETS", "200"))
@@ -117,6 +118,34 @@ COMBINED_REGIMES        = ["A", "B", "C", "D", "E", "F", "G", "H"]
 COMBINED_N_PER_REGIME   = COMBINED_N_DATASETS // len(COMBINED_REGIMES)  # 50
 COMBINED_PRIMARY_SUITE  = os.getenv("COMBINED_PRIMARY_SUITE_ID", "linear_poisson_v1_recommended")
 COMBINED_OOD_SUITE      = os.getenv("COMBINED_OOD_SUITE_ID", "ood_linear_full_v1")
+
+
+# ---------------------------------------------------------------------------
+# Snowflake stage helpers
+# ---------------------------------------------------------------------------
+
+def _list_stage_parquets(session, stage_prefix: str) -> list[str]:
+    """Return list of stage paths for parquet files under prefix (recursive)."""
+    try:
+        rows = session.sql(f"LIST {stage_prefix}").collect()
+        return [r["name"] for r in rows if str(r["name"]).endswith(".parquet")]
+    except Exception as exc:
+        print(f"[WARN] LIST {stage_prefix} failed: {exc}", flush=True)
+        return []
+
+
+def _download_from_stage_to_dir(session, stage_path: str, local_dir: str):
+    """Download a file from stage to local_dir. Returns local path."""
+    from pathlib import Path
+    os.makedirs(local_dir, exist_ok=True)
+    session.file.get(stage_path, local_dir)
+    filename = stage_path.rsplit("/", 1)[-1]
+    local_path = Path(local_dir) / filename
+    if not local_path.exists():
+        candidates = list(Path(local_dir).glob(filename))
+        if candidates:
+            local_path = candidates[0]
+    return local_path
 
 
 # ---------------------------------------------------------------------------
@@ -465,13 +494,14 @@ def write_manifest_to_stage(session, manifest_dict: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def create_synreg_index_table(session) -> None:
-    """Create SYNTHETIC_REGRESSION_DATASET_INDEX if not already present."""
+    """Create LINEAR_REGRESSION_DATASET_INDEX if not already present."""
     ddl = f"""
     CREATE TRANSIENT TABLE IF NOT EXISTS {SYNREG_INDEX_TABLE} (
       suite_id             STRING,
       suite_family         STRING,
       dataset_id           NUMBER,
       dataset_seed         NUMBER,
+      global_idx           NUMBER,
       stage_path           STRING,
       prior_name           STRING,
       prior_version        STRING,
@@ -485,12 +515,30 @@ def create_synreg_index_table(session) -> None:
       p_total              NUMBER,
       target_noise_scale   FLOAT,
       training_size_anchor BOOLEAN,
-      feature_noise_level  NUMBER,
+      feature_noise_level  FLOAT,
       eval_weight          FLOAT,
       payload_bytes        NUMBER,
       created_at           TIMESTAMP_NTZ,
       logical_dataset_key  STRING,
       source_suite_id      STRING
+      ,schema_version       STRING
+      ,task_family          STRING
+      ,distribution_family STRING
+      ,is_training_allowed BOOLEAN
+      ,is_eval_only         BOOLEAN
+      ,is_ood               BOOLEAN
+      ,is_hidden_holdout    BOOLEAN
+      ,difficulty_score     FLOAT
+      ,difficulty_tier      STRING
+      ,difficulty_reasons   STRING
+      ,estimated_memory_bytes NUMBER
+      ,estimated_memory_gib FLOAT
+      ,memory_class         STRING
+      ,covariance_type      STRING
+      ,rho                  FLOAT
+      ,target_noise_type    STRING
+      ,hidden_holdout_suite_id STRING
+      ,task_fingerprint     STRING
     ) DATA_RETENTION_TIME_IN_DAYS = 0
     """
     session.sql(ddl).collect()
@@ -498,7 +546,7 @@ def create_synreg_index_table(session) -> None:
 
 
 def insert_synreg_index_rows(session, rows: list[dict]) -> None:
-    """Insert index rows into SYNTHETIC_REGRESSION_DATASET_INDEX in chunks.
+    """Insert index rows into LINEAR_REGRESSION_DATASET_INDEX in chunks.
     Uses raw SQL INSERT to avoid Snowpark type-inference issues with ARRAY columns.
     Mirrors prepare_benchmark_datasets._write_benchmark_dataset_index()."""
     if not rows:
@@ -531,6 +579,7 @@ def insert_synreg_index_rows(session, rows: list[dict]) -> None:
             f"{_sql_str(r['suite_family'])}, "
             f"{_sql_num(r['dataset_id'])}, "
             f"{_sql_num(r['dataset_seed'])}, "
+            f"{_sql_num(r.get('global_idx'))}, "
             f"{_sql_str(r['stage_path'])}, "
             f"{_sql_str(r.get('prior_name'))}, "
             f"{_sql_str(r.get('prior_version'))}, "
@@ -544,21 +593,44 @@ def insert_synreg_index_rows(session, rows: list[dict]) -> None:
             f"{_sql_num(r.get('p_total'))}, "
             f"{_sql_float(r.get('target_noise_scale'))}, "
             f"{_sql_bool(r.get('training_size_anchor', False))}, "
-            f"{_sql_num(r.get('feature_noise_level'))}, "
+            f"{_sql_float(r.get('feature_noise_level'))}, "
             f"{_sql_float(r.get('eval_weight'))}, "
             f"{_sql_num(r.get('payload_bytes'))}, "
             f"TO_TIMESTAMP_NTZ({_sql_str(now_sql)}), "
             f"{_sql_str(r.get('logical_dataset_key'))}, "
-            f"{_sql_str(r.get('source_suite_id'))}"
+            f"{_sql_str(r.get('source_suite_id'))}, "
+            f"{_sql_str(r.get('schema_version'))}, "
+            f"{_sql_str(r.get('task_family', 'linear_regression'))}, "
+            f"{_sql_str(r.get('distribution_family'))}, "
+            f"{_sql_bool(r.get('is_training_allowed', True))}, "
+            f"{_sql_bool(r.get('is_eval_only', False))}, "
+            f"{_sql_bool(r.get('is_ood', False))}, "
+            f"{_sql_bool(r.get('is_hidden_holdout', False))}, "
+            f"{_sql_float(r.get('difficulty_score'))}, "
+            f"{_sql_str(r.get('difficulty_tier'))}, "
+            f"{_sql_str(json.dumps(r.get('difficulty_reasons', [])))}, "
+            f"{_sql_num(r.get('estimated_memory_bytes'))}, "
+            f"{_sql_float(r.get('estimated_memory_gib'))}, "
+            f"{_sql_str(r.get('memory_class'))}, "
+            f"{_sql_str(r.get('covariance_type'))}, "
+            f"{_sql_float(r.get('rho'))}, "
+            f"{_sql_str(r.get('target_noise_type'))}, "
+            f"{_sql_str(r.get('hidden_holdout_suite_id'))}, "
+            f"{_sql_str(r.get('task_fingerprint'))}"
         )
 
     col_list = (
-        "suite_id, suite_family, dataset_id, dataset_seed, stage_path, "
+        "suite_id, suite_family, dataset_id, dataset_seed, global_idx, stage_path, "
         "prior_name, prior_version, prior_regime, split_seeds, "
         "n_total, n_train_default, n_holdout_default, "
         "p_signal, p_noise, p_total, target_noise_scale, "
         "training_size_anchor, feature_noise_level, "
-        "eval_weight, payload_bytes, created_at, logical_dataset_key, source_suite_id"
+        "eval_weight, payload_bytes, created_at, logical_dataset_key, source_suite_id, "
+        "schema_version, task_family, distribution_family, is_training_allowed, "
+        "is_eval_only, is_ood, is_hidden_holdout, difficulty_score, difficulty_tier, "
+        "difficulty_reasons, estimated_memory_bytes, estimated_memory_gib, memory_class, "
+        "covariance_type, rho, target_noise_type, hidden_holdout_suite_id, "
+        "task_fingerprint"
     )
 
     chunk_size = 100
@@ -691,6 +763,12 @@ def _download_manifest_json(session) -> dict | None:
 
 def _build_index_from_manifest_datasets(session, manifest: dict) -> list[dict]:
     """Construct index rows from manifest.datasets (no NPZ generation needed)."""
+    task_family = manifest.get("task_family", "linear_regression")
+    if task_family not in {"linear_regression", "synthetic_linear_regression"}:
+        raise ValueError(
+            "Regression preparer refuses manifest for task_family="
+            f"{task_family!r}"
+        )
     suite_id = manifest["suite_id"]
     rows = []
     for rec in manifest["datasets"]:
@@ -699,6 +777,7 @@ def _build_index_from_manifest_datasets(session, manifest: dict) -> list[dict]:
             "suite_family": rec["suite_family"],
             "dataset_id": rec["dataset_id"],
             "dataset_seed": rec["dataset_seed"],
+            "global_idx": rec.get("global_idx"),
             "stage_path": rec["stage_path"],
             "prior_name": PRIOR_NAME,
             "prior_version": PRIOR_VERSION,
@@ -721,6 +800,24 @@ def _build_index_from_manifest_datasets(session, manifest: dict) -> list[dict]:
                 or f"{suite_id}:{rec['prior_regime']}:{rec['dataset_id']:04d}"
             ),
             "source_suite_id": rec.get("source_suite_id"),
+            "schema_version": manifest.get("schema_version"),
+            "task_family": task_family,
+            "distribution_family": rec.get("distribution_family"),
+            "is_training_allowed": rec.get("is_training_allowed", True),
+            "is_eval_only": rec.get("is_eval_only", False),
+            "is_ood": rec.get("is_ood", False),
+            "is_hidden_holdout": rec.get("is_hidden_holdout", False),
+            "difficulty_score": rec.get("difficulty_score"),
+            "difficulty_tier": rec.get("difficulty_tier"),
+            "difficulty_reasons": rec.get("difficulty_reasons", []),
+            "estimated_memory_bytes": rec.get("estimated_memory_bytes"),
+            "estimated_memory_gib": rec.get("estimated_memory_gib"),
+            "memory_class": rec.get("memory_class"),
+            "covariance_type": rec.get("covariance_type"),
+            "rho": rec.get("rho"),
+            "target_noise_type": rec.get("target_noise_type"),
+            "hidden_holdout_suite_id": rec.get("hidden_holdout_suite_id"),
+            "task_fingerprint": rec.get("task_fingerprint"),
         })
     return rows
 
@@ -1307,6 +1404,369 @@ def prepare_combined_suite(session) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Mixed-categorical regression preparation
+# ---------------------------------------------------------------------------
+
+def _create_mixed_reg_index_table(session) -> None:
+    """Create LINEAR_MIXED_REGRESSION_DATASET_INDEX if not already present."""
+    ddl = f"""
+    CREATE TRANSIENT TABLE IF NOT EXISTS {SYNREG_INDEX_TABLE} (
+      suite_id             STRING,
+      suite_family         STRING,
+      dataset_id           NUMBER,
+      dataset_seed         NUMBER,
+      global_idx           NUMBER,
+      stage_path           STRING,
+      prior_name           STRING,
+      prior_version        STRING,
+      prior_regime         STRING,
+      split_seeds          ARRAY,
+      n_total              NUMBER,
+      n_train_default      NUMBER,
+      n_holdout_default    NUMBER,
+      p_signal             NUMBER,
+      p_noise              NUMBER,
+      p_total              NUMBER,
+      p_num                NUMBER,
+      p_cat                NUMBER,
+      categorical_cardinalities VARIANT,
+      max_cardinality      NUMBER,
+      cat_effect_scale     FLOAT,
+      missing_rate         FLOAT,
+      target_noise_scale   FLOAT,
+      training_size_anchor BOOLEAN,
+      feature_noise_level  FLOAT,
+      eval_weight          FLOAT,
+      payload_bytes        NUMBER,
+      created_at           TIMESTAMP_NTZ,
+      logical_dataset_key  STRING,
+      source_suite_id      STRING,
+      base_task_id         STRING,
+      perturbation_condition STRING,
+      task_seed            NUMBER,
+      schema_version       STRING,
+      task_family          STRING,
+      distribution_family  STRING,
+      covariance_type      STRING,
+      rho                  FLOAT,
+      target_noise_type    STRING,
+      is_training_allowed  BOOLEAN,
+      is_eval_only         BOOLEAN,
+      is_ood               BOOLEAN,
+      is_hidden_holdout    BOOLEAN,
+      difficulty_score     FLOAT,
+      difficulty_tier      STRING,
+      difficulty_reasons   STRING,
+      estimated_memory_bytes NUMBER,
+      estimated_memory_gib FLOAT,
+      memory_class         STRING,
+      hidden_holdout_suite_id STRING,
+      task_fingerprint     STRING,
+      training_data_family STRING,
+      task_objective       STRING
+    ) DATA_RETENTION_TIME_IN_DAYS = 0
+    """
+    session.sql(ddl).collect()
+    print(f"[INFO] Mixed-cat index table {SYNREG_INDEX_TABLE} ready.")
+
+
+def _build_mixed_reg_index_record(
+    suite_id: str,
+    dataset_id: int,
+    stage_path: str,
+    meta: dict,
+    payload_bytes: int = 0,
+) -> dict:
+    """Build a single index row dict for a mixed-categorical regression task."""
+    import datetime
+    cat_cards = list(meta.get("categorical_cardinalities", []))
+    p_num = int(meta.get("p_num", 0))
+    p_cat = int(meta.get("p_cat", 0))
+    max_card = max(cat_cards) if cat_cards else 0
+    n_train = int(meta.get("n_train", 0))
+    n_test = int(meta.get("n_test", 0))
+    n_total = n_train + n_test
+    return {
+        "suite_id": suite_id,
+        "suite_family": meta.get("suite_family", "primary"),
+        "dataset_id": dataset_id,
+        "dataset_seed": meta.get("dataset_seed"),
+        "global_idx": meta.get("global_idx", dataset_id),
+        "stage_path": stage_path,
+        "prior_name": meta.get("prior_name"),
+        "prior_version": meta.get("prior_version"),
+        "prior_regime": meta.get("prior_regime"),
+        "split_seeds": meta.get("split_seeds", [0]),
+        "n_total": n_total,
+        "n_train_default": n_train,
+        "n_holdout_default": n_test,
+        "p_signal": meta.get("p_signal", p_num),
+        "p_noise": meta.get("p_noise", 0),
+        "p_total": p_num + p_cat,
+        "p_num": p_num,
+        "p_cat": p_cat,
+        "categorical_cardinalities": cat_cards,
+        "max_cardinality": max_card,
+        "cat_effect_scale": meta.get("cat_effect_scale"),
+        "missing_rate": meta.get("missing_rate"),
+        "target_noise_scale": meta.get("target_noise_scale"),
+        "training_size_anchor": meta.get("training_size_anchor", False),
+        "feature_noise_level": meta.get("feature_noise_level"),
+        "eval_weight": meta.get("eval_weight", 1.0),
+        "payload_bytes": payload_bytes,
+        "logical_dataset_key": f"{suite_id}:mixed_reg:{dataset_id:04d}",
+        "source_suite_id": meta.get("source_suite_id"),
+        "base_task_id": meta.get("base_task_id"),
+        "perturbation_condition": meta.get("perturbation_condition"),
+        "task_seed": meta.get("task_seed"),
+        "schema_version": meta.get("schema_version"),
+        "task_family": meta.get("task_family", "linear_regression"),
+        "distribution_family": meta.get("distribution_family"),
+        "covariance_type": meta.get("covariance_type"),
+        "rho": meta.get("rho"),
+        "target_noise_type": meta.get("target_noise_type"),
+        "is_training_allowed": meta.get("is_training_allowed", True),
+        "is_eval_only": meta.get("is_eval_only", False),
+        "is_ood": meta.get("is_ood", False),
+        "is_hidden_holdout": meta.get("is_hidden_holdout", False),
+        "difficulty_score": meta.get("difficulty_score"),
+        "difficulty_tier": meta.get("difficulty_tier"),
+        "difficulty_reasons": meta.get("difficulty_reasons", []),
+        "estimated_memory_bytes": meta.get("estimated_memory_bytes"),
+        "estimated_memory_gib": meta.get("estimated_memory_gib"),
+        "memory_class": meta.get("memory_class"),
+        "hidden_holdout_suite_id": meta.get("hidden_holdout_suite_id"),
+        "task_fingerprint": meta.get("task_fingerprint"),
+        "training_data_family": meta.get(
+            "training_data_family", "synthetic_linear_regression_mixed_categorical"
+        ),
+        "task_objective": meta.get("task_objective", "inductive_regression"),
+    }
+
+
+def _insert_mixed_reg_index_rows(session, rows: list[dict]) -> None:
+    """Insert mixed-cat regression index rows using raw SQL INSERT."""
+    if not rows:
+        return
+
+    import datetime
+
+    def _sql_str(v) -> str:
+        if v is None:
+            return "NULL"
+        return "'" + str(v).replace("'", "''") + "'"
+
+    def _sql_num(v) -> str:
+        return str(int(v)) if v is not None else "NULL"
+
+    def _sql_float(v) -> str:
+        return str(float(v)) if v is not None else "NULL"
+
+    def _sql_bool(v) -> str:
+        return "TRUE" if v else "FALSE"
+
+    now_sql = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    col_list = (
+        "suite_id, suite_family, dataset_id, dataset_seed, global_idx, stage_path, "
+        "prior_name, prior_version, prior_regime, split_seeds, "
+        "n_total, n_train_default, n_holdout_default, "
+        "p_signal, p_noise, p_total, "
+        "p_num, p_cat, categorical_cardinalities, max_cardinality, "
+        "cat_effect_scale, missing_rate, "
+        "target_noise_scale, training_size_anchor, feature_noise_level, "
+        "eval_weight, payload_bytes, created_at, logical_dataset_key, source_suite_id, "
+        "base_task_id, perturbation_condition, task_seed, "
+        "schema_version, task_family, distribution_family, covariance_type, rho, "
+        "target_noise_type, is_training_allowed, is_eval_only, is_ood, is_hidden_holdout, "
+        "difficulty_score, difficulty_tier, difficulty_reasons, "
+        "estimated_memory_bytes, estimated_memory_gib, memory_class, "
+        "hidden_holdout_suite_id, task_fingerprint, training_data_family, task_objective"
+    )
+
+    select_strings = []
+    for r in rows:
+        split_seeds_json = json.dumps(list(r.get("split_seeds") or []))
+        cat_cards_json = json.dumps(list(r.get("categorical_cardinalities") or []))
+        diff_reasons = r.get("difficulty_reasons", [])
+        if isinstance(diff_reasons, list):
+            diff_reasons = json.dumps(diff_reasons)
+        select_strings.append(
+            "SELECT "
+            f"{_sql_str(r.get('suite_id'))}, "
+            f"{_sql_str(r.get('suite_family'))}, "
+            f"{_sql_num(r.get('dataset_id'))}, "
+            f"{_sql_num(r.get('dataset_seed'))}, "
+            f"{_sql_num(r.get('global_idx'))}, "
+            f"{_sql_str(r.get('stage_path'))}, "
+            f"{_sql_str(r.get('prior_name'))}, "
+            f"{_sql_str(r.get('prior_version'))}, "
+            f"{_sql_str(r.get('prior_regime'))}, "
+            f"PARSE_JSON({_sql_str(split_seeds_json)}), "
+            f"{_sql_num(r.get('n_total'))}, "
+            f"{_sql_num(r.get('n_train_default'))}, "
+            f"{_sql_num(r.get('n_holdout_default'))}, "
+            f"{_sql_num(r.get('p_signal'))}, "
+            f"{_sql_num(r.get('p_noise'))}, "
+            f"{_sql_num(r.get('p_total'))}, "
+            f"{_sql_num(r.get('p_num'))}, "
+            f"{_sql_num(r.get('p_cat'))}, "
+            f"PARSE_JSON({_sql_str(cat_cards_json)}), "
+            f"{_sql_num(r.get('max_cardinality'))}, "
+            f"{_sql_float(r.get('cat_effect_scale'))}, "
+            f"{_sql_float(r.get('missing_rate'))}, "
+            f"{_sql_float(r.get('target_noise_scale'))}, "
+            f"{_sql_bool(r.get('training_size_anchor', False))}, "
+            f"{_sql_float(r.get('feature_noise_level'))}, "
+            f"{_sql_float(r.get('eval_weight', 1.0))}, "
+            f"{_sql_num(r.get('payload_bytes', 0))}, "
+            f"TO_TIMESTAMP_NTZ({_sql_str(now_sql)}), "
+            f"{_sql_str(r.get('logical_dataset_key'))}, "
+            f"{_sql_str(r.get('source_suite_id'))}, "
+            f"{_sql_str(r.get('base_task_id'))}, "
+            f"{_sql_str(r.get('perturbation_condition'))}, "
+            f"{_sql_num(r.get('task_seed'))}, "
+            f"{_sql_str(r.get('schema_version'))}, "
+            f"{_sql_str(r.get('task_family'))}, "
+            f"{_sql_str(r.get('distribution_family'))}, "
+            f"{_sql_str(r.get('covariance_type'))}, "
+            f"{_sql_float(r.get('rho'))}, "
+            f"{_sql_str(r.get('target_noise_type'))}, "
+            f"{_sql_bool(r.get('is_training_allowed', True))}, "
+            f"{_sql_bool(r.get('is_eval_only', False))}, "
+            f"{_sql_bool(r.get('is_ood', False))}, "
+            f"{_sql_bool(r.get('is_hidden_holdout', False))}, "
+            f"{_sql_float(r.get('difficulty_score'))}, "
+            f"{_sql_str(r.get('difficulty_tier'))}, "
+            f"{_sql_str(diff_reasons)}, "
+            f"{_sql_num(r.get('estimated_memory_bytes'))}, "
+            f"{_sql_float(r.get('estimated_memory_gib'))}, "
+            f"{_sql_str(r.get('memory_class'))}, "
+            f"{_sql_str(r.get('hidden_holdout_suite_id'))}, "
+            f"{_sql_str(r.get('task_fingerprint'))}, "
+            f"{_sql_str(r.get('training_data_family'))}, "
+            f"{_sql_str(r.get('task_objective'))}"
+        )
+
+    chunk_size = 100
+    for start in range(0, len(select_strings), chunk_size):
+        chunk = select_strings[start: start + chunk_size]
+        sql = (
+            f"INSERT INTO {SYNREG_INDEX_TABLE} ({col_list})\n"
+            + "\nUNION ALL\n".join(chunk)
+        )
+        session.sql(sql).collect()
+        print(
+            f"[INFO] Inserted rows {start}\u2013{start + len(chunk) - 1} "
+            f"into {SYNREG_INDEX_TABLE}.",
+            flush=True,
+        )
+
+
+def _validate_mixed_parquet_fields(local_path) -> dict:
+    """Read scalar metadata from a mixed-cat regression parquet file."""
+    import pyarrow.parquet as pq
+
+    tbl = pq.read_table(str(local_path))
+    d = tbl.to_pydict()
+
+    meta = {}
+    for field in [
+        "n", "p_num", "p_cat", "n_train", "n_test",
+        "prior_regime", "schema_version", "task_family",
+        "training_data_family", "task_objective",
+    ]:
+        if field in d:
+            meta[field] = d[field][0]
+
+    if "categorical_cardinalities" in d:
+        meta["categorical_cardinalities"] = list(d["categorical_cardinalities"][0])
+
+    return meta
+
+
+def _prepare_mixed_regression(session) -> str:
+    """Prepare mixed-categorical regression evaluation index.
+
+    Discovers parquet files on stage, validates metadata, and populates
+    LINEAR_MIXED_REGRESSION_DATASET_INDEX.
+    """
+    import tempfile
+
+    suite_id = SYNREG_SUITE_ID
+    print(
+        f"[INFO] _prepare_mixed_regression START suite_id={suite_id} "
+        f"index_table={SYNREG_INDEX_TABLE}",
+        flush=True,
+    )
+
+    # Discover parquet files under the mixed regression evaluation stage prefix
+    stage_prefix = f"@EVALUATION_DATASET_STAGE/mixed_regression_prepared/{suite_id}"
+    parquet_paths = _list_stage_parquets(session, stage_prefix)
+    if not parquet_paths:
+        raise FileNotFoundError(
+            f"No parquet files found under {stage_prefix}. "
+            "Ensure mixed-categorical regression data has been generated and staged."
+        )
+    print(f"[INFO] Found {len(parquet_paths)} parquet files under {stage_prefix}.", flush=True)
+
+    os.makedirs(SYNREG_LOCAL_DIR, exist_ok=True)
+    _create_mixed_reg_index_table(session)
+
+    # Delete existing rows for this suite
+    session.sql(
+        f"DELETE FROM {SYNREG_INDEX_TABLE} WHERE suite_id = '{suite_id}'"
+    ).collect()
+
+    index_rows = []
+    errors = []
+
+    for dataset_id, stage_path in enumerate(sorted(parquet_paths)):
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                local_path = _download_from_stage_to_dir(session, stage_path, tmp_dir)
+                meta = _validate_mixed_parquet_fields(local_path)
+                payload_bytes = local_path.stat().st_size if hasattr(local_path, "stat") else 0
+                record = _build_mixed_reg_index_record(
+                    suite_id=suite_id,
+                    dataset_id=dataset_id,
+                    stage_path=stage_path,
+                    meta=meta,
+                    payload_bytes=payload_bytes,
+                )
+                index_rows.append(record)
+        except Exception as exc:
+            errors.append(f"  [{stage_path}]: {exc}")
+            print(f"[ERROR] {stage_path}: {exc}", flush=True)
+
+    if errors:
+        summary = "\n".join(errors)
+        raise RuntimeError(
+            f"_prepare_mixed_regression: {len(errors)} parquet(s) failed:\n{summary}"
+        )
+
+    _insert_mixed_reg_index_rows(session, index_rows)
+
+    # Validate
+    count_row = session.sql(
+        f"SELECT COUNT(*) AS n FROM {SYNREG_INDEX_TABLE} "
+        f"WHERE suite_id = '{suite_id}'"
+    ).collect()
+    actual = int(count_row[0][0]) if count_row else 0
+    if actual != len(index_rows):
+        raise RuntimeError(
+            f"{SYNREG_INDEX_TABLE} row count {actual} does not match "
+            f"expected {len(index_rows)} after insert."
+        )
+
+    print(
+        f"[INFO] _prepare_mixed_regression DONE. {actual} rows for suite_id={suite_id!r}.",
+        flush=True,
+    )
+    return f"OK suite_id={suite_id} total_rows={actual} (mixed_categorical)"
+
+
 def prepare_synthetic_regression(session=None) -> str:
     """
     Stored procedure handler and main function.
@@ -1315,6 +1775,10 @@ def prepare_synthetic_regression(session=None) -> str:
     if session is None:
         from snowflake.snowpark import Session
         session = Session.builder.getOrCreate()
+
+    # Dispatch to mixed-categorical handler
+    if SYNREG_IS_MIXED_CATEGORICAL:
+        return _prepare_mixed_regression(session)
 
     # Dispatch to combined-suite handler when SYNTHETIC_REGRESSION_SUITE_ID=linear_all_v1
     if SYNREG_SUITE_ID == COMBINED_SUITE_ID:

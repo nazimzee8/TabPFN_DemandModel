@@ -6,7 +6,7 @@ stages them as .npz files with no pickle, and writes benchmark_manifest.json.
 
 Run before any benchmark shard jobs:
     CALL prepare_benchmark_datasets();
-    LIST @META_DATASET_STAGE/benchmark_prepared/;
+    LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
 
 Or let run_evaluation_pipeline() handle it automatically.
 
@@ -60,7 +60,7 @@ def _configure_openml_cache(openml_module):
 # ---------------------------------------------------------------------------
 
 BENCHMARK_PREPARED_STAGE = os.environ.get(
-    "BENCHMARK_PREPARED_STAGE", "@META_DATASET_STAGE/benchmark_prepared/"
+    "BENCHMARK_PREPARED_STAGE", "@META_REGRESSION_DATASET_STAGE/benchmark_prepared/"
 )
 BENCHMARK_FORCE_REBUILD = os.environ.get("BENCHMARK_FORCE_REBUILD", "false").lower() == "true"
 BENCHMARK_INCLUDE_OPENML = os.environ.get("BENCHMARK_INCLUDE_OPENML", "true").lower() == "true"
@@ -72,7 +72,7 @@ BENCHMARK_DATASET_INDEX_TABLE = os.environ.get(
     "BENCHMARK_DATASET_INDEX_TABLE", "BENCHMARK_DATASET_INDEX"
 )
 
-KAGGLE_STAGE_PATH = "@META_DATASET_STAGE/kaggle/"
+KAGGLE_STAGE_PATH = "@META_REGRESSION_DATASET_STAGE/kaggle/"
 LOCAL_PREP_DIR = "/tmp/benchmark_prep"
 MANIFEST_FILENAME = "benchmark_manifest.json"
 

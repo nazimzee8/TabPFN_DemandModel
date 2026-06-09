@@ -4,16 +4,31 @@ This file is loaded automatically by Claude Code at every session start. It desc
 architecture, coding standards, pipeline design, and operational guardrails for this project.
 Do not delete or rename this file.
 
+**Skills index** — read the relevant skill before implementing:
+
+| Skill | When to use |
+|-------|-------------|
+| `skills/architecture/SKILL.md` | **Source of truth** for intended pipeline architecture: linear and nonlinear data-generation layers, `TRAINING_DATA_FAMILY` routing contract, checkpoint naming invariants, the categorical eval design contract, and the linear-vs-nonlinear fork/shared-harness structure. Read first when adding task families, wiring runtime flags, or reasoning about which script/checkpoint/env-var a change belongs in. |
+| `skills/linear-synthetic-data/SKILL.md` | Before implementing any change to the **linear training pipeline**: data generation (`generate_dgp.py`, `generate_synthetic_regression.py`, `generate_synthetic_classification.py`), training orchestration (`run_pretrain_job.py`, `run_hpo_job.py`, `run_model_training_job.py`), or `TRAINING_DATA_FAMILY` routing. Cross-ref `nonlinear-synthetic-data` for nonlinear data generation. |
+| `skills/linear-evaluation-pipeline/SKILL.md` | Before implementing any change to the **linear evaluation pipeline**: eval-suite prep (`prepare_synthetic_regression.py`, `prepare_synthetic_classification.py`), evaluation scripts (`evaluate_linear_regression.py`, `evaluate_linear_classification.py`), or linear evaluation orchestration procedures. Cross-ref `nonlinear-evaluation-pipeline` for the nonlinear fork. |
+| `skills/nonlinear-synthetic-data/SKILL.md` | Before implementing any change to the **nonlinear training pipeline**: `generate_nonlinear_dgp.py` (4 families via `main_nonlinear_training()`), nonlinear eval generators (`generate_nonlinear_regression.py`, `generate_nonlinear_classification.py`), or nonlinear index tables (`META_NONLINEAR_*`). |
+| `skills/nonlinear-evaluation-pipeline/SKILL.md` | Before implementing any change to the **nonlinear evaluation pipeline**: nonlinear prep scripts (`prepare_nonlinear_regression.py`, `prepare_nonlinear_classification.py`), evaluation forks (`evaluate_nonlinear_regression.py`, `evaluate_nonlinear_classification.py`), or nonlinear orchestrators (`run_nonlinear_regression_evaluation.py`, `run_nonlinear_classification_evaluation.py`). |
+| `skills/machine-learning-pipeline/SKILL.md` | Before implementing any change to the **ML model, training loop, HPO, or checkpoint management**: `src/model.py`, `src/train.py`, `src/hpo.py`, checkpoint format, `val_mse` / `val_cross_entropy` HPO metrics. |
+
 ---
 
 ## 1. Project Overview
 
-TabPFN DemandModel is a MODEL3-ICL tabular regression model trained and evaluated entirely within
+TabPFN DemandModel is a MODEL4-ICL tabular regression and linear-classification model trained and evaluated entirely within
 Snowflake Snowpark Container Services (SPCS). The model is trained on synthetic linear-regression
 priors and benchmarked against ten classical baselines plus AutoGluon on both an in-distribution
 synthetic suite and an OOD parity pilot suite. The primary deliverables are model comparison
-summaries (MODEL3-ICL vs. baselines on MSE, rank, win rate) and stability charts demonstrating
-MODEL3-ICL's robustness to feature noise and consistent performance across training set sizes.
+summaries (MODEL4-ICL vs. baselines on MSE, rank, win rate) and stability charts demonstrating
+MODEL4-ICL's robustness to feature noise and consistent performance across training set sizes.
+
+MODEL4 (Linear-Statistic-Aware DeepSet ICL) supersedes MODEL3 as the default architecture.
+MODEL3 checkpoints remain loadable for historical comparison. See `MODEL4.md` for the
+normative architecture specification.
 
 ---
 
@@ -61,14 +76,20 @@ results/                Local downloaded evaluation artifacts
 
 | Stage | Contents |
 |-------|----------|
-| `@META_DATASET_STAGE` | Benchmark metadata index + prepared `.npz` splits (`benchmark_prepared/`) |
+| `@META_REGRESSION_DATASET_STAGE` | Benchmark metadata index + prepared `.npz` splits (`benchmark_prepared/`) |
+| `@META_NONLINEAR_REGRESSION_DATASET_STAGE` | Nonlinear regression training parquet |
+| `@META_CLASSIFICATION_DATASET_STAGE` | Linear classification training parquet |
 | `@MODEL_STAGE/scripts/` | All runnable MLJob code from `src/*.py` and `scripts/*.py` (flat, no subdirectories) |
-| `@MODEL_STAGE/hpo/` | `best_config_ridge_residual.json` (sweep 1), `best_config_architecture.json` (sweep 2), `best_config.json` (merged final); `hpo_failure.json` on failure |
-| `@MODEL_STAGE/checkpoints/` | `pretrain_gate32.pt`, `pretrain_gate64.pt`, `pretrain_gate128.pt` (one per gate candidate), `best.pt` (v4 format) |
+| `@MODEL_STAGE/hpo/` | `best_config_linear_model.json` (sweep 1), `best_config_linear_model_architecture.json` (sweep 2), `best_config.json` (merged final); `hpo_failure.json` on failure |
+| `@MODEL_STAGE/checkpoints/` | `pretrain_gate32.pt`, `pretrain_gate64.pt`, `pretrain_gate128.pt` (one per gate candidate), `best_regression.pt` (v4 format) |
+| `@MODEL_STAGE/checkpoints/best_classification.pt` | MODEL4 classification checkpoint (v5, `classification_path_version=class_linear_v1`) |
 | `@EVALUATION_RESULTS_STAGE` | All evaluation output CSVs, charts, manifests |
-| `@EVALUATION_RESULTS_STAGE/regression/{suite_id}/` | Synthetic regression shard part CSVs (path scoped by `SYNREG_RESULTS_STAGE` env var) |
-| `@EVALUATION_RESULTS_STAGE/ood_parity/` | OOD pilot MODEL3-ICL-only shard part CSVs |
-| `@EVALUATION_RESULTS_STAGE/ood_full/` | OOD full suite (ood_linear_full_v1) aggregation outputs |
+| `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}/` | Linear regression shard part CSVs (path scoped by `SYNREG_RESULTS_STAGE` env var) |
+| `@EVALUATION_RESULTS_STAGE/linear/regression/mixed/{suite_id}/` | Linear mixed-categorical regression shard part CSVs |
+| `@EVALUATION_RESULTS_STAGE/linear/classification/numeric/{suite_id}/` | Linear classification shard part CSVs |
+| `@EVALUATION_RESULTS_STAGE/nonlinear/regression/numeric/{suite_id}/` | Nonlinear regression shard part CSVs |
+| `@EVALUATION_RESULTS_STAGE/nonlinear/classification/numeric/{suite_id}/` | Nonlinear classification shard part CSVs |
+| `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/ood_parity/` | OOD pilot MODEL3-ICL-only shard part CSVs |
 | `@MLJOB_PAYLOAD_STAGE` | Ephemeral MLJob payloads (managed by `submit_from_stage`) |
 | `@EVALUATION_DATASET_STAGE/primary/` | In-distribution synthetic parquet files (200 datasets) |
 | `@EVALUATION_DATASET_STAGE/ood_parity/{E,F,G,H}/` | OOD parity source pool — 200 parquet files (50 per regime); serves both pilot (80-row subset) and full suite (all 200 rows) |
@@ -78,7 +99,7 @@ results/                Local downloaded evaluation artifacts
 - Never embed suite IDs, version strings, or method names in stage subdirectory paths (exception:
   `{suite_id}` in `SYNREG_RESULTS_STAGE`, which is an env var value, not a hardcoded string).
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands — causes silent read failures.
-- `@META_DATASET_STAGE` must never be read or written by any OOD script.
+- `@META_REGRESSION_DATASET_STAGE` must never be read or written by any OOD script.
 - `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
 ---
@@ -87,15 +108,15 @@ results/                Local downloaded evaluation artifacts
 
 ### Step 1 — Metadata index (`build_meta_dataset_index.py`)
 
-- Reads Kaggle/OpenML parquet files from `@META_DATASET_STAGE`
+- Reads Kaggle/OpenML parquet files from `@META_REGRESSION_DATASET_STAGE`
 - Validates split counts: `train=800`, `val=100`, `test=100`
-- Writes `META_DATASET_INDEX` Snowflake table
+- Writes `META_REGRESSION_DATASET_INDEX` Snowflake table
 - Rebuild with `CALL build_meta_dataset_index();` whenever training parquet is restaged
 
 ### Step 2 — Benchmark preparation (`prepare_benchmark_datasets.py`)
 
-- Reads `META_DATASET_INDEX`; fetches raw OpenML/Kaggle datasets
-- Normalises features, writes `.npz` splits to `@META_DATASET_STAGE/benchmark_prepared/`
+- Reads `META_REGRESSION_DATASET_INDEX`; fetches raw OpenML/Kaggle datasets
+- Normalises features, writes `.npz` splits to `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/`
 - Writes `benchmark_manifest.json`; idempotent (skips if valid manifest present)
 - Use `BENCHMARK_FORCE_REBUILD=true` to force a full reprepare
 
@@ -103,7 +124,7 @@ results/                Local downloaded evaluation artifacts
 
 Both scripts run **locally** and produce parquet files that are PUT to Snowflake stages before
 the Snowflake prep jobs run. Their rows are indexed into the **same**
-`SYNTHETIC_REGRESSION_DATASET_INDEX` table, differentiated by `suite_id`.
+`LINEAR_REGRESSION_DATASET_INDEX` table, differentiated by `suite_id`.
 
 **`scripts/generate_synthetic_regression.py`** — in-distribution primary suite
 - Generates 200 parquet files across 4 regimes (A/B/C/D, 50 per regime)
@@ -123,7 +144,7 @@ the Snowflake prep jobs run. Their rows are indexed into the **same**
 ### Step 4 — Synthetic regression indexing (`prepare_synthetic_regression.py` — Snowflake job)
 
 - Detects `generated_locally=true, format="parquet"` manifest; validates via `_validate_parquet_index()`
-- Inserts in-distribution rows into `SYNTHETIC_REGRESSION_DATASET_INDEX` with
+- Inserts in-distribution rows into `LINEAR_REGRESSION_DATASET_INDEX` with
   `suite_id=linear_poisson_v1_recommended`
 - Also generates and indexes optional extended NPZ suites if configured
 - Idempotent: skips rebuild if valid; force rebuild with `SYNTHETIC_REGRESSION_FORCE_REBUILD=true`
@@ -159,16 +180,19 @@ the Snowflake prep jobs run. Their rows are indexed into the **same**
 - Validates exactly 400 rows and 50 per regime A–H before inserting
 - No parquet files are modified; stage paths are preserved from source rows
 - Orchestrated by `run_synthetic_regression_combined_evaluation()`; aggregation outputs to
-  `@EVALUATION_RESULTS_STAGE/combined/`
+  `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/`
 
-**Shared index architecture:** `SYNTHETIC_REGRESSION_DATASET_INDEX` is the single source of
+**Shared index architecture:** `LINEAR_REGRESSION_DATASET_INDEX` is the single source of
 truth for all synthetic evaluation suites. The evaluation procedure `load_synthetic_regression_index()`
 always filters `WHERE suite_id = SYNREG_SUITE_ID` — controlling which suite runs by setting the
 `SYNTHETIC_REGRESSION_SUITE_ID` env var before launching evaluation shards.
 
 ---
 
-## 6. Model Architecture (MODEL3 — DeepSetICLModel)
+## 6. Model Architecture (MODEL4 — DeepSetICLModel)
+
+**Current default: MODEL4 (Linear-Statistic-Aware DeepSet ICL). MODEL3 is retained for historical comparison.**
+See `MODEL4.md` for the normative specification.
 
 - **Bounded-context ensemble**: 5 random context windows × 200 training rows per window
 - **MC dropout**: K=8 forward passes per (sample, window)
@@ -178,28 +202,81 @@ always filters `WHERE suite_id = SYNREG_SUITE_ID` — controlling which suite ru
 - **Output**: mean prediction across 5×8=40 forward passes
 - Selection is train-only: fit on `(X_train, y_train)`, applied to both train and holdout
 - Baselines and AutoGluon receive full un-capped feature matrices
-- Reference: `src/model.py`, `src/evaluate_synthetic_regression.py`
+- Reference: `src/model.py`, `scripts/evaluate_linear_regression.py`
 
-**Gated Ridge Expert (enabled by default):**
-- `use_ridge_expert=True` by default in `ModelConfig`; prediction form: `ridge + gate × neural`
-- `ridge_lambda=1.0` (default); tuned via HPO as `tune.loguniform(1e-3, 1e1)`
-- `gate_hidden_dim ∈ {32, 64, 128}` — tuned by HPO (`tune.choice`); each candidate requires its own `pretrain_gate<N>.pt`
-- `RidgeExpert` is stateless — zero trainable parameters; no `nn.Parameter` or `nn.Module`
-- Gate sigmoid output in `(0, 1)`; gate MLP trains via gradient descent; ridge path is analytic
-- `best_config.json` always includes `use_ridge_expert`, `ridge_lambda`, `gate_hidden_dim`
-- Architecture mismatch check (in both `hpo.py` and `train.py`) includes `use_ridge_expert` and
-  `gate_hidden_dim`; a pretrain checkpoint trained with ridge expert disabled will not warm-start a
-  ridge-expert-enabled model (mismatch detected, training starts from scratch)
+**MODEL4 architecture (new default, `model_arch_version="model4"`):**
+
+Inherited backbone (unchanged from MODEL3): `ExchangeableMatrixBlock`, `ColumnEncoder`,
+`CellEncoder`, `RidgeExpert` (used as teacher utility), `SetPool`.
+
+New MODEL4 components:
+- `LinearStatisticExtractor` — no parameters; computes per-feature stats `(p, 6)` and global stats `(7,)` from `(X_norm, y_norm)` in float32 (protected from AMP)
+- `LinearStatisticEncoder` — shared MLP over feature rows + global MLP; encodes stats to `(linear_stat_dim,)` embedding
+- `FusionModule` — gated fusion of DeepSet embedding and linear-stat embedding; `gate = σ(MLP([h_glob, z_linear]))`
+- `CoefficientHead` — per-feature shared MLP; estimates `beta_hat_norm (p,)` directly; handles any `p` with the same weights
+- `LambdaHead` — small MLP with Softplus output; estimates dataset-specific regularization strength
+
+**Prediction path priority (MODEL4):**
+1. `use_coefficient_head=True` (default): `pred = xq_norm @ beta_hat_norm` (± residual if `use_residual_head=True`)
+2. `use_ridge_expert=True` (MODEL3 legacy, off by default): `pred = ridge + gate × neural`
+3. Pure neural: `pred = neural`
+
+**MODEL4 defaults in `ModelConfig`:**
+- `model_arch_version = "model4"` (was `"model3"`)
+- `use_ridge_expert = False` (was `True`)
+- `use_linear_model = True`, `use_coefficient_head = True`, `use_lambda_head = True`
+- `best_config.json` from `linear_model` HPO includes `use_coefficient_head: true`, `beta_aux_loss_weight`, etc.
+
+**Evaluation accepts both `"model3"` and `"model4"` in `model_arch_version`** for historical comparison.
+
+**MODEL4 Auxiliary Losses (Method 2 — soft penalization toward OLS structure):**
+- Teacher signal: OLS (unbiased, no lambda-selection problem; training data guarantees `n/p ≥ 5.0`)
+- `beta_norm` (ground-truth beta in normalized space) takes priority when available (new parquet files with `"beta"` field); OLS used as fallback
+- Tier 1 (`beta_aux_loss_weight=0.10`): scale-invariant coefficient MSE — `||beta_hat - beta_teacher||² / ||beta_teacher||²`
+- Tier 2 (`pred_aux_loss_weight=0.05`): normalized prediction MSE — `||y_coeff - y_ols||² / Var(y_ols)`
+- Tier 3 (`cos_aux_loss_weight=0.02`): cosine direction alignment — `1 - cos(beta_hat, beta_teacher)`
+- Lambda prior (`lambda_aux_loss_weight=0.01`): penalizes `lambda_hat` deviating from `p/n` heuristic
+- Auxiliary gradients are ≤20% of primary loss gradients in expectation (by weight design)
+
+**MODEL4 linear classification path:**
+- Explicitly selected by `TRAINING_DATA_FAMILY=synthetic_linear_classification`.
+- Uses integer labels, masked query-label embeddings, class-conditional statistics,
+  class-stat fusion, and per-feature/per-class coefficient and bias heads.
+- Always returns `(m, K)` logits, including binary tasks.
+- Uses cross-entropy plus optional logistic-teacher KL/coefficient, margin, prior, and calibration losses.
+- Does not reuse regression target normalization, scalar denormalization, MSE-on-labels, or the OLS/ridge teacher.
+- Classification checkpoints use format 5; regression checkpoints remain format 4.
 
 **Permutation test gate:** `run_permutation_tests(model)` is called immediately after
 checkpoint load. If any of the 7 permutation-invariance tests fail, evaluation aborts with
-a `RuntimeError`. This gate ensures the checkpoint actually implements MODEL3-ICL invariance.
+a `RuntimeError`. This gate ensures the checkpoint actually implements MODEL4-ICL invariance.
 
 ---
 
 ## 7. Snowflake Training & Fine-Tuning
 
+Use skill `linear-synthetic-data` when implementing changes to this pipeline.
+
 Three-phase pipeline, each submitted as an MLJob:
+
+All three procedures use the same API for regression and classification.
+`TRAINING_DATA_FAMILY` is the task switch:
+
+| Value | Index / stage | HPO metric | Final checkpoint |
+|---|---|---|---|
+| `synthetic_linear_regression` | `META_REGRESSION_DATASET_INDEX` / `@META_REGRESSION_DATASET_STAGE` | `val_mse` | `best_regression.pt` |
+| `synthetic_regression_nonlinear` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` / `@META_NONLINEAR_REGRESSION_DATASET_STAGE` | `val_mse` | nonlinear checkpoint |
+| `synthetic_linear_classification` | `META_CLASSIFICATION_DATASET_INDEX` / `@META_CLASSIFICATION_DATASET_STAGE` | `val_cross_entropy` | `best_classification.pt` |
+
+The zero-argument index builders read `META_DATASET_EXPECTED_TOTAL`,
+`META_NONLINEAR_DATASET_EXPECTED_TOTAL`, and
+`META_CLASSIFICATION_DATASET_EXPECTED_TOTAL`, respectively. Each value must
+equal the exact number of parquet datasets across that stage's train/val/test prefixes.
+
+The combined evaluation procedure has a three-argument overload whose final
+argument is `TRAINING_DATA_FAMILY`. Classification uses
+`LINEAR_CLASSIFICATION_DATASET_INDEX`, train-only `f_classif`,
+classification baselines and metrics, and the stable method ID `MODLE_ICL-MC`.
 
 ### Phase A — Pretraining (`run_pretrain_job.py` → `src/train.py`)
 
@@ -229,7 +306,7 @@ Three-phase pipeline, each submitted as an MLJob:
 - Topology: 10 nodes × 4 workers = world size 40
 - `EXPECTED_TRAIN_WORLD_SIZE=40`, `STRICT_WORLD_SIZE_CHECK=true`
 - SQL-sharded by DDP rank: `MOD(ROW_NUMBER() OVER (PARTITION BY split ORDER BY task_id) - 1, world_size) = rank`
-- Warm-starts from the HPO-selected gate checkpoint; writes `@MODEL_STAGE/checkpoints/best.pt` (v4 format)
+- Warm-starts from the HPO-selected gate checkpoint; writes `@MODEL_STAGE/checkpoints/best_regression.pt` (v4 format)
 - Pretrain checkpoint is resolved strictly (no cold-start, no `pretrain.pt` fallback):
   1. `best_config._meta.pretrain_checkpoint_stage_path` (written by HPO)
   2. Fallback: `@MODEL_STAGE/checkpoints/pretrain_gate<gate_hidden_dim>.pt`
@@ -263,22 +340,22 @@ If `Failed to mmap`, `activeQueryTracker`, or `Unable to create mmap-ed active q
 appear in logs **and** Python boundary markers are absent, treat as Snowflake MLJob/Ray/
 Prometheus runtime startup failure — do not rewrite model code.
 
-### HPO sweep strategy for MODEL3-ICL with Ridge Expert
+### HPO sweep strategy for MODEL4-ICL (linear_model sweep)
 
-**Recommended: two-sweep strategy (`ridge_residual` → `architecture`).**
+**Recommended: two-sweep strategy (`linear_model` → `architecture`).**
 
-Sweep-specific outputs: `best_config_ridge_residual.json`, `best_config_architecture.json`.
+Sweep-specific outputs: `best_config_linear_model.json`, `best_config_linear_model_architecture.json`.
 Merged final: `best_config.json` (written by architecture sweep).
-`_meta.sweeps.ridge_residual` and `_meta.sweeps.architecture` record both sweep results.
-`HPO_BASELINE_CONFIG_STAGE_PATH` must be set to `@MODEL_STAGE/hpo/best_config_ridge_residual.json` when calling architecture sweep.
+`_meta.sweeps.linear_model` and `_meta.sweeps.architecture` record both sweep results.
+`HPO_BASELINE_CONFIG_STAGE_PATH` must be set to `@MODEL_STAGE/hpo/best_config_linear_model.json` when calling architecture sweep.
 Run `model_ddp_memory_probe` (worst-case `d_phi=256, n_blocks=2`) as a **mandatory gate** before architecture HPO.
 
 | Mode | Architecture | Tuned hyperparameters | Requires |
 |------|-------------|----------------------|----------|
-| `ridge_residual` (default) | Fixed: `d_phi=128`, `n_sab_feat=1` | `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim ∈ {32,64,128}`, `use_huber`, `huber_delta`, `lambda_l1` | Gate-specific pretrain checkpoints |
-| `architecture` | `d_phi ∈ {64,128,192,256}`, `n_sab_feat ∈ {1,2}` | Frozen from ridge_residual baseline via `HPO_BASELINE_CONFIG_STAGE_PATH` | Ridge_residual sweep + memory probe |
+| `linear_model` (default) | Fixed: `d_phi=128`, `n_sab_feat=1` | `lr`, `weight_decay`, `dropout`, `ridge_lambda`, `gate_hidden_dim ∈ {32,64,128}`, `use_huber`, `huber_delta`, `lambda_l1` | Gate-specific pretrain checkpoints |
+| `architecture` | `d_phi ∈ {64,128,192,256}`, `n_sab_feat ∈ {1,2}` | Frozen from linear_model baseline via `HPO_BASELINE_CONFIG_STAGE_PATH` | linear_model sweep + memory probe |
 
-**Gate-specific pretrain requirement (ridge_residual):**
+**Gate-specific pretrain requirement (linear_model):**
 HPO samples `gate_hidden_dim ∈ {32, 64, 128}`. Each trial must warm-start from its matching
 `pretrain_gate<N>.pt`. All three checkpoints must exist before HPO starts. Missing any one
 checkpoint causes HPO to fail with `FileNotFoundError` (driver-side, before Ray init).
@@ -288,7 +365,7 @@ Gates checkpoints are optional for architecture sweep. If missing, all trials co
 (`PRETRAIN_LOAD_POLICY=allow_cold_start_on_arch_mismatch`).
 
 **Pretrain checkpoint mismatch policy** (`PRETRAIN_LOAD_POLICY`):
-- `ridge_residual` result → `require_match` (gate checkpoints must exactly match trial architecture)
+- `linear_model` result → `require_match` (gate checkpoints must exactly match trial architecture)
 - `architecture` result → `allow_cold_start_on_arch_mismatch` (set automatically by `run_model_training_job.py` based on `best_config.hpo_sweep_mode`)
 
 **Fixed across all sweep spaces:**
@@ -298,17 +375,17 @@ Gates checkpoints are optional for architecture sweep. If missing, all trials co
 
 **Operational order (two-sweep, recommended):**
 1. Run gate pretrains: `CALL run_pretrain_pipeline(..., 32/64/128)`.
-2. Run `CALL run_hpo_pipeline(..., 'ridge_residual', '')`. Writes `best_config_ridge_residual.json`.
+2. Run `CALL run_hpo_pipeline(..., 'linear_model', '')`. Writes `best_config_linear_model.json`.
 3. Run memory probe: `CALL run_model_ddp_memory_probe('model3', ..., 256, 2, TRUE)`.
-4. Run `CALL run_hpo_pipeline(..., 'architecture', '@MODEL_STAGE/hpo/best_config_ridge_residual.json')`. Writes merged `best_config.json`.
+4. Run `CALL run_hpo_pipeline(..., 'linear_model_architecture', '@MODEL_STAGE/hpo/best_config_linear_model.json')`. Writes merged `best_config.json`.
 5. Run `CALL run_model_training()`. Reads `best_config.json`; `PRETRAIN_LOAD_POLICY` set from `hpo_sweep_mode`.
 
 **SQL overloads:**
 ```sql
--- Sweep 1: ridge_residual
+-- Sweep 1: linear_model
 CALL run_hpo_pipeline(
-    'market_exchangeable_icl', 'synthetic_regression_combined',
-    'inductive_forecasting', 'ridge_residual', ''
+    'market_exchangeable_icl', 'synthetic_linear_regression',
+    'inductive_forecasting', 'linear_model', ''
 );
 
 -- Memory probe (mandatory before architecture sweep):
@@ -317,11 +394,11 @@ CALL run_model_ddp_memory_probe(
     200, 128, 128, 256, 2, TRUE
 );
 
--- Sweep 2: architecture (requires best_config_ridge_residual.json)
+-- Sweep 2: architecture (requires best_config_linear_model.json)
 CALL run_hpo_pipeline(
-    'market_exchangeable_icl', 'synthetic_regression_combined',
-    'inductive_forecasting', 'architecture',
-    '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
+    'market_exchangeable_icl', 'synthetic_linear_regression',
+    'inductive_forecasting', 'linear_model_architecture',
+    '@MODEL_STAGE/hpo/best_config_linear_model.json'
 );
 ```
 
@@ -329,7 +406,7 @@ CALL run_hpo_pipeline(
 
 ## 8. Benchmark Evaluation Architecture
 
-Orchestrated by `scripts/run_evaluation_test.py`. Use skill `evaluation-pipeline` when modifying or validating this pipeline.
+Orchestrated by `scripts/run_evaluation_test.py`. Use skill `linear-evaluation-pipeline` when modifying or validating this pipeline.
 
 ### Phase sequence (phase-gated):
 
@@ -375,7 +452,7 @@ phase: `run_evaluation_prep`, `run_deepset_evaluation`, `run_baseline_evaluation
 
 ## 9. Synthetic Regression Evaluation Architecture
 
-Orchestrated by `scripts/run_synthetic_regression_evaluation.py`. Use skill `evaluation-pipeline` when modifying or validating this pipeline.
+Orchestrated by `scripts/run_synthetic_regression_evaluation.py`. Use skill `linear-evaluation-pipeline` when modifying or validating this pipeline.
 
 ### Suite definitions:
 
@@ -397,13 +474,13 @@ Orchestrated by `scripts/run_synthetic_regression_evaluation.py`. Use skill `eva
 | 1 | Runtime probes (serialised) |
 | 2 | Capacity probes (GPU → CPU → AG, non-overlapping) |
 | 3 | Prep — 1 CPU job (`prepare_synthetic_regression.py`) |
-| 4 | MODEL3-ICL GPU shards (10, `DEEPSET_GPU_POOL`) — `SYNREG_RESULTS_STAGE=@EVALUATION_RESULTS_STAGE/regression/{suite_id}` |
+| 4 | MODEL3-ICL GPU shards (10, `DEEPSET_GPU_POOL`) — `SYNREG_RESULTS_STAGE=@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}` |
 | 5 | Baseline CPU shards (6, `DEEPSET_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
 | 6 | AutoGluon cluster shards (6×4 workers, `ray_work_items` mode, `AUTOGLUON_CPU_POOL`) — same `SYNREG_RESULTS_STAGE` |
 | 7 | Aggregation (1 CPU job) — reads from suite-specific prefix; validates `suite_id` in all rows |
-| 8 | OOD pilot runs as separate procedure: `run_synthetic_regression_ood_deepset_pilot` (only MODEL3-ICL, 5 GPU shards, results → `@EVALUATION_RESULTS_STAGE/ood_parity/`) |
-| 9 | OOD full suite runs as separate procedure: `run_synthetic_regression_ood_full_evaluation` (prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 200-dataset OOD suite; aggregation outputs → `SYNREG_OUTPUT_STAGE=@EVALUATION_RESULTS_STAGE/ood_full`) |
-| 10 | Combined suite runs as separate procedure: `run_synthetic_regression_combined_evaluation` (combined prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 400-dataset combined suite; aggregation outputs → `@EVALUATION_RESULTS_STAGE/combined`; requires both `linear_poisson_v1_recommended` and `ood_linear_full_v1` to be indexed first) |
+| 8 | OOD pilot runs as separate procedure: `run_synthetic_regression_ood_deepset_pilot` (only MODEL3-ICL, 5 GPU shards, results → `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/ood_parity/`) |
+| 9 | OOD full suite runs as separate procedure: `run_synthetic_regression_ood_full_evaluation` (prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 200-dataset OOD suite; aggregation outputs → `SYNREG_OUTPUT_STAGE=@EVALUATION_RESULTS_STAGE/linear/regression/numeric`) |
+| 10 | Combined suite runs as separate procedure: `run_synthetic_regression_combined_evaluation` (combined prep + MODEL3-ICL + baselines + AutoGluon + aggregation for 400-dataset combined suite; aggregation outputs → `@EVALUATION_RESULTS_STAGE/linear/regression/numeric`; requires both `linear_poisson_v1_recommended` and `ood_linear_full_v1` to be indexed first) |
 
 ### Split-phase stored procedures
 
@@ -527,19 +604,27 @@ CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
 
 ### Nonlinear suite data
 
-- **Nonlinear training data:** 1000 parquet files (800/100/100 train/val/test split), regimes I–L,
-  generated by `src/generate_nonlinear_dgp.py` → `data/nonlinear/{train,val,test}/`. Same
-  single-row parquet schema as linear training data (X_train, y_train, X_test, betaX_test).
-- **Nonlinear training stage/index:** `@META_NONLINEAR_DATASET_STAGE` / `META_NONLINEAR_DATASET_INDEX`.
+- **Nonlinear training data:** 1000 parquet files (800/100/100 train/val/test split),
+  generated by `src/generate_nonlinear_dgp.py` → `data/nonlinear/{train,val,test}/`.
+  The default `nonlinear_stat_aware` profile keeps target families I/J/K/L and
+  broadens them across feature regimes such as sparse/dense, noise features,
+  high-dimensional, correlated, and feature-noise settings. Use `--profile legacy`
+  for the original Poisson/Gaussian behavior, `--balanced` for deterministic
+  target-family x feature-regime coverage, and `--allow_underdetermined` to include
+  `low_n_high_p`.
+- **Nonlinear training stage/index:** `@META_NONLINEAR_REGRESSION_DATASET_STAGE` / `META_NONLINEAR_REGRESSION_DATASET_INDEX`.
   Routed by `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` in `snowflake_io.py::_resolve_index_table_and_stage()`.
   Index built by `CALL build_meta_nonlinear_dataset_index()` (script: `src/build_meta_nonlinear_dataset_index.py`).
-  Leaving `TRAINING_DATA_FAMILY` unset or non-nonlinear always uses `META_DATASET_INDEX` / `@META_DATASET_STAGE`.
-- **Nonlinear pretrain checkpoint:** `pretrain_nonlinear_meta.pt` (vs `pretrain_gate{32,64,128}.pt` for linear).
+  The index preserves the legacy runtime columns and adds nonlinear curriculum metadata
+  including `profile`, `feature_regime`, signal/noise feature counts, covariance,
+  target/feature noise, and sample-complexity bucket.
+  Leaving `TRAINING_DATA_FAMILY` unset or non-nonlinear always uses `META_REGRESSION_DATASET_INDEX` / `@META_REGRESSION_DATASET_STAGE`.
+- **Nonlinear pretrain checkpoint:** `pretrain_nonlinear_model.pt` (vs `pretrain_gate{32,64,128}.pt` for linear).
   Created by `CALL run_pretrain_pipeline_nonlinear(...)`. Uses `use_latent_ridge_expert=True, latent_ridge_dim=64`.
 - **Nonlinear HPO:** 6-arg `run_hpo_pipeline` overload adds `HPO_PRETRAIN_CHECKPOINT_STAGE_PATH` parameter.
-  Single sweep: `nonlinear_meta` tunes `latent_ridge_dim` ∈ {32, 64, 128} alongside
+  Single sweep: `nonlinear_model` tunes `latent_ridge_dim` ∈ {32, 64, 128} alongside
   optimizer/regularization and nonlinear-specific params. The pretrain checkpoint
-  (`pretrain_nonlinear_meta.pt`, built with dim=64) warm-starts dim=64 trials; dim=32/128
+  (`pretrain_nonlinear_model.pt`, built with dim=64) warm-starts dim=64 trials; dim=32/128
   trials cold-start on architecture mismatch.
 - **Nonlinear cold-start guard:** `run_model_training_job.py` raises `RuntimeError` when nonlinear
   `best_config` has no `_meta.pretrain_checkpoint_stage_path`. Dev-only override: `ALLOW_NONLINEAR_COLD_START=true`.
@@ -549,11 +634,11 @@ CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
   and the capacity probe — the previous 500 MB/2 GB production defaults have been retired.
 - **Nonlinear evaluation suite (`nonlinear_v1`, regimes I–L):** 400 datasets (100/regime):
   Quadratic (I), Sinusoidal (J), Pairwise Interactions (K), ReLU/Threshold (L). Same `(n,p)`
-  Poisson sampling as primary suite. Separate index table: `SYNTHETIC_NONLINEAR_DATASET_INDEX`.
-  Evaluation reads from this table when `SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX`
+  Poisson sampling as primary suite. Separate index table: `NONLINEAR_REGRESSION_DATASET_INDEX`.
+  Evaluation reads from this table when `SYNREG_INDEX_TABLE=NONLINEAR_REGRESSION_DATASET_INDEX`
   is set (configured automatically by `run_synthetic_nonlinear_evaluation.py` handlers).
   Generation: `python scripts/generate_nonlinear.py` → PUT → `CALL run_synthetic_nonlinear_prep(...)`.
-  Results: `@EVALUATION_RESULTS_STAGE/nonlinear/`.
+  Results: `@EVALUATION_RESULTS_STAGE/nonlinear/regression/numeric/nonlinear/`.
   SQL procedures: `sql/05_synthetic_nonlinear_evaluation_pipeline.sql`.
 
 ### Runtime-configurable baseline shard count:
@@ -634,7 +719,7 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
   workers do not time out waiting for the coordinator head port before SPCS even places the
   coordinator container.
 - **Session-free worker dataset loading:** The Ray driver opens Snowpark only to query
-  `SYNTHETIC_REGRESSION_DATASET_INDEX` and derive `dataset_access.presigned_url` with
+  `LINEAR_REGRESSION_DATASET_INDEX` and derive `dataset_access.presigned_url` with
   `GET_PRESIGNED_URL`. Each Ray worker receives only a compact item dict and downloads
   the presigned HTTPS URL with `urllib`. Workers must not call
   `Session.builder.getOrCreate()`, must not query the index, and the driver must not
@@ -667,7 +752,7 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
 | `SYNREG_AUTOGLUON_CONCURRENT_CLUSTERS` | N | Number of shards submitted (= `output_shards`) |
 
 - Each shard is a **single-instance** MLJob (`target_instances=1`) running
-  `evaluate_synthetic_regression.py` with `mode=autogluon`.
+  `evaluate_linear_regression.py` with `mode=autogluon`.
 - Output files follow the same naming convention:
   `AutoGluon_shard{i}_of_{N}_detailed.csv` where `N = CONCURRENT_CLUSTERS`.
 - Aggregation must expect `SYNREG_EXPECTED_AG_SHARDS=N` matching `CONCURRENT_CLUSTERS`.
@@ -676,7 +761,7 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
 - Capacity probes use `capacity_probe.py` with `target_instances=1` (not `ray_capacity_probe.py`).
 - `WORKERS_PER_SHARD` must be **1** in this mode. Values > 1 are rejected by
   `_resolve_combined_autogluon_execution_plan` before any Snowflake call.
-- The entrypoint (`evaluate_synthetic_regression.py`) is **derived internally** from the mode.
+- The entrypoint (`evaluate_linear_regression.py`) is **derived internally** from the mode.
   It is not accepted as a runtime argument or SQL procedure parameter.
 
 **Multi-instance entrypoint allowlist (both modes):**
@@ -685,11 +770,13 @@ Two supported modes are selected by `AUTOGLUON_CLUSTER_SHARDS` (SQL arg) /
 are permitted: `autogluon_ray.py` (production distributed AutoGluon),
 `ray_capacity_probe.py` (capacity probing), and `autogluon_worker_access_probe.py`
 (worker-access probing). All other entrypoints — including
-`evaluate_synthetic_regression.py` and `capacity_probe.py` — are rejected before the
+`evaluate_linear_regression.py` and `capacity_probe.py` — are rejected before the
 Snowflake submit call. Do not weaken this guard.
-- `MODEL_ARCH_VERSION` is **not** a Snowflake SQL/runtime selector. The model default is
-  MODEL3/DeepSet ICL. Internal checkpoint metadata may contain `model_arch_version='model3'`
-  for compatibility — do not remove that without updating all validation and tests.
+- `MODEL_ARCH_VERSION` is **not** a Snowflake SQL/runtime selector. The current default is
+  `"model4"` in `train.py`, `hpo.py`, and `ModelConfig`. New checkpoints carry
+  `model_arch_version="model4"`. MODEL3 checkpoints (`model_arch_version="model3"`) remain
+  loadable for historical comparison; evaluation accepts both. Do not remove MODEL3 validation
+  without updating all tests and checkpoint consumers.
 - `run_model_training` accepts the same explicit runtime lineage variables as pretrain and HPO:
   `MODEL_FAMILY`, `TRAINING_DATA_FAMILY`, `MODEL_DESIGN_PATTERN`.
 
@@ -715,7 +802,7 @@ Snowflake submit call. Do not weaken this guard.
 - Cache collision prevention: `load_prepared_synthetic_dataset` uses full stage path (not
   basename) to derive local cache filename — regime is embedded in the filename via
   `_stage_path_to_local_name()`; e.g. `ood_parity__E__dataset_0000.parquet`
-- `logical_dataset_key` is persisted in `SYNTHETIC_REGRESSION_DATASET_INDEX`; zero-padded
+- `logical_dataset_key` is persisted in `LINEAR_REGRESSION_DATASET_INDEX`; zero-padded
   format `{suite_id}:{regime}:{dataset_id:04d}` everywhere; evaluation falls back to
   zero-padded format when the index row has no value
 - All-method suites (`linear_poisson_v1_recommended`, `ood_linear_full_v1`, `linear_all_v1`)
@@ -725,9 +812,9 @@ Snowflake submit call. Do not weaken this guard.
   or rewritten; `prepare_combined_suite()` copies rows from the primary in-distribution suite
   (family=`primary`) and the full OOD suite, remapping `suite_id`, `source_suite_id`, `split_seeds`,
   and `logical_dataset_key`; both source suites must be indexed before combined prep runs
-- `source_suite_id` column in `SYNTHETIC_REGRESSION_DATASET_INDEX` records which source suite
+- `source_suite_id` column in `LINEAR_REGRESSION_DATASET_INDEX` records which source suite
   contributed each row in a combined suite (NULL for primary/OOD suites); migration:
-  `ALTER TABLE SYNTHETIC_REGRESSION_DATASET_INDEX ADD COLUMN IF NOT EXISTS source_suite_id STRING;`
+  `ALTER TABLE LINEAR_REGRESSION_DATASET_INDEX ADD COLUMN IF NOT EXISTS source_suite_id STRING;`
 - `OOD_REGRESSION_N_DATASETS` is the canonical env var for OOD dataset count;
   `OOD_REGRESSION_N_PILOT` is kept as a backward-compatible fallback; `_submit_ood_prep`
   passes both env vars so old and new versions of the script both work
@@ -754,6 +841,44 @@ All metrics are computed against `betaX` (noiseless signal), not noisy `y`.
 | Regime | Description |
 |--------|-------------|
 | E–H | Unseen at training time — parity pilot to test OOD generalisation |
+
+### Linear DGP Profiles (generate_dgp.py and generate_synthetic_regression.py)
+
+Both scripts now support `--profile` selection:
+
+| Profile | Purpose |
+|---------|---------|
+| `legacy` | Bit-identical to pre-2026 behaviour: Poisson n/p, regimes A–D only, p_noise=0, feature_noise=0, noise_scale=1.0 |
+| `linear_stat_aware` | **Recommended.** Grid-based n/p sampling, all 12 linear regimes (A_iid_dense through L_market_linear), noise features, feature noise, and teacher targets |
+| `linear_stress` | High-dim and underdetermined emphasis; requires `--allow_underdetermined` |
+| `market_linear` | L_market_linear weighted at 30%; suited for demand-modelling fine-tuning |
+
+The shared helper module `src/dgp_helpers.py` provides all DGP logic. Do not
+duplicate regime or covariance logic in other files — import from dgp_helpers.
+
+### Teacher Targets (stored optionally)
+
+With `--store_teacher_preds` and `--store_beta`, both scripts store:
+- `beta`, `support_mask`, `beta_signal`, `beta_noise`
+- `ridge_pred_lambda_*_test` for λ ∈ {0.0, 0.01, 0.1, 1.0, 10.0}
+- `oracle_ridge_lambda`, `ridge_oracle_mse`
+- `condition_number`, `effective_rank`, `matrix_rank`
+
+These are **optional metadata** columns and do not affect the evaluation
+pipeline (`evaluate_linear_regression.py` ignores unknown parquet columns).
+
+### META_REGRESSION_DATASET_INDEX Compatibility
+
+`generate_dgp.py` output must always include: `X_train`, `y_train`, `X_test`,
+`betaX_test`, `n`, `p`, `n_train`, `n_test`, `prior_regime`. These are read by
+`build_meta_dataset_index.py` and `train.py`. New columns are additive and safe.
+
+### LINEAR_REGRESSION_DATASET_INDEX Compatibility
+
+`generate_synthetic_regression.py` output must always include the 12 locked
+parquet columns. The manifest JSON must supply all 15 required per-dataset
+fields for `prepare_synthetic_regression.py` to build the index table correctly.
+New `prior_regime` string values are safe (no enum constraint).
 
 ---
 
@@ -787,7 +912,7 @@ All final files written to `@EVALUATION_RESULTS_STAGE/`.
 The two stability charts (`noise_features` and `training_size`) are the primary visual
 evidence for MODEL3-ICL's resistance to noise and consistent performance across training set sizes.
 
-### OOD full suite outputs (written to `@EVALUATION_RESULTS_STAGE/ood_full/`):
+### OOD full suite outputs (written to `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/`):
 
 **Required (always written):**
 
@@ -842,7 +967,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   `SYNTHETIC_REGRESSION_DROP_INDEX_TABLE=true` is explicitly set.
 - **Lazy imports:** prefer method-specific lazy imports in `evaluate.py` so an unrelated
   model package failure does not break a shard for another method.
-- **Entrypoint boundaries:** `evaluate_synthetic_regression.py` must never import from
+- **Entrypoint boundaries:** `evaluate_linear_regression.py` must never import from
   `evaluate.py`. Entrypoint scripts are runnable orchestration surfaces, not shared
   libraries; reusable MODEL3-ICL, baseline, AutoGluon, and ranking code belongs in stable
   `src/*.py` helper modules.
@@ -853,7 +978,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   into Python evaluator or indexing code must be normalised to lowercase keys immediately:
   `{str(k).lower(): v for k, v in row.as_dict().items()}`.
   Do not assume Snowflake preserves lowercase column names. This is mandatory for
-  `SYNTHETIC_REGRESSION_DATASET_INDEX` rows because downstream evaluation code expects
+  `LINEAR_REGRESSION_DATASET_INDEX` rows because downstream evaluation code expects
   lowercase keys such as `stage_path`, `split_seeds`, `dataset_id`, `suite_id`,
   `suite_family`, and `prior_regime`.
 - **Model family routing:** Never hardcode `DeepSetICLModel(cfg=cfg)` or
@@ -869,22 +994,30 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 ## 13. Operational Guardrails (Critical Rules)
 
+### MODEL4 operational notes
+
+- `linear_model` HPO uses `allow_cold_start_on_arch_mismatch` for new MODEL4 heads — this is expected, not an error. New `coeff_head`/`lambda_head`/`fusion` weights are randomly initialized; backbone weights are loaded from the pretrain checkpoint.
+- Do not set `use_coefficient_head=True` without `use_linear_model=True` — the coefficient head requires `feat_stats` from the `LinearStatisticExtractor`. `ModelConfig.__post_init__` enforces this.
+- Regenerate training parquet with updated `generate_dgp.py` (add `--store_beta` flag) to get `beta` for beta teacher loss. Old parquet files without `beta` (or with legacy `beta_true`) remain valid; OLS is used as the teacher signal fallback.
+- MODEL4 checkpoints carry `model_arch_version="model4"`. Evaluation accepts both `"model3"` and `"model4"`.
+- Do not set `use_coefficient_head=True` with `use_ridge_expert=True` simultaneously — the coefficient head is the primary prediction path; the ridge expert gate is only active when `use_coefficient_head=False`.
+
 ### Data safety
 
-- Never materialise full benchmark datasets locally inside an MLJob; use `@META_DATASET_STAGE` paths.
+- Never materialise full benchmark datasets locally inside an MLJob; use `@META_REGRESSION_DATASET_STAGE` paths.
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands (causes silent read failures).
-- OOD scripts never touch `@META_DATASET_STAGE`; only `@EVALUATION_DATASET_STAGE`.
+- OOD scripts never touch `@META_REGRESSION_DATASET_STAGE`; only `@EVALUATION_DATASET_STAGE`.
 - `data/ood_regression/` is the local directory; `@EVALUATION_DATASET_STAGE/ood_parity/` is the stage prefix.
 - `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
 ### Index safety
 
-- `SYNTHETIC_REGRESSION_DATASET_INDEX` stores both in-distribution and OOD rows, differentiated by `suite_id`.
+- `LINEAR_REGRESSION_DATASET_INDEX` stores both in-distribution and OOD rows, differentiated by `suite_id`.
 - Force rebuild must only delete `WHERE suite_id = '{active}'`; never DROP the whole table
   unless `SYNTHETIC_REGRESSION_DROP_INDEX_TABLE=true`.
 - `_assert_index_populated()` is called after every insert; zero rows is always fatal.
 - OOD truncation: `DELETE WHERE suite_id = 'ood_linear_pilot_v1'` only; never `TRUNCATE TABLE` or `DROP TABLE`.
-- `create_or_validate_manifest()` must check that `SYNTHETIC_REGRESSION_DATASET_INDEX` has rows
+- `create_or_validate_manifest()` must check that `LINEAR_REGRESSION_DATASET_INDEX` has rows
   for the `suite_id` — not just that manifest JSON files exist on stage.
 
 ### Training topology
@@ -983,7 +1116,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   (`ray_capacity_probe_readiness`, `ray_capacity_probe_timeout`) via its `_log()` helper.
   Cancelled workers with no logs at all were terminated before Python started; those with
   signal logs were alive and cancelled externally.
-- **Lazy Torch import in `evaluate_synthetic_regression.py`:** `torch`, `deepset_inference`,
+- **Lazy Torch import in `evaluate_linear_regression.py`:** `torch`, `deepset_inference`,
   and `model` are imported lazily inside the DeepSet/checkpoint functions that need them
   (`safe_torch_load_with_legacy_escape_hatch`, `normalize_checkpoint_cfg`,
   `load_best_deepset_checkpoint`, `apply_deepset_feature_selection`,
@@ -1015,7 +1148,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 - `TORCH_UNLOAD=true` is only a compatibility alias inside the evaluator;
   orchestration must set `ALLOW_UNSAFE_TORCH_LOAD=true` directly. This exception
   is not a policy for third-party checkpoints.
-- Migration: `python scripts/migrate_checkpoint.py --stage-name MODEL_STAGE --name best.pt`
+- Migration: `python scripts/migrate_checkpoint.py --stage-name MODEL_STAGE --name best_regression.pt`
 
 ### Script staging path invariant
 
@@ -1030,7 +1163,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   MLJobs can import them from `@MODEL_STAGE/scripts/`.
 - Current synthetic-evaluation upload reference after evaluator/helper changes:
   ```sql
-  PUT file://C:/Documents/TabPFN_DemandModel/src/evaluate_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/evaluate_linear_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/deepset_inference.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/baseline_models.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/autogluon_models.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
@@ -1042,7 +1175,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/ray_capacity_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_worker_access_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/scripts/autogluon_import_timing_probe.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_synthetic_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|run_synthetic_nonlinear_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
+  LIST @MODEL_STAGE/scripts/ PATTERN='.*(evaluate_linear_regression|deepset_inference|baseline_models|autogluon_models|evaluation_metrics|evaluate|run_synthetic_regression_evaluation|run_synthetic_nonlinear_evaluation|autogluon_ray|ray_capacity_probe|autogluon_worker_access_probe|autogluon_import_timing_probe)[.]py';
   ```
   Use the targeted block above when only the evaluator/helper refactor changed. Use
   the broad `src/*.py` plus `scripts/*.py` PUT block when procedure dependencies or
@@ -1069,7 +1202,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 - `401 Unauthorized` → recreate `KAGGLE_API_SECRET` with correct username/token.
 - `403 Forbidden` → accept competition rules at kaggle.com while logged in as the API token's account.
-- Always run `CALL download_kaggle_to_stage();` then `LIST @META_DATASET_STAGE/kaggle/;` to verify.
+- Always run `CALL download_kaggle_to_stage();` then `LIST @META_REGRESSION_DATASET_STAGE/kaggle/;` to verify.
 
 ## Guardrail: Query Collapse and Early Feature Compression
 
@@ -1099,7 +1232,7 @@ corrected architecture passes query sanity checks. The first priority is to elim
 collapse and early feature compression. HPO expansion comes after the model demonstrates
 query-sensitive behavior on controlled synthetic contexts.
 
-## Guardrail: DeepSetICLModel (MODEL3) is the Only Supported Model
+## Guardrail: DeepSetICLModel (MODEL4) is the Default Supported Model
 
 `DeepSetICLModel` is the sole production model for all synthetic regression
 training, OOD synthetic regression, and future market mental model prior training.
@@ -1110,7 +1243,7 @@ checkpoints carrying retired family values.
 
 ## Guardrail: Synthetic Regression Evaluation Must Instantiate from Checkpoint cfg
 
-`load_best_deepset_checkpoint()` in `evaluate_synthetic_regression.py` must always call
+`load_best_deepset_checkpoint()` in `evaluate_linear_regression.py` must always call
 `_instantiate_model(cfg)` — never hardcode `DeepSetICLModel(cfg=cfg)` or
 `DeepSetCompletionModel(cfg=cfg)`. The model class is determined by
 `cfg.model_family` from the checkpoint.
@@ -1166,7 +1299,7 @@ All Snowflake production training submissions (pretrain, HPO, final training) mu
 set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting to `"unknown"`.
 
 **Allowed values:**
-- `synthetic_regression_combined` — combined suite `linear_all_v1` (primary + OOD). **Use for all checkpoints evaluated by synthetic regression evaluation procedures.**
+- `synthetic_linear_regression` — combined suite `linear_all_v1` (primary + OOD). **Use for all checkpoints evaluated by synthetic regression evaluation procedures.**
 - `synthetic_regression_primary` — primary in-distribution synthetic regression data only.
 - `synthetic_regression_ood` — OOD synthetic regression data only.
 - `market_mental_model` — market mental model prior training.
@@ -1174,7 +1307,7 @@ set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting t
 
 **Key rules:**
 - `run_training_job.py`, `run_model_training_job.py`, and `run_hpo_job.py` each expose
-  `DEFAULT_TRAINING_DATA_FAMILY = os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")`.
+  `DEFAULT_TRAINING_DATA_FAMILY = os.getenv("TRAINING_DATA_FAMILY", "synthetic_linear_regression")`.
 - Standalone pretrain and HPO submitters support purpose-specific selectors:
   `PRETRAIN_TRAINING_DATA_FAMILY` and `HPO_TRAINING_DATA_FAMILY` override
   `TRAINING_DATA_FAMILY` for zero-arg `run_pretrain_pipeline()` and
@@ -1190,13 +1323,13 @@ set `TRAINING_DATA_FAMILY` in `env_vars`. Do not rely on `train.py` defaulting t
 - Pretrain and final training in `run_training_job.py` must use the **same** value.
 - `train.py` validates the value at module load time and raises `ValueError` for unknown values.
 - Checkpoint `metadata["training_data_family"]` is populated from `TRAINING_DATA_FAMILY`; it enables end-to-end lineage tracing from staged data → checkpoint → evaluation.
-- Combined suite `linear_all_v1` = `synthetic_regression_combined`. Never default production
+- Combined suite `linear_all_v1` = `synthetic_linear_regression`. Never default production
   synthetic regression evaluation checkpoints to `synthetic_regression_primary`.
 
-## Guardrail: MODEL3 Architecture Selectors Must Be Propagated Explicitly
+## Guardrail: MODEL4 Architecture Selectors Must Be Propagated Explicitly
 
 `MODEL_DESIGN_PATTERN` must be set explicitly in all production Snowflake training
-submissions. `MODEL_FAMILY` defaults to `"market_exchangeable_icl"` (MODEL3 ICL).
+submissions. `MODEL_FAMILY` defaults to `"market_exchangeable_icl"` (MODEL4 ICL).
 
 **Key rules:**
 - `MODEL_DESIGN_PATTERN="inductive_forecasting"` (default) → `model_family="market_exchangeable_icl"` → `DeepSetICLModel`
@@ -1207,9 +1340,9 @@ submissions. `MODEL_FAMILY` defaults to `"market_exchangeable_icl"` (MODEL3 ICL)
   `DEFAULT_MODEL_FAMILY` and `DEFAULT_MODEL_DESIGN_PATTERN` constants that propagate
   through `env_vars` to all MLJob children.
 
-## Guardrail: Run MODEL3 DDP Memory Probe Before Training
+## Guardrail: Run MODEL4 DDP Memory Probe Before Training
 
-Run `CALL run_model_ddp_memory_probe(...)` with `RUN_BACKWARD=TRUE` before every MODEL3
+Run `CALL run_model_ddp_memory_probe(...)` with `RUN_BACKWARD=TRUE` before every MODEL4
 pretrain / HPO / final-training submission when shape parameters change.
 
 **Key rules:**
@@ -1232,3 +1365,168 @@ CALL run_model_ddp_memory_probe(
     200, 128, 128, 128, 1, TRUE
 );
 ```
+
+---
+
+## MODEL4 Pipeline Contract Reference
+
+Eight contract areas fixed during MODEL4 integration testing. Keep these invariants when modifying
+the pipeline.
+
+### 1. Dynamic Dataset-Index Counts
+
+Split counts are **not** hard-coded. They are derived from an env var:
+
+| Env var | Default | Used by |
+|---------|---------|---------|
+| `META_DATASET_EXPECTED_TOTAL` | 1000 | linear index builder, validators |
+| `META_NONLINEAR_DATASET_EXPECTED_TOTAL` | 1000 | nonlinear index builder, validators |
+
+**Formula:** `train = int(0.8 * total)`, `val = int(0.1 * total)`, `test = total - train - val`.
+For `total=1000`: train=800, val=100, test=100 (backward compatible).
+
+**SQL:** Always use the 1-arg parameterized form:
+```sql
+CALL build_meta_dataset_index(1000);           -- linear
+CALL build_meta_nonlinear_dataset_index(1000); -- nonlinear
+```
+
+**Python handlers** `build_meta_dataset_index_with_total(expected_total)` and
+`build_meta_nonlinear_dataset_index_with_total(expected_total)` are defined in
+`scripts/run_training_job.py` and set the env var before delegating to the zero-arg handler.
+
+### 2. Linear Index Schema
+
+`META_REGRESSION_DATASET_INDEX` has **23 columns** (9 runtime + 14 MODEL4 metadata), matching the nonlinear
+index minus `feature_regime`.
+
+| Group | Columns |
+|-------|---------|
+| Runtime (9) | split, task_id, stage_path, n, p, n_train, n_test, prior_regime, hpo_bucket |
+| MODEL4 metadata (14) | profile, suite_id†, p_signal, p_noise, p_total, active_s, sparsity_ratio, covariance_type, rho, target_noise_scale, feature_noise_level, sample_complexity_bucket, has_noise_features, has_feature_noise |
+
+†`suite_id` is nullable; there is no authoritative source in `generate_dgp.py`. Always written as NULL.
+
+Existing tables without the 14 new columns: run `sql/migrate_meta_dataset_index_v2.sql`.
+
+### 3. Canonical Coefficient Field: `beta`
+
+`generate_dgp.py` writes the coefficient vector as **`"beta"`** (not `"beta_true"`).
+
+**`src/train.py` `load_parquet()`** reads with priority:
+1. `"beta"` (canonical)
+2. `"beta_true"` (legacy fallback, handles old parquet)
+3. `None` (nonlinear payloads without coefficients)
+
+**`src/model.py` `forward()`** parameter is `beta` (renamed from `beta_true`). The normalized
+form in the debug dict is `"beta_norm"` (was `"beta_true_norm"`).
+
+### 4. HPO Cardinality Limits
+
+Linear MODEL4 HPO uses `MODEL4_MAX_P = 256` and `MODEL4_MAX_N_TRAIN = 1024` (from
+`src/constants.py`), **not** `FIXED_D_PHI = 128` / `FIXED_D_RHO = 256`.
+
+| Mode | `HPO_MAX_INDEX_P` default | `HPO_MAX_INDEX_N_TRAIN` default |
+|------|--------------------------|--------------------------------|
+| `linear_model`, `linear_model_architecture` | 256 | 1024 |
+| `nonlinear_model`, `nonlinear_model_architecture` | 512 | 1024 |
+
+Override via env vars `HPO_MAX_INDEX_P` and `HPO_MAX_INDEX_N_TRAIN`.
+
+### 5. Snowflake HPO Handler Arity
+
+`run_hpo_pipeline_model_sweep_with_baseline_and_pretrain` in `scripts/run_hpo_job.py` takes
+**6 parameters** (no leading `session`). Snowflake passes SQL args by position; a leading
+`session` param causes all args to shift by 1.
+
+### 6. MODEL4 Checkpoint Integrity
+
+- **Format-4 checkpoints require `metadata`**. Missing metadata raises `RuntimeError` (not warning).
+- **`cfg.model_arch_version` and `metadata.model_arch_version` must agree**. Mismatch raises.
+- **No arbitrary `.pt` fallback**. Only explicit path, expected filename, and Snowflake suffix
+  glob variants are tried. If not found, raises immediately with actionable message.
+- **Strict `state_dict` load**: `load_state_dict(..., strict=True)`. Missing or unexpected keys
+  raise `RuntimeError`.
+
+### 7. Evaluation Result Identity
+
+```python
+DEEPSET_METHOD_ID = "MODEL-ICL-MC"   # in scripts/evaluate_linear_regression.py
+```
+
+All result rows, shard filenames, and aggregation completeness checks use `DEEPSET_METHOD_ID`.
+Do **not** hard-code `"MODEL3-ICL-MC"`. Do **not** derive the ID from `model_arch_version`.
+
+### 8. Linear Classification Audit Rules (2026-06)
+
+**No query-label preprocessing rule.**
+`load_classification_parquet` derives the canonical label map **only from `y_train`**.
+Never pass `y_test` labels to `torch.unique` or any mapping step.
+
+**Canonical class IDs.**
+After loading, class IDs are always in `[0, num_classes)` for both `y_train` and
+`y_test`.  `unseen_query_classes` records query labels that were absent from
+`y_train` and were mapped to the OOD bucket (`num_classes - 1`).
+
+**SMOTE restrictions.**
+Do **not** add SMOTE or any over/under-sampling to the classification pipeline.
+Class imbalance is an intentional DGP regime.  Use `inverse_frequency_class_weight`
+instead.  See `skills/linear-synthetic-data/SKILL.md` for the full decision record.
+
+**Schema-version ownership.**
+The single source of truth is `CLASSIFICATION_EVAL_SCHEMA_VERSION` in
+`src/dgp_helpers.py`.  Import it — never hard-code the version string.
+
+**Required evidence before performance claims.**
+A classification checkpoint is considered evidenced only when all of these
+`completion_gates` are True in the generation manifest:
+- `binary_datasets_present`
+- `multiclass_datasets_present`
+- `all_suite_families_present`
+
+And the evaluation manifest has `validation_status == "ok"` with
+`log_loss_valid == True` for the target model on the development split.
+
+**val_cross_entropy is pure CE.**
+`val_cross_entropy` in checkpoint metadata records the query cross-entropy loss
+only (no auxiliary KL/coef/margin/prior/calibration terms).  `val_total_loss`
+records the full objective.  Use `val_cross_entropy` for model selection.
+
+### 8b. Mixed-Categorical Training Family Rules (2026-06)
+
+**Family constants.**
+Use `MIXED_CAT_REGRESSION_TRAINING_FAMILY` and `MIXED_CAT_CLASSIFICATION_TRAINING_FAMILY`
+from `src/constants.py`. Never hard-code the family strings
+`"synthetic_linear_regression_mixed_categorical"` or
+`"synthetic_linear_classification_mixed_categorical"`.
+
+**Regime reuse.**
+Mixed-categorical families reuse the existing A-L regimes for the continuous axis.
+Categorical features are an orthogonal axis controlled by `p_cat_grid` and
+`cardinality_grid`, not a new regime axis.
+
+**Categorical classification is balanced-only by default.**
+The canonical training configuration uses `label_noise_rate=0.0` and all K classes
+present in both context and query splits.
+
+**Reference class identifiability.**
+For classification: `W_num[:, 0] = 0`, `b[0] = 0`, and
+`cat_class_effects[j][:, 0] = 0` for all categorical features `j`.
+This is the reference-class zeroing constraint.
+
+**Entity embedding token IDs.**
+Category IDs use `[ENTITY_EMBED_FIRST_REAL_ID, ENTITY_EMBED_FIRST_REAL_ID + C)`.
+Tokens 0 (PAD), 1 (MISSING), 2 (UNKNOWN) are reserved special tokens.
+Never generate or store category IDs in `{0, 1, 2}`.
+
+**Parquet schema versions.**
+`MIXED_REG_DGP_SCHEMA_VERSION` and `MIXED_CLS_DGP_SCHEMA_VERSION` from
+`src/constants.py`. Checkpoint format versions: 6 (mixed regression),
+7 (mixed classification).
+
+### 9. Deferred Work
+
+- **Nonlinear MODEL4 architecture**: Nonlinear MODEL4 checkpoint format, architecture
+  implementation, and warm-start behavior are explicitly deferred. The handler arity fix (Area 5)
+  is a generic SQL-dispatch correction; it applies to all nonlinear HPO use cases without
+  implementing nonlinear MODEL4 architecture.

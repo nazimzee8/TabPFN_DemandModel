@@ -12,19 +12,81 @@
 --      CALL run_synthetic_regression_combined_evaluation('2.5.0-py311', '2.5.0-py311');
 --   3. Verify index (expect A/B/C/D/E/F/G/H each with 50 rows):
 --      SELECT prior_regime, COUNT(*) AS n
---      FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+--      FROM LINEAR_REGRESSION_DATASET_INDEX
 --      WHERE suite_id = 'linear_all_v1'
 --      GROUP BY prior_regime ORDER BY prior_regime;
 --   4. Verify source lineage:
 --      SELECT source_suite_id, COUNT(*) AS n
---      FROM SYNTHETIC_REGRESSION_DATASET_INDEX
+--      FROM LINEAR_REGRESSION_DATASET_INDEX
 --      WHERE suite_id = 'linear_all_v1'
 --      GROUP BY source_suite_id ORDER BY source_suite_id;
 --      -- Expected: linear_poisson_v1_recommended=200, ood_linear_full_v1=200
 --   5. Verify outputs:
---      LIST @EVALUATION_RESULTS_STAGE/combined/;
---   6. Migration note — if SYNTHETIC_REGRESSION_DATASET_INDEX exists without source_suite_id:
---      ALTER TABLE SYNTHETIC_REGRESSION_DATASET_INDEX ADD COLUMN IF NOT EXISTS source_suite_id STRING;
+--      LIST @EVALUATION_RESULTS_STAGE/linear/regression/numeric/;
+--   6. Migration note — if LINEAR_REGRESSION_DATASET_INDEX exists without source_suite_id:
+--      ALTER TABLE LINEAR_REGRESSION_DATASET_INDEX ADD COLUMN IF NOT EXISTS source_suite_id STRING;
+
+-- ============================================================
+-- OOD Full Suite Evaluation (ood_linear_full_v1, 200 datasets)
+-- ============================================================
+-- Runbook:
+--   Prerequisites: run_synthetic_regression_prep must have been called first.
+--   1. Stage updated Python scripts:
+--      PUT file://scripts/run_synthetic_regression_evaluation.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://scripts/prepare_synthetic_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--      PUT file://scripts/prepare_ood_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--   2. Call phase 1 (prep) then full evaluation:
+--      CALL run_synthetic_regression_ood_full_evaluation('<bench_rt>', '<ag_rt>');
+--   3. Verify outputs:
+--      LIST @EVALUATION_RESULTS_STAGE/linear/regression/numeric/ood_linear_full_v1/;
+
+-- Phase 1 (prep only — index 200 datasets under suite_id=ood_linear_full_v1):
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_prep(
+  BENCH_RUNTIME_ENVIRONMENT     STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_prep';
+
+-- Pilot: prep + DeepSet only (80 datasets, suite_id=ood_linear_pilot_v1, no baselines/AutoGluon):
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_deepset_pilot(
+  BENCH_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_deepset_pilot';
+
+-- Full OOD evaluation (prep + DeepSet + baselines + AutoGluon + aggregation):
+CREATE OR REPLACE PROCEDURE run_synthetic_regression_ood_full_evaluation(
+  BENCH_RUNTIME_ENVIRONMENT     STRING,
+  AUTOGLUON_RUNTIME_ENVIRONMENT STRING
+)
+  RETURNS STRING
+  LANGUAGE PYTHON
+  RUNTIME_VERSION = '3.11'
+  PACKAGES = ('snowflake-snowpark-python', 'snowflake-ml-python')
+  IMPORTS = (
+    '@MODEL_STAGE/scripts/run_synthetic_regression_evaluation.py',
+    '@MODEL_STAGE/scripts/prepare_synthetic_regression.py',
+    '@MODEL_STAGE/scripts/prepare_ood_regression.py'
+  )
+  HANDLER = 'run_synthetic_regression_evaluation.run_synthetic_regression_ood_full_evaluation_default';
+
 CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_evaluation(
   BENCH_RUNTIME_ENVIRONMENT STRING,
   AUTOGLUON_RUNTIME_ENVIRONMENT STRING
@@ -436,7 +498,7 @@ CALL run_synthetic_regression_autogluon_spcs_import_probe('<image_ref>', 1);
 --
 -- Step 2: Session probe — verify Snowflake OAuth token injection (snowflakeService.enabled=true)
 --         and that Snowpark session creation works inside SPCS containers.
---         Required for drivers to query SYNTHETIC_REGRESSION_DATASET_INDEX and GET_PRESIGNED_URL().
+--         Required for drivers to query LINEAR_REGRESSION_DATASET_INDEX and GET_PRESIGNED_URL().
 CALL run_synthetic_regression_autogluon_spcs_session_probe('<image_ref>', 1);
 --
 -- Step 3: Capacity probe — single-node mode (CLUSTER_SHARDS=0), 6 concurrent probes.

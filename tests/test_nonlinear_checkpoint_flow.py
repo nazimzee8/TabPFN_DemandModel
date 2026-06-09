@@ -230,8 +230,8 @@ class TestAutogluonRayImportability:
         # numpy stub (just needs to be importable)
         stubs["numpy"] = types.ModuleType("numpy")
 
-        # evaluate_synthetic_regression stub — all names imported at module level
-        esr_stub = types.ModuleType("evaluate_synthetic_regression")
+        # evaluate_linear_regression stub — all names imported at module level
+        esr_stub = types.ModuleType("evaluate_linear_regression")
         for attr in (
             "create_snowpark_session",
             "load_synthetic_regression_index",
@@ -251,7 +251,7 @@ class TestAutogluonRayImportability:
             "_check_tmp_free_bytes",
         ):
             setattr(esr_stub, attr, lambda *a, **kw: None)
-        stubs["evaluate_synthetic_regression"] = esr_stub
+        stubs["evaluate_linear_regression"] = esr_stub
 
         # autogluon_models stub
         ag_stub = types.ModuleType("autogluon_models")

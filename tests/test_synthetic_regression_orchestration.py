@@ -90,7 +90,7 @@ def _patch_submit(collector: JobCollector):
     from contextlib import contextmanager, ExitStack
 
     def _mock_submit_synreg(session, label, compute_pool, env_vars, runtime_environment,
-                             entrypoint="evaluate_synthetic_regression.py",
+                             entrypoint="evaluate_linear_regression.py",
                              target_instances=1, pip_requirements=None,
                              external_access_integrations=None):
         return collector.submit(
@@ -351,7 +351,7 @@ class TestPhaseGating:
         events = []
 
         def _mock_submit_synreg(session, label, compute_pool, env_vars,
-                                 runtime_environment, entrypoint="evaluate_synthetic_regression.py",
+                                 runtime_environment, entrypoint="evaluate_linear_regression.py",
                                  target_instances=1, pip_requirements=None,
                                  external_access_integrations=None):
             mode = env_vars.get("SYNTHETIC_REGRESSION_MODE", "prep")
@@ -667,7 +667,7 @@ class TestMultiInstanceGuard:
                     "SYNTHETIC_REGRESSION_SUITE_ID": "linear_all_v1",
                     "SYNTHETIC_REGRESSION_NUM_SHARDS": "6",
                     "SYNTHETIC_REGRESSION_SHARD_INDEX": "0",
-                    "SYNREG_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
+                    "SYNREG_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/linear/regression/numeric/linear_all_v1",
                     "SYNREG_AUTOGLUON_DISTRIBUTED_MODE": "ray_work_items",
                 },
                 runtime_environment="2.5.0-py311",
@@ -693,7 +693,7 @@ class TestMultiInstanceGuard:
                     "SYNTHETIC_REGRESSION_SUITE_ID": "linear_all_v1",
                     "SYNTHETIC_REGRESSION_NUM_SHARDS": "6",
                     "SYNTHETIC_REGRESSION_SHARD_INDEX": "0",
-                    "SYNREG_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/regression/linear_all_v1",
+                    "SYNREG_RESULTS_STAGE": "@EVALUATION_RESULTS_STAGE/linear/regression/numeric/linear_all_v1",
                     "SYNREG_WORKER_ACCESS_PROBE_USE_RAY": "true",
                     "EXPECTED_RAY_NODES": "4",
                     "EXPECTED_RAY_CPUS_MIN": "4",
@@ -722,8 +722,8 @@ class TestMultiInstanceGuard:
                 target_instances=4,
             )
 
-    def test_rejects_evaluate_synthetic_regression_multi_instance(self, fake_session):
-        """evaluate_synthetic_regression.py with target_instances > 1 must be rejected."""
+    def test_rejects_evaluate_linear_regression_multi_instance(self, fake_session):
+        """evaluate_linear_regression.py with target_instances > 1 must be rejected."""
         with pytest.raises(RuntimeError, match="Refusing target_instances"):
             orch._submit_synreg(
                 session=fake_session,
@@ -734,7 +734,7 @@ class TestMultiInstanceGuard:
                     "ALLOW_UNSAFE_TORCH_LOAD": "true",
                 },
                 runtime_environment="2.5.0-py311",
-                entrypoint="evaluate_synthetic_regression.py",
+                entrypoint="evaluate_linear_regression.py",
                 target_instances=2,
             )
 
@@ -1509,7 +1509,7 @@ class TestCombinedSplitPhase:
         assert "Worker failed to resolve dataset access" in text
 
     def test_worker_dataset_access_helper_is_session_free(self):
-        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        text = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         fn_start = text.index("def load_prepared_synthetic_dataset_from_access(")
         next_def = text.find("\ndef ", fn_start + 1)
         fn_body = text[fn_start:next_def] if next_def != -1 else text[fn_start:]
@@ -1521,7 +1521,7 @@ class TestCombinedSplitPhase:
         assert "urlopen" in fn_body
 
     def test_snowpark_session_helper_supports_spcs_oauth(self):
-        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        text = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         fn_start = text.index("def create_snowpark_session(")
         next_def = text.find("\ndef ", fn_start + 1)
         fn_body = text[fn_start:next_def] if next_def != -1 else text[fn_start:]
@@ -1532,7 +1532,7 @@ class TestCombinedSplitPhase:
         assert "Session.builder.configs(configs).create()" in fn_body
 
     def test_compact_work_item_helper_drops_unexpected_payload_fields(self):
-        from evaluate_synthetic_regression import build_compact_synreg_work_item
+        from evaluate_linear_regression import build_compact_synreg_work_item
 
         class _Row:
             def as_dict(self):
@@ -1576,7 +1576,7 @@ class TestCombinedSplitPhase:
         assert item["dataset_access"]["presigned_url"].startswith("https://example.")
 
     def test_compact_work_item_helper_enforces_size_guard(self):
-        from evaluate_synthetic_regression import build_compact_synreg_work_item
+        from evaluate_linear_regression import build_compact_synreg_work_item
 
         class _Row:
             def as_dict(self):
@@ -2012,10 +2012,10 @@ class TestCombinedAutogluonSingleNodeMode:
         ]
         assert len(ag_jobs) == 30
 
-    def test_single_node_evaluation_uses_evaluate_synthetic_regression_entrypoint(
+    def test_single_node_evaluation_uses_evaluate_linear_regression_entrypoint(
         self, collector, fake_session
     ):
-        """Single-node evaluation must use evaluate_synthetic_regression.py."""
+        """Single-node evaluation must use evaluate_linear_regression.py."""
         with _patch_submit(collector):
             orch.run_synthetic_regression_combined_autogluon_evaluation(
                 fake_session,
@@ -2030,8 +2030,8 @@ class TestCombinedAutogluonSingleNodeMode:
         ]
         assert ag_jobs
         for job in ag_jobs:
-            assert job.entrypoint == "evaluate_synthetic_regression.py", (
-                f"Expected evaluate_synthetic_regression.py, got {job.entrypoint!r}"
+            assert job.entrypoint == "evaluate_linear_regression.py", (
+                f"Expected evaluate_linear_regression.py, got {job.entrypoint!r}"
             )
 
     def test_single_node_evaluation_uses_target_instances_1(
@@ -2223,15 +2223,15 @@ class TestCombinedAutogluonPlanValidation:
         assert "AUTOGLUON_WORKERS_PER_SHARD" in msg
         assert "single-node" in msg.lower()
 
-    def test_single_node_mode_derives_evaluate_synthetic_regression_entrypoint(self):
-        """cluster_shards=0 must derive entrypoint=evaluate_synthetic_regression.py internally."""
+    def test_single_node_mode_derives_evaluate_linear_regression_entrypoint(self):
+        """cluster_shards=0 must derive entrypoint=evaluate_linear_regression.py internally."""
         plan = orch._resolve_combined_autogluon_execution_plan(
             procedure_name="test_proc",
             cluster_shards_arg=0,
             workers_per_shard_arg=1,
             concurrent_clusters_arg=30,
         )
-        assert plan.entrypoint == "evaluate_synthetic_regression.py"
+        assert plan.entrypoint == "evaluate_linear_regression.py"
         assert plan.mode == "single_node_shards"
 
     def test_cluster_shards_6_concurrent_clusters_4_raises(self, fake_session):
@@ -2375,9 +2375,9 @@ class TestAutogluonImportTimingProbe:
         assert "snowflake.ml" not in text
 
     def test_probe_script_does_not_query_index(self):
-        """autogluon_import_timing_probe.py must not reference SYNTHETIC_REGRESSION_DATASET_INDEX."""
+        """autogluon_import_timing_probe.py must not reference LINEAR_REGRESSION_DATASET_INDEX."""
         text = (ROOT / "scripts" / "autogluon_import_timing_probe.py").read_text()
-        assert "SYNTHETIC_REGRESSION_DATASET_INDEX" not in text
+        assert "LINEAR_REGRESSION_DATASET_INDEX" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -2697,32 +2697,32 @@ class TestSPCSStaticAnalysis:
 
     # Lazy Torch import — AutoGluon/SPCS paths must not require torch
     def test_evaluate_synreg_no_toplevel_torch_import(self):
-        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        src = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         import re
         assert not re.search(r"^import torch", src, re.MULTILINE), (
-            "evaluate_synthetic_regression.py must not have a top-level 'import torch'. "
+            "evaluate_linear_regression.py must not have a top-level 'import torch'. "
             "Use _import_torch() inside DeepSet/checkpoint functions only."
         )
 
     def test_evaluate_synreg_has_import_torch_helper(self):
-        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        src = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         assert "_import_torch" in src, (
-            "evaluate_synthetic_regression.py must define _import_torch() lazy-import helper"
+            "evaluate_linear_regression.py must define _import_torch() lazy-import helper"
         )
 
     def test_evaluate_synreg_no_toplevel_deepset_inference_import(self):
-        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        src = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         import re
         assert not re.search(r"^from deepset_inference import", src, re.MULTILINE), (
-            "evaluate_synthetic_regression.py must not have a top-level 'from deepset_inference import'. "
+            "evaluate_linear_regression.py must not have a top-level 'from deepset_inference import'. "
             "Import lazily inside DeepSet functions."
         )
 
     def test_evaluate_synreg_no_toplevel_model_import(self):
-        src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        src = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         import re
         assert not re.search(r"^from model import", src, re.MULTILINE), (
-            "evaluate_synthetic_regression.py must not have a top-level 'from model import'. "
+            "evaluate_linear_regression.py must not have a top-level 'from model import'. "
             "Import lazily inside DeepSet/checkpoint functions."
         )
 
@@ -2932,7 +2932,7 @@ class TestSPCSAutogluonBackend:
         from run_synthetic_regression_evaluation import _build_spcs_job_spec
         spec = _build_spcs_job_spec(
             image="img:1.0",
-            args=["/app/src/evaluate_synthetic_regression.py"],
+            args=["/app/scripts/evaluate_linear_regression.py"],
             env_vars={},
         )
         # Must not contain runtime_environment or pip_requirements fields
@@ -3133,7 +3133,7 @@ class TestSPCSAutogluonBackend:
             autogluon_concurrent_clusters=1,
         )
         assert submitted, "No specs submitted"
-        assert "/app/src/evaluate_synthetic_regression.py" in submitted[0]
+        assert "/app/scripts/evaluate_linear_regression.py" in submitted[0]
 
     def test_spcs_distributed_ray_driver_uses_explicit_address(self, monkeypatch):
         """spcs_ray_coordinator.py must set SYNREG_RAY_ADDRESS_MODE=explicit when launching the driver.
@@ -4354,8 +4354,8 @@ class TestSPCSRayCoordinatorTopology:
             f"Single-node mode with 3 concurrent shards must submit 3 jobs, got {len(submitted)}"
         )
         for s in submitted:
-            assert "/app/src/evaluate_synthetic_regression.py" in s["spec"], (
-                f"Single-node spec must use evaluate_synthetic_regression.py entrypoint: {s['spec'][:200]}"
+            assert "/app/scripts/evaluate_linear_regression.py" in s["spec"], (
+                f"Single-node spec must use evaluate_linear_regression.py entrypoint: {s['spec'][:200]}"
             )
 
     def test_spcs_ray_coordinator_starts_ray_head_with_zero_cpus(self):
@@ -4829,7 +4829,7 @@ class TestDatasetIndexSelectColumns:
 
     def test_load_index_does_not_use_select_star(self):
         """load_synthetic_regression_index must not use SELECT *."""
-        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        text = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         fn_start = text.index("def load_synthetic_regression_index(")
         fn_end_candidates = [
             text.find("\ndef ", fn_start + 1),
@@ -4844,7 +4844,7 @@ class TestDatasetIndexSelectColumns:
 
     def test_load_index_selects_required_columns(self):
         """load_synthetic_regression_index must select known required columns."""
-        text = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+        text = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
         fn_start = text.index("def load_synthetic_regression_index(")
         fn_end_candidates = [
             text.find("\ndef ", fn_start + 1),
@@ -5016,8 +5016,8 @@ class TestSPCSCoordinatorTopologyGuards:
 # --- Static analysis tests (added to TestSPCSStaticAnalysis equivalent) ---
 
 def test_nonlinear_script_files_exist():
-    for name in ["generate_nonlinear.py", "evaluate_synthetic_nonlinear.py",
-                 "run_synthetic_nonlinear_evaluation.py"]:
+    for name in ["generate_nonlinear_regression.py", "evaluate_nonlinear_regression.py",
+                 "run_nonlinear_regression_evaluation.py"]:
         assert (ROOT / "scripts" / name).exists(), f"{name} must exist"
 
 
@@ -5027,38 +5027,37 @@ def test_nonlinear_sql_file_exists():
 
 def test_nonlinear_index_table_in_sql():
     src = (ROOT / "sql" / "05_synthetic_nonlinear_evaluation_pipeline.sql").read_text()
-    assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in src
+    assert "NONLINEAR_REGRESSION_DATASET_INDEX" in src
     assert "TRANSIENT TABLE" in src.upper()
 
 
-def test_evaluate_synthetic_nonlinear_does_not_drop_table():
-    src = (ROOT / "scripts" / "evaluate_synthetic_nonlinear.py").read_text()
+def test_evaluate_nonlinear_regression_does_not_drop_table():
+    src = (ROOT / "scripts" / "evaluate_nonlinear_regression.py").read_text()
     assert "DROP TABLE" not in src.upper()
-    assert "NONLINEAR_SUITE_ID" in src
+    assert "SYNREG_SUITE_ID" in src
 
 
 def test_generate_nonlinear_has_all_regimes():
-    src = (ROOT / "scripts" / "generate_nonlinear.py").read_text()
-    for r in ["I", "J", "K", "L"]:
-        assert f'"{r}"' in src or f"'{r}'" in src
+    src = (ROOT / "scripts" / "generate_nonlinear_regression.py").read_text()
+    assert "V2_TARGET_FAMILIES" in src or "V3_TARGET_FAMILIES" in src
 
 
 def test_run_nonlinear_evaluation_injects_index_table():
-    src = (ROOT / "scripts" / "run_synthetic_nonlinear_evaluation.py").read_text()
+    src = (ROOT / "scripts" / "run_nonlinear_regression_evaluation.py").read_text()
     assert "SYNREG_INDEX_TABLE" in src
-    assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in src
+    assert "NONLINEAR_REGRESSION_DATASET_INDEX" in src
 
 
-def test_evaluate_synthetic_regression_index_table_configurable():
-    src = (ROOT / "src" / "evaluate_synthetic_regression.py").read_text()
+def test_evaluate_linear_regression_index_table_configurable():
+    src = (ROOT / "scripts" / "evaluate_linear_regression.py").read_text()
     assert "SYNREG_INDEX_TABLE" in src
     assert "os.getenv" in src  # must read from env, not be hardcoded
 
 
 def test_nonlinear_autogluon_ray_does_not_reference_combined_suite():
-    src = (ROOT / "scripts" / "run_synthetic_nonlinear_evaluation.py").read_text()
+    src = (ROOT / "scripts" / "run_nonlinear_regression_evaluation.py").read_text()
     assert "linear_all_v1" not in src, (
-        "run_synthetic_nonlinear_evaluation.py must not reference combined suite_id"
+        "run_nonlinear_regression_evaluation.py must not reference combined suite_id"
     )
     assert "COMBINED_SUITE_ID" not in src
 
@@ -5069,33 +5068,33 @@ class TestNonlinearEvaluation:
     """Functional tests for nonlinear evaluation orchestration handlers."""
 
     def test_nonlinear_prep_uses_eval_nonlinear_entrypoint(self, monkeypatch):
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_submit_synreg",
             lambda *a, **kw: submitted.append(kw) or "JOB_ID")
         monkeypatch.setattr(mod, "_wait_done", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
-        mod.run_synthetic_nonlinear_prep(object())
-        assert submitted[0]["entrypoint"] == "evaluate_synthetic_nonlinear.py"
-        assert submitted[0]["env_vars"].get("NONLINEAR_SUITE_ID") == "nonlinear_v1"
+        mod.run_nonlinear_regression_prep(object())
+        assert submitted[0]["entrypoint"] == "prepare_nonlinear_regression.py"
+        assert submitted[0]["env_vars"].get("NONLINEAR_SUITE_ID") == "nonlinear"
 
     def test_nonlinear_deepset_submits_10_gpu_shards(self, monkeypatch):
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_submit_synreg",
             lambda *a, **kw: submitted.append(kw) or "JOB_ID")
         monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: True)
-        mod.run_synthetic_nonlinear_deepset_evaluation(object())
+        mod.run_nonlinear_regression_deepset_evaluation(object())
         assert len(submitted) == 10
         for s in submitted:
-            assert s["env_vars"]["SYNTHETIC_REGRESSION_SUITE_ID"] == "nonlinear_v1"
-            assert s["env_vars"]["SYNREG_INDEX_TABLE"] == "SYNTHETIC_NONLINEAR_DATASET_INDEX"
+            assert s["env_vars"]["SYNTHETIC_REGRESSION_SUITE_ID"] == "nonlinear"
+            assert s["env_vars"]["SYNREG_INDEX_TABLE"] == "NONLINEAR_REGRESSION_DATASET_INDEX"
             assert s["compute_pool"] == mod.DEEPSET_GPU_POOL
 
     def test_nonlinear_spcs_uses_nonlinear_suite_id(self, monkeypatch):
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
@@ -5108,18 +5107,18 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
-        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(), autogluon_cluster_shards=1,
             autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
         coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
         assert coord_specs, "No coordinator spec captured"
-        assert "nonlinear_v1" in coord_specs[0]
+        assert "nonlinear" in coord_specs[0]
         assert "linear_all_v1" not in coord_specs[0]
-        assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in coord_specs[0]
+        assert "NONLINEAR_REGRESSION_DATASET_INDEX" in coord_specs[0]
 
     def test_nonlinear_spcs_ray_concurrent_must_equal_cluster_shards(self, monkeypatch):
         """concurrent_clusters != cluster_shards in Ray mode raises ValueError."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: label.upper())
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
@@ -5132,7 +5131,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
         with pytest.raises(ValueError, match="concurrent_clusters"):
-            mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+            mod.run_nonlinear_regression_autogluon_spcs_evaluation(
                 object(),
                 autogluon_cluster_shards=4,
                 autogluon_workers_per_shard=1,
@@ -5141,7 +5140,7 @@ class TestNonlinearEvaluation:
 
     def test_nonlinear_spcs_injects_distributed_mode_env(self, monkeypatch):
         """Coordinator env contains SYNREG_AUTOGLUON_DISTRIBUTED_MODE=ray_work_items."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
@@ -5154,7 +5153,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
-        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(), autogluon_cluster_shards=1,
             autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
         coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
@@ -5162,8 +5161,8 @@ class TestNonlinearEvaluation:
         assert "ray_work_items" in coord_specs[0]
 
     def test_nonlinear_spcs_injects_index_table_in_all_envs(self, monkeypatch):
-        """All submitted SPCS envs include SYNREG_INDEX_TABLE=SYNTHETIC_NONLINEAR_DATASET_INDEX."""
-        import run_synthetic_nonlinear_evaluation as mod
+        """All submitted SPCS envs include SYNREG_INDEX_TABLE=NONLINEAR_REGRESSION_DATASET_INDEX."""
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
@@ -5176,39 +5175,39 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
-        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(), autogluon_cluster_shards=2,
             autogluon_workers_per_shard=1, autogluon_concurrent_clusters=2)
         assert submitted, "No SPCS jobs submitted"
         coordinator_specs = [(label, spec) for label, spec in submitted if "coord" in label]
         assert coordinator_specs, "No coordinator SPCS jobs found"
         for _label, spec in coordinator_specs:
-            assert "SYNTHETIC_NONLINEAR_DATASET_INDEX" in spec, (
-                f"Coordinator SPCS spec for {_label!r} is missing SYNTHETIC_NONLINEAR_DATASET_INDEX"
+            assert "NONLINEAR_REGRESSION_DATASET_INDEX" in spec, (
+                f"Coordinator SPCS spec for {_label!r} is missing NONLINEAR_REGRESSION_DATASET_INDEX"
             )
 
     def test_nonlinear_parts_prefix_uses_nonlinear_namespace(self):
         """NONLINEAR_PARTS_PREFIX must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         assert mod.NONLINEAR_PARTS_PREFIX.startswith("@EVALUATION_RESULTS_STAGE/nonlinear"), (
             f"NONLINEAR_PARTS_PREFIX={mod.NONLINEAR_PARTS_PREFIX!r} must start with "
             "'@EVALUATION_RESULTS_STAGE/nonlinear'"
         )
-        assert "/regression/" not in mod.NONLINEAR_PARTS_PREFIX, (
-            f"NONLINEAR_PARTS_PREFIX={mod.NONLINEAR_PARTS_PREFIX!r} must not use the "
-            "regression namespace"
+        assert "/nonlinear/regression/" in mod.NONLINEAR_PARTS_PREFIX, (
+            f"NONLINEAR_PARTS_PREFIX={mod.NONLINEAR_PARTS_PREFIX!r} must contain "
+            "'/nonlinear/regression/'"
         )
 
     def test_nonlinear_deepset_results_stage_uses_nonlinear_namespace(self, monkeypatch):
         """DeepSet shard env SYNREG_RESULTS_STAGE must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_submit_synreg",
             lambda *a, **kw: submitted.append(kw) or "JOB_ID")
         monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_stage_file_exists", lambda *a, **kw: True)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
-        mod.run_synthetic_nonlinear_deepset_evaluation(object())
+        mod.run_nonlinear_regression_deepset_evaluation(object())
         assert submitted, "No DeepSet jobs submitted"
         for s in submitted:
             results_stage = s["env_vars"].get("SYNREG_RESULTS_STAGE", "")
@@ -5216,18 +5215,18 @@ class TestNonlinearEvaluation:
                 f"DeepSet SYNREG_RESULTS_STAGE={results_stage!r} must be under "
                 "@EVALUATION_RESULTS_STAGE/nonlinear"
             )
-            assert "/regression/" not in results_stage
+            assert "/nonlinear/regression/" in results_stage
 
     def test_nonlinear_baseline_results_stage_uses_nonlinear_namespace(self, monkeypatch):
         """Baseline shard env SYNREG_RESULTS_STAGE must be under @EVALUATION_RESULTS_STAGE/nonlinear."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_submit_synreg",
             lambda *a, **kw: submitted.append(kw) or "JOB_ID")
         monkeypatch.setattr(mod, "_wait_job_group", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_ensure_compute_pool_usable", lambda *a, **kw: None)
         monkeypatch.setattr(mod, "_resolve_baseline_shard_count", lambda *a, **kw: 2)
-        mod.run_synthetic_nonlinear_baseline_evaluation(object())
+        mod.run_nonlinear_regression_baseline_evaluation(object())
         assert submitted, "No baseline jobs submitted"
         for s in submitted:
             results_stage = s["env_vars"].get("SYNREG_RESULTS_STAGE", "")
@@ -5235,11 +5234,11 @@ class TestNonlinearEvaluation:
                 f"Baseline SYNREG_RESULTS_STAGE={results_stage!r} must be under "
                 "@EVALUATION_RESULTS_STAGE/nonlinear"
             )
-            assert "/regression/" not in results_stage
+            assert "/nonlinear/regression/" in results_stage
 
     def test_nonlinear_spcs_single_node_results_stage_uses_nonlinear_namespace(self, monkeypatch):
         """Single-node SPCS shard spec must reference @EVALUATION_RESULTS_STAGE/nonlinear."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
@@ -5249,7 +5248,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_IMAGE", "img:1.0")
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
-        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(),
             autogluon_cluster_shards=0,    # single_node_shards mode
             autogluon_workers_per_shard=None,  # defaults to 1
@@ -5260,11 +5259,11 @@ class TestNonlinearEvaluation:
             assert "@EVALUATION_RESULTS_STAGE/nonlinear" in spec, (
                 f"Single-node SPCS spec missing nonlinear results stage: {spec!r}"
             )
-            assert "/regression/" not in spec
+            assert "/nonlinear/regression/" in spec
 
     def test_nonlinear_spcs_coordinator_results_stage_uses_nonlinear_namespace(self, monkeypatch):
         """Ray coordinator SPCS spec must reference @EVALUATION_RESULTS_STAGE/nonlinear."""
-        import run_synthetic_nonlinear_evaluation as mod
+        import run_nonlinear_regression_evaluation as mod
         submitted = []
         monkeypatch.setattr(mod, "_execute_spcs_job_service",
             lambda s, *, label, compute_pool, spec: submitted.append((label, spec)) or label.upper())
@@ -5277,7 +5276,7 @@ class TestNonlinearEvaluation:
         monkeypatch.setattr(mod, "_spcs_run_id", lambda: "r0")
         monkeypatch.setattr(mod, "_spcs_session_context_env", lambda s: {})
         monkeypatch.setattr(mod, "_spcs_dns_domain", lambda s: "svc.snowflakecomputing.internal")
-        mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(), autogluon_cluster_shards=1,
             autogluon_workers_per_shard=1, autogluon_concurrent_clusters=1)
         coord_specs = [spec for label, spec in submitted if "coord" in label and "worker" not in label]
@@ -5286,7 +5285,7 @@ class TestNonlinearEvaluation:
             assert "@EVALUATION_RESULTS_STAGE/nonlinear" in spec, (
                 f"Coordinator SPCS spec missing nonlinear results stage: {spec!r}"
             )
-            assert "/regression/" not in spec
+            assert "/nonlinear/regression/" in spec
 
 
 # ---------------------------------------------------------------------------
@@ -5672,7 +5671,7 @@ class TestSPCSTimeoutAlignment:
 
     def test_nonlinear_worker_connect_timeout_uses_formula_not_hardcoded(self, monkeypatch):
         """Nonlinear SPCS workers must not use hardcoded '600' for connect timeout."""
-        import run_synthetic_nonlinear_evaluation as nl_mod
+        import run_nonlinear_regression_evaluation as nl_mod
         import run_synthetic_regression_evaluation as mod
 
         submitted_envs = []
@@ -5706,7 +5705,7 @@ class TestSPCSTimeoutAlignment:
         monkeypatch.setattr(mod, "SYNREG_SPCS_WORKER_PLACEMENT_TIMEOUT_SECONDS", 900)
         monkeypatch.setattr(mod, "SYNREG_AUTOGLUON_SPCS_RAY_START_TIMEOUT_SECONDS", 600)
 
-        nl_mod.run_synthetic_nonlinear_autogluon_spcs_evaluation(
+        nl_mod.run_nonlinear_regression_autogluon_spcs_evaluation(
             object(),
             autogluon_cluster_shards=1,
             autogluon_workers_per_shard=1,

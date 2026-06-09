@@ -325,10 +325,10 @@ class TestIndexSafety:
         assert ood_prep.OOD_SUITE_ID != production_default
 
     def test_ood_stage_prefix_uses_eval_stage(self):
-        """OOD data must reference @EVALUATION_DATASET_STAGE, never @META_DATASET_STAGE."""
+        """OOD data must reference @EVALUATION_DATASET_STAGE, never @META_REGRESSION_DATASET_STAGE."""
         import prepare_ood_regression as ood_prep
         assert "@EVALUATION_DATASET_STAGE" in ood_prep.EVAL_STAGE_PREFIX
-        assert "@META_DATASET_STAGE" not in ood_prep.EVAL_STAGE_PREFIX
+        assert "@META_REGRESSION_DATASET_STAGE" not in ood_prep.EVAL_STAGE_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -436,9 +436,9 @@ class TestProductionOODSeparation:
         assert eval_mod.OOD_FULL_SUITE_ID == "ood_linear_full_v1"
 
     def test_ood_full_output_stage_value(self):
-        """OOD_FULL_OUTPUT_STAGE must equal '@EVALUATION_RESULTS_STAGE/ood_full'."""
+        """OOD_FULL_OUTPUT_STAGE must equal '@EVALUATION_RESULTS_STAGE/linear/regression/numeric'."""
         import run_synthetic_regression_evaluation as eval_mod
-        assert eval_mod.OOD_FULL_OUTPUT_STAGE == "@EVALUATION_RESULTS_STAGE/ood_full"
+        assert eval_mod.OOD_FULL_OUTPUT_STAGE == "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
 
     def test_ood_pilot_suite_id_value(self):
         import run_synthetic_regression_evaluation as run_eval
@@ -450,7 +450,7 @@ class TestProductionOODSeparation:
 
     def test_ood_pilot_parts_prefix_distinct_from_production(self):
         import run_synthetic_regression_evaluation as run_eval
-        prod_prefix = "@EVALUATION_RESULTS_STAGE/regression"
+        prod_prefix = "@EVALUATION_RESULTS_STAGE/linear/regression/numeric"
         assert run_eval.OOD_PILOT_PARTS_PREFIX != prod_prefix
         assert "ood" in run_eval.OOD_PILOT_PARTS_PREFIX
 
@@ -619,7 +619,7 @@ class TestOODFullSuiteIndexing:
 # Tests: Cache path collision (Item 2)
 # ---------------------------------------------------------------------------
 
-import evaluate_synthetic_regression as evsr
+import evaluate_linear_regression as evsr
 
 
 class TestCachePathCollision:

@@ -15,7 +15,7 @@ MLJOB_PAYLOAD_STAGE = "MLJOB_PAYLOAD_STAGE"
 # Does not affect search behavior or Ray Tune metric selection.
 DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
     "HPO_TRAINING_DATA_FAMILY",
-    os.getenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined"),
+    os.getenv("TRAINING_DATA_FAMILY", "synthetic_linear_regression"),
 )
 
 # MODEL3 architecture selectors — propagated to the HPO MLJob env_vars.
@@ -23,27 +23,42 @@ DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_excha
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
 
 # HPO sweep mode — selects search space in hpo.py.
-# ridge_residual: tunes optimizer/regularization/Ridge Expert; architecture fixed (default).
+# linear_model: tunes optimizer/regularization/Ridge Expert; architecture fixed (default).
 # architecture:   tunes d_phi/n_sab_feat; allows cold-start on pretrain mismatch.
-# nonlinear_meta / nonlinear_architecture: opt-in latent nonlinear ridge HPO.
-DEFAULT_HPO_SWEEP_MODE = os.getenv("HPO_SWEEP_MODE", "ridge_residual")
+# nonlinear_model / nonlinear_model_architecture: opt-in latent nonlinear ridge HPO.
+_HPO_SWEEP_MODE_ALIASES = {
+    "ridge_residual": "linear_model",
+    "architecture": "linear_model_architecture",
+    "linear_stats": "linear_model",
+    "nonlinear_meta": "nonlinear_model",
+    "nonlinear_architecture": "nonlinear_model_architecture",
+}
+_ALLOWED_HPO_SWEEP_MODES = {
+    "linear_model",
+    "linear_model_architecture",
+    "nonlinear_model",
+    "nonlinear_model_architecture",
+}
+
+
+def _canonical_hpo_sweep_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    return _HPO_SWEEP_MODE_ALIASES.get(mode, mode)
+
+
+DEFAULT_HPO_SWEEP_MODE = _canonical_hpo_sweep_mode(os.getenv("HPO_SWEEP_MODE", "linear_model"))
 
 # Baseline config stage path for architecture sweep.
-# Must point to best_config_ridge_residual.json from sweep 1 when HPO_SWEEP_MODE=architecture.
+# Must point to best_config_linear_model.json from sweep 1 when HPO_SWEEP_MODE=architecture.
 DEFAULT_HPO_BASELINE_CONFIG_STAGE_PATH = os.getenv(
     "HPO_BASELINE_CONFIG_STAGE_PATH", ""
 )
 
-_ALLOWED_HPO_SWEEP_MODES = {
-    "ridge_residual",
-    "architecture",
-    "nonlinear_meta",
-    "nonlinear_architecture",
-}
 if DEFAULT_HPO_SWEEP_MODE not in _ALLOWED_HPO_SWEEP_MODES:
     raise ValueError(
         f"Invalid HPO_SWEEP_MODE={DEFAULT_HPO_SWEEP_MODE!r}. "
-        f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
+        f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)} "
+        f"(deprecated aliases: {sorted(_HPO_SWEEP_MODE_ALIASES)})"
     )
 
 
@@ -114,8 +129,9 @@ def _run_hpo_impl(
         "HOME":                 "/tmp",
         "MODEL_FAMILY":          model_family,
         "TRAINING_DATA_FAMILY":  training_data_family,
+        "HPO_TRAINING_DATA_FAMILY": training_data_family,
         "MODEL_DESIGN_PATTERN":  model_design_pattern,
-        "HPO_SWEEP_MODE":        hpo_sweep_mode,
+        "HPO_SWEEP_MODE":        _canonical_hpo_sweep_mode(hpo_sweep_mode),
     }
     if hpo_baseline_config_stage_path:
         env_vars["HPO_BASELINE_CONFIG_STAGE_PATH"] = hpo_baseline_config_stage_path
@@ -165,7 +181,7 @@ def run_hpo_pipeline_model(
     Usage:
         CALL run_hpo_pipeline(
             'market_exchangeable_icl',
-            'synthetic_regression_combined',
+            'synthetic_linear_regression',
             'inductive_forecasting'
         );
     """
@@ -188,25 +204,25 @@ def run_hpo_pipeline_model_sweep(
 ) -> str:
     """Four-arg entrypoint: explicit model selectors + HPO sweep mode.
 
-    hpo_sweep_mode must be one of: 'ridge_residual', 'architecture'.
+    hpo_sweep_mode must be one of: 'linear_model', 'linear_model_architecture'.
 
-    ridge_residual (default):
+    linear_model (default):
         Fixed architecture. Tunes lr, weight_decay, dropout, ridge_lambda,
         gate_hidden_dim, use_huber, huber_delta, lambda_l1.
 
     architecture:
         Tunes d_phi and n_sab_feat. Allows cold-start on pretrain mismatch.
-        Run only after ridge_residual sweep and DDP memory probe for d_phi > 128.
+        Run only after linear_model sweep and DDP memory probe for d_phi > 128.
 
     Usage:
         CALL run_hpo_pipeline(
             'market_exchangeable_icl',
-            'synthetic_regression_combined',
+            'synthetic_linear_regression',
             'inductive_forecasting',
-            'ridge_residual'
+            'linear_model'
         );
     """
-    _mode = str(hpo_sweep_mode).strip().lower()
+    _mode = _canonical_hpo_sweep_mode(hpo_sweep_mode)
     if _mode not in _ALLOWED_HPO_SWEEP_MODES:
         raise ValueError(
             f"Invalid HPO_SWEEP_MODE={_mode!r}. "
@@ -232,20 +248,20 @@ def run_hpo_pipeline_model_sweep_with_baseline(
 ) -> str:
     """Five-arg entrypoint: explicit model selectors + HPO sweep mode + baseline config path.
 
-    hpo_sweep_mode must be one of: 'ridge_residual', 'architecture'.
-    hpo_baseline_config_stage_path: stage path to best_config_ridge_residual.json.
-      Required when hpo_sweep_mode='architecture'; ignored (pass '') for 'ridge_residual'.
+    hpo_sweep_mode must be one of: 'linear_model', 'linear_model_architecture'.
+    hpo_baseline_config_stage_path: stage path to best_config_linear_model.json.
+      Required when hpo_sweep_mode='linear_model_architecture'; ignored (pass '') for 'linear_model'.
 
     Usage (architecture sweep with baseline):
         CALL run_hpo_pipeline(
             'market_exchangeable_icl',
-            'synthetic_regression_combined',
+            'synthetic_linear_regression',
             'inductive_forecasting',
-            'architecture',
-            '@MODEL_STAGE/hpo/best_config_ridge_residual.json'
+            'linear_model_architecture',
+            '@MODEL_STAGE/hpo/best_config_linear_model.json'
         );
     """
-    _mode = str(hpo_sweep_mode).strip().lower()
+    _mode = _canonical_hpo_sweep_mode(hpo_sweep_mode)
     if _mode not in _ALLOWED_HPO_SWEEP_MODES:
         raise ValueError(
             f"Invalid HPO_SWEEP_MODE={_mode!r}. "
@@ -263,7 +279,6 @@ def run_hpo_pipeline_model_sweep_with_baseline(
 
 
 def run_hpo_pipeline_model_sweep_with_baseline_and_pretrain(
-    session,
     model_family: str,
     training_data_family: str,
     model_design_pattern: str,
@@ -273,8 +288,8 @@ def run_hpo_pipeline_model_sweep_with_baseline_and_pretrain(
 ) -> str:
     """Six-arg SQL-callable entrypoint: sweep mode + baseline config + pretrain checkpoint.
 
-    hpo_pretrain_checkpoint_stage_path: stage path to pretrain_nonlinear_meta.pt.
-      Required when HPO_SWEEP_MODE='nonlinear_meta' or 'nonlinear_architecture'.
+    hpo_pretrain_checkpoint_stage_path: stage path to pretrain_nonlinear_model.pt.
+      Required when HPO_SWEEP_MODE='nonlinear_model' or 'nonlinear_model_architecture'.
       Pass '' for linear sweeps.
 
     Usage (nonlinear HPO with pretrain warm-start):
@@ -282,17 +297,18 @@ def run_hpo_pipeline_model_sweep_with_baseline_and_pretrain(
             'market_exchangeable_icl',
             'synthetic_regression_nonlinear',
             'inductive_forecasting',
-            'nonlinear_meta',
+            'nonlinear_model',
             '',
-            '@MODEL_STAGE/checkpoints/pretrain_nonlinear_meta.pt'
+            '@MODEL_STAGE/checkpoints/pretrain_nonlinear_model.pt'
         );
     """
-    _mode = str(hpo_sweep_mode).strip().lower()
+    _mode = _canonical_hpo_sweep_mode(hpo_sweep_mode)
     if _mode not in _ALLOWED_HPO_SWEEP_MODES:
         raise ValueError(
             f"Invalid HPO_SWEEP_MODE={_mode!r}. "
             f"Allowed values: {sorted(_ALLOWED_HPO_SWEEP_MODES)}"
         )
+    session = _get_session()
     return _run_hpo_impl(
         session,
         model_family,
@@ -302,3 +318,4 @@ def run_hpo_pipeline_model_sweep_with_baseline_and_pretrain(
         hpo_baseline_config_stage_path.strip(),
         hpo_pretrain_checkpoint_stage_path.strip(),
     )
+

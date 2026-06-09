@@ -352,7 +352,7 @@ All output files are written to `@EVALUATION_RESULTS_STAGE`.
 
 Part files produced by each shard (named
 `{method}_shard{i}_of_{n}_detailed.csv`) are written to a subdirectory
-`@EVALUATION_RESULTS_STAGE/regression` and are consumed by the
+`@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}` and are consumed by the
 aggregation step.
 
 ---
@@ -394,7 +394,7 @@ without modifying the data preparation, preprocessing, metrics, or aggregation l
 
 5. The aggregation step (`SYNTHETIC_REGRESSION_MODE = "aggregate"`) is fully
    model-agnostic. It reads any `*_detailed.csv` part files found under
-   `@EVALUATION_RESULTS_STAGE/regression` and produces the same
+   `@EVALUATION_RESULTS_STAGE/linear/regression/numeric/{suite_id}` and produces the same
    summary CSVs regardless of which models contributed rows.
 
 A reader with a standard Python ML stack (scikit-learn, numpy, pandas) can run the

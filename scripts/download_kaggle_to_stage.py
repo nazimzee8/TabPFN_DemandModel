@@ -15,7 +15,7 @@ from snowflake.snowpark.context import get_active_session
 from download_kaggle_benchmark import COMPETITIONS, MAX_SAMPLES, convert_competition
 
 
-DEFAULT_STAGE = "@META_DATASET_STAGE/kaggle/"
+DEFAULT_STAGE = "@META_REGRESSION_DATASET_STAGE/kaggle/"
 
 
 def _parse_slugs(raw_slugs):

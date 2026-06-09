@@ -175,11 +175,11 @@ def main():
         session = Session.builder.getOrCreate()
         train_df = session.sql(
             "SELECT split, task_id, stage_path, p, n_train "
-            "FROM META_DATASET_INDEX WHERE split = 'train' ORDER BY task_id"
+            "FROM META_REGRESSION_DATASET_INDEX WHERE split = 'train' ORDER BY task_id"
         )
         val_df = session.sql(
             "SELECT split, task_id, stage_path, p, n_train "
-            "FROM META_DATASET_INDEX WHERE split = 'val' ORDER BY task_id"
+            "FROM META_REGRESSION_DATASET_INDEX WHERE split = 'val' ORDER BY task_id"
         )
         train_connector = ShardedDataConnector.from_dataframe(train_df, equal=True)
         val_connector   = ShardedDataConnector.from_dataframe(val_df,   equal=False)

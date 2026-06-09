@@ -22,7 +22,7 @@ Tests for the MODEL3 DDP memory probe:
      - ModelConfig construction uses correct selectors
      - result JSON schema contains required top-level keys
   5. SQL DDL
-     - run_model_ddp_memory_probe procedure exists in run_training_job.sql
+     - run_model_ddp_memory_probe procedure exists in synthetic_linear_pipeline.sql
      - signature contains all 8 required parameters
      - HANDLER points to run_model_training_job.run_model_ddp_memory_probe
      - IMPORTS includes run_model_training_job.py
@@ -565,7 +565,7 @@ class TestProbeScriptValidation:
 
 class TestModelDDPMemoryProbeSQLDDL:
     def _sql(self) -> str:
-        return (REPO_ROOT / "sql" / "run_training_job.sql").read_text()
+        return (REPO_ROOT / "sql" / "synthetic_linear_pipeline.sql").read_text()
 
     def test_procedure_exists(self):
         assert "run_model_ddp_memory_probe" in self._sql()

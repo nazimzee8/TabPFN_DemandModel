@@ -56,6 +56,60 @@ def run_permutation_tests(model):
     cfg = model.cfg
     device = next(model.parameters(), torch.empty(0)).device
     model_family = getattr(cfg, "model_family", "market_exchangeable_icl")
+    task_objective = getattr(cfg, "task_objective", "inductive_regression")
+
+    if task_objective in {"inductive_classification", "linear_classification"}:
+        num_classes = min(3, int(getattr(cfg, "max_num_classes", 3)))
+        X_train = torch.randn(n, p, device=device)
+        y_train = torch.arange(n, device=device) % num_classes
+        x_test = torch.randn(4, p, device=device)
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                reference = model(
+                    X_train,
+                    y_train,
+                    x_test,
+                    task_objective=task_objective,
+                    num_classes=num_classes,
+                )["logits"]
+                pi = torch.randperm(n, device=device)
+                row_logits = model(
+                    X_train[pi],
+                    y_train[pi],
+                    x_test,
+                    task_objective=task_objective,
+                    num_classes=num_classes,
+                )["logits"]
+                pi_col = torch.randperm(p, device=device)
+                col_logits = model(
+                    X_train[:, pi_col],
+                    y_train,
+                    x_test[:, pi_col],
+                    task_objective=task_objective,
+                    num_classes=num_classes,
+                )["logits"]
+                results = {
+                    "Test 1 (row permutation invariance)": torch.allclose(
+                        reference, row_logits, atol=1e-5
+                    ),
+                    "Test 2 (column permutation consistency)": torch.allclose(
+                        reference, col_logits, atol=1e-5
+                    ),
+                    "Test 3 (finite output)": bool(
+                        torch.isfinite(reference).all().item()
+                    ),
+                    "Test 4 (batch query shape)": (
+                        reference.shape == (x_test.shape[0], num_classes)
+                    ),
+                }
+        finally:
+            model.train(was_training)
+        print("\nPermutation Invariance Tests:")
+        for name, passed in results.items():
+            print(f"  {name}: {'PASS' if passed else 'FAIL'}")
+        return all(bool(value) for value in results.values())
 
     X_train = torch.randn(n, p, device=device)
     y_train = torch.randn(n, device=device)
@@ -233,6 +287,34 @@ def select_deepset_features_train_only(
     return X_train_p[:, selected_columns], X_test_p[:, selected_columns], metadata
 
 
+def select_deepset_classification_features_train_only(
+    X_train_p,
+    y_train,
+    X_test_p,
+    feature_cap,
+):
+    """Train-only ANOVA feature selection for integer classification labels."""
+    processed_features = int(X_train_p.shape[1])
+    feature_cap = int(feature_cap)
+    metadata = {
+        "processed_features": processed_features,
+        "selected_features": min(processed_features, feature_cap),
+        "feature_selector": "train_f_classif",
+        "feature_cap": feature_cap,
+    }
+    if processed_features <= feature_cap:
+        return X_train_p, X_test_p, metadata
+    from sklearn.feature_selection import f_classif
+
+    scores, _ = f_classif(X_train_p, y_train)
+    scores = np.asarray(scores, dtype=np.float64)
+    scores[~np.isfinite(scores)] = -np.inf
+    column_indices = np.arange(processed_features)
+    selected_by_rank = np.lexsort((column_indices, -scores))[:feature_cap]
+    selected_columns = np.sort(selected_by_rank)
+    return X_train_p[:, selected_columns], X_test_p[:, selected_columns], metadata
+
+
 def deepset_inference_device(require_cuda=None):
     """Select and log the torch device used only by DeepSet inference."""
     require_cuda = BENCHMARK_REQUIRE_CUDA if require_cuda is None else require_cuda
@@ -323,6 +405,24 @@ def estimate_model3_icl_gpu_inference_bytes(
     return int(math.ceil(tensor_elements * float32_bytes * float(safety_factor)))
 
 
+def estimate_model4_icl_gpu_inference_bytes(
+    n_train_rows,
+    n_test_rows,
+    n_features,
+    d_phi,
+    **kw,
+):
+    """Estimate peak GPU memory for MODEL4 ICL inference.
+
+    MODEL4 adds LinearStatisticExtractor, CoefficientHead, LambdaHead, and FusionModule,
+    but their parameter overhead is negligible compared to the H tensor (m, n, p, d_phi).
+    Delegates to the MODEL3 estimator which dominates memory usage.
+    """
+    return estimate_model3_icl_gpu_inference_bytes(
+        n_train_rows, n_test_rows, n_features, d_phi, **kw
+    )
+
+
 def _cuda_free_bytes(device):
     try:
         free_bytes, _ = torch.cuda.mem_get_info(device)
@@ -369,21 +469,28 @@ def deepset_gpu_memory_skip_reason(
     if model_family == "market_exchangeable_icl":
         cfg = getattr(model, "cfg", None) if model is not None else None
         d_phi = int(getattr(cfg, "d_phi", 64) if cfg is not None else 64)
-        estimate = estimate_model3_icl_gpu_inference_bytes(
+        arch_version = getattr(cfg, "model_arch_version", "model3") if cfg is not None else "model3"
+        _estimator = (
+            estimate_model4_icl_gpu_inference_bytes
+            if arch_version == "model4"
+            else estimate_model3_icl_gpu_inference_bytes
+        )
+        estimate = _estimator(
             n_train_rows=X_train_np.shape[0],
             n_test_rows=X_test_np.shape[0],
             n_features=X_train_np.shape[1],
             d_phi=d_phi,
         )
+        _arch_tag = arch_version
         if int(max_inference_bytes) > 0 and estimate > int(max_inference_bytes):
             return (
-                f"gpu_oom:model3_estimated_h_tensor_bytes={estimate} exceeds "
+                f"gpu_oom:{_arch_tag}_estimated_h_tensor_bytes={estimate} exceeds "
                 f"BENCHMARK_DEEPSET_MAX_GPU_INFERENCE_BYTES={int(max_inference_bytes)}"
             ), estimate
         free_budget = int(_cuda_free_bytes(device) * float(max_memory_fraction))
         if estimate > free_budget:
             return (
-                f"gpu_oom:model3_estimated_h_tensor_bytes={estimate} exceeds "
+                f"gpu_oom:{_arch_tag}_estimated_h_tensor_bytes={estimate} exceeds "
                 f"available CUDA memory budget {free_budget}"
             ), estimate
         return None, estimate
@@ -480,3 +587,94 @@ def predict_deepset_bounded_context_ensemble(
         context_preds.append(preds)
 
     return np.mean(np.stack(context_preds, axis=0), axis=0)
+
+
+def predict_deepset_classification_mc_streamed(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    *,
+    num_classes,
+    K=32,
+    test_batch_size=128,
+    device=None,
+):
+    """MC-dropout probability mean for one bounded classification context."""
+    if K <= 0:
+        raise ValueError("MC dropout K must be positive.")
+    device = device or deepset_inference_device()
+    model.to(device)
+    Xtr = torch.as_tensor(X_train_np, dtype=torch.float32, device=device)
+    ytr = torch.as_tensor(y_train_np, dtype=torch.long, device=device)
+    n_test = int(X_test_np.shape[0])
+    out = np.empty((n_test, int(num_classes)), dtype=np.float64)
+    model.train()
+    try:
+        with torch.no_grad():
+            for start in range(0, n_test, test_batch_size):
+                end = min(start + test_batch_size, n_test)
+                Xte = torch.as_tensor(
+                    X_test_np[start:end], dtype=torch.float32, device=device
+                )
+                probability_sum = None
+                for _ in range(K):
+                    probs = model(
+                        Xtr,
+                        ytr,
+                        Xte,
+                        task_objective="inductive_classification",
+                        num_classes=int(num_classes),
+                    )["probs"].detach()
+                    probability_sum = (
+                        probs if probability_sum is None else probability_sum + probs
+                    )
+                out[start:end] = (
+                    probability_sum / float(K)
+                ).float().cpu().numpy()
+    finally:
+        model.eval()
+    return out
+
+
+def predict_deepset_classification_bounded_context_ensemble(
+    model,
+    X_train_np,
+    y_train_np,
+    X_test_np,
+    *,
+    num_classes,
+    seed,
+    dataset_identity="classification",
+    K=32,
+    context_size=BENCHMARK_DEEPSET_CONTEXT_SIZE,
+    context_ensembles=BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES,
+    test_batch_size=BENCHMARK_DEEPSET_TEST_BATCH_SIZE,
+    device=None,
+):
+    """Average class probabilities across deterministic support contexts."""
+    device = device or deepset_inference_device()
+    context_probabilities = []
+    for context_index in range(int(context_ensembles)):
+        idx = select_deepset_context_indices(
+            X_train_np.shape[0],
+            context_size,
+            seed,
+            context_index,
+            dataset_identity=dataset_identity,
+            context_ensembles=context_ensembles,
+        )
+        probabilities = predict_deepset_classification_mc_streamed(
+            model,
+            X_train_np[idx],
+            y_train_np[idx],
+            X_test_np,
+            num_classes=num_classes,
+            K=K,
+            test_batch_size=test_batch_size,
+            device=device,
+        )
+        context_probabilities.append(probabilities)
+    mean_probabilities = np.mean(np.stack(context_probabilities, axis=0), axis=0)
+    mean_probabilities /= mean_probabilities.sum(axis=1, keepdims=True).clip(min=1e-12)
+    return mean_probabilities

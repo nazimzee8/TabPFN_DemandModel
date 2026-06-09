@@ -1,7 +1,7 @@
 """
 tests/test_synthetic_regression_evaluation.py
 ===============================================
-Unit tests for src/evaluate_synthetic_regression.py.
+Unit tests for src/evaluate_linear_regression.py.
 
 Covers:
   - DeepSet mode: checkpoint loading, TORCH_UNLOAD alias, feature cap, preprocessing,
@@ -26,7 +26,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import evaluate_synthetic_regression as evsr
+import evaluate_linear_regression as evsr
 
 
 # ---------------------------------------------------------------------------
@@ -99,12 +99,12 @@ def wide_data():
 class TestCheckpointLoading:
     def test_deepset_loads_best_pt_not_best_config_json(self):
         """
-        load_best_deepset_checkpoint must use best.pt stage path, never best_config.json.
+        load_best_deepset_checkpoint must use best_regression.pt stage path, never best_config.json.
         Verified via the CHECKPOINT_STAGE_PATH constant and the load function's source contract.
         """
-        # The checkpoint stage path constant must point to best.pt
-        assert evsr.CHECKPOINT_STAGE_PATH.endswith("best.pt"), (
-            f"CHECKPOINT_STAGE_PATH={evsr.CHECKPOINT_STAGE_PATH!r} must end with 'best.pt'"
+        # The checkpoint stage path constant must point to best_regression.pt
+        assert evsr.CHECKPOINT_STAGE_PATH.endswith("best_regression.pt"), (
+            f"CHECKPOINT_STAGE_PATH={evsr.CHECKPOINT_STAGE_PATH!r} must end with 'best_regression.pt'"
         )
         assert "best_config.json" not in evsr.CHECKPOINT_STAGE_PATH
 
@@ -183,7 +183,7 @@ class TestFeatureSelection:
                  "feature_selector": "train_f_regression", "feature_cap": feature_cap_},
             )
 
-        with patch("evaluate_synthetic_regression.select_deepset_features_train_only",
+        with patch("evaluate_linear_regression.select_deepset_features_train_only",
                    side_effect=_mock_select):
             X_tr_sel, X_ho_sel, meta = evsr.apply_deepset_feature_selection(
                 X_train_p, split["y_train"], X_holdout_p, feature_cap=feature_cap
@@ -262,7 +262,7 @@ class TestBoundedContextEnsemble:
             })
             return np.zeros(X_test_np.shape[0])
 
-        with patch("evaluate_synthetic_regression.predict_deepset_bounded_context_ensemble",
+        with patch("evaluate_linear_regression.predict_deepset_bounded_context_ensemble",
                    side_effect=_mock_ensemble):
             with patch.dict(os.environ, {
                 "SYNTHETIC_REGRESSION_CONTEXT_ENSEMBLES": "5",
@@ -364,7 +364,7 @@ class TestBaselineMode:
     def test_fixed_ridge_uses_alpha_1(self):
         """FixedRidgeLambda1 must instantiate Ridge(alpha=1.0)."""
         from sklearn.linear_model import Ridge
-        with patch("evaluate_synthetic_regression.make_baseline_model") as mock_make:
+        with patch("evaluate_linear_regression.make_baseline_model") as mock_make:
             # Simulate what the baseline loop does for FixedRidgeLambda1
             method = "FixedRidgeLambda1"
             if method == "FixedRidgeLambda1":
@@ -435,7 +435,7 @@ class TestAutoGluonMode:
 
     def test_tmp_space_guard_emits_skip(self):
         """If free /tmp bytes < threshold, run must emit status='skipped'."""
-        with patch("evaluate_synthetic_regression._check_tmp_free_bytes", return_value=1000):
+        with patch("evaluate_linear_regression._check_tmp_free_bytes", return_value=1000):
             free = evsr._check_tmp_free_bytes()
             # Simulate the guard logic used in run_autogluon_synthetic_regression
             if free < evsr.SYNREG_AG_MIN_TMP_FREE_BYTES:
@@ -589,7 +589,7 @@ class TestAutogluonEnvVars:
             suite_id="linear_poisson_v1_recommended",
             num_shards=6,
             shard_index=0,
-            results_stage="@EVALUATION_RESULTS_STAGE/regression",
+            results_stage="@EVALUATION_RESULTS_STAGE/linear/regression/numeric",
             extra_env={},
         )
 
@@ -613,3 +613,15 @@ class TestAutogluonEnvVars:
         ]
         for var in required:
             assert var in env, f"Missing required env var: {var}"
+
+
+# ---------------------------------------------------------------------------
+# Area 7 — Evaluation result identity
+# ---------------------------------------------------------------------------
+
+def test_deepset_method_id_constant_value():
+    """DEEPSET_METHOD_ID must be exactly 'MODEL-ICL-MC' (not 'MODEL3-ICL-MC')."""
+    assert evsr.DEEPSET_METHOD_ID == "MODEL-ICL-MC", (
+        f"Expected 'MODEL-ICL-MC', got {evsr.DEEPSET_METHOD_ID!r}. "
+        "Do not derive this from model_arch_version — it is a stable output identifier."
+    )

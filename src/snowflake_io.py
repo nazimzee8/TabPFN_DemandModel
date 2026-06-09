@@ -4,22 +4,28 @@ import glob
 import os
 import posixpath
 
-META_DATASET_STAGE = "@META_DATASET_STAGE"
-META_DATASET_INDEX = "META_DATASET_INDEX"
-META_NONLINEAR_DATASET_STAGE = "@META_NONLINEAR_DATASET_STAGE"
-META_NONLINEAR_DATASET_INDEX = "META_NONLINEAR_DATASET_INDEX"
+from task_routing import get_training_data_spec
+
+META_DATASET_STAGE = "@META_REGRESSION_DATASET_STAGE"
+META_DATASET_INDEX = "META_REGRESSION_DATASET_INDEX"
+META_NONLINEAR_DATASET_STAGE = "@META_NONLINEAR_REGRESSION_DATASET_STAGE"
+META_NONLINEAR_DATASET_INDEX = "META_NONLINEAR_REGRESSION_DATASET_INDEX"
+META_CLASSIFICATION_DATASET_STAGE = "@META_CLASSIFICATION_DATASET_STAGE"
+META_CLASSIFICATION_DATASET_INDEX = "META_CLASSIFICATION_DATASET_INDEX"
 NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
+CLASSIFICATION_TRAINING_FAMILY = "synthetic_linear_classification"
 DEFAULT_SPLITS = ("train", "val", "test")
 RUNTIME_INDEX_COLUMNS = ("split", "task_id", "stage_path", "p", "n_train")
 HPO_INDEX_COLUMNS = RUNTIME_INDEX_COLUMNS + ("hpo_bucket", "prior_regime")
+NONLINEAR_HPO_INDEX_COLUMNS = HPO_INDEX_COLUMNS + ("feature_regime",)
+CLASSIFICATION_HPO_INDEX_COLUMNS = HPO_INDEX_COLUMNS + ("num_classes",)
 
 
 def _resolve_index_table_and_stage(training_data_family=None):
     """Return (index_table, stage) based on TRAINING_DATA_FAMILY env var or explicit arg."""
     family = training_data_family or os.getenv("TRAINING_DATA_FAMILY", "")
-    if family == NONLINEAR_TRAINING_FAMILY:
-        return META_NONLINEAR_DATASET_INDEX, META_NONLINEAR_DATASET_STAGE
-    return META_DATASET_INDEX, META_DATASET_STAGE
+    spec = get_training_data_spec(family or "unknown")
+    return spec.index_table, spec.stage
 
 
 def _get_active_session_or_none():
@@ -124,6 +130,8 @@ def _local_index_rows(local_root, splits, split_limits=None):
                 "n_train": n_train,
                 "hpo_bucket": i,
                 "prior_regime": "",
+                "feature_regime": "legacy_gaussian",
+                "num_classes": 2,
             })
     if split_limits:
         _validate_index_rows(rows, RUNTIME_INDEX_COLUMNS, split_limits=split_limits)
@@ -132,16 +140,20 @@ def _local_index_rows(local_root, splits, split_limits=None):
 
 def _normalize_stage_path(stage_path, split=None):
     if stage_path is None:
-        raise ValueError("META_DATASET_INDEX row has NULL stage_path")
+        raise ValueError("META_REGRESSION_DATASET_INDEX row has NULL stage_path")
     path = str(stage_path).replace("\\", "/").strip()
-    for stage in (META_DATASET_STAGE, META_NONLINEAR_DATASET_STAGE):
+    for stage in (
+        META_DATASET_STAGE,
+        META_NONLINEAR_DATASET_STAGE,
+        META_CLASSIFICATION_DATASET_STAGE,
+    ):
         prefix = f"{stage}/"
         if path.upper().startswith(prefix.upper()):
             path = path[len(prefix):]
             break
     path = path.lstrip("/")
     if not path:
-        raise ValueError("META_DATASET_INDEX row has empty stage_path")
+        raise ValueError("META_REGRESSION_DATASET_INDEX row has empty stage_path")
     if split and not path.startswith(f"{split}/"):
         path = posixpath.join(str(split), posixpath.basename(path))
     return path
@@ -197,8 +209,8 @@ def select_meta_dataset_index_rows(
     session=None,
 ):
     """
-    Select deterministic runtime rows from META_DATASET_INDEX (or META_NONLINEAR_DATASET_INDEX
-    when TRAINING_DATA_FAMILY=synthetic_regression_nonlinear).
+    Select deterministic runtime rows from META_REGRESSION_DATASET_INDEX (or
+    META_NONLINEAR_REGRESSION_DATASET_INDEX when TRAINING_DATA_FAMILY=synthetic_regression_nonlinear).
 
     Outside Snowflake, returns synthetic rows for existing local parquet files so
     developer runs never download stage contents to the workstation.
@@ -207,7 +219,14 @@ def select_meta_dataset_index_rows(
     session = session or _get_active_session_or_none()
     split_limits = dict(split_limits or {})
     splits = tuple(splits)
-    required_columns = HPO_INDEX_COLUMNS if hpo_subset else RUNTIME_INDEX_COLUMNS
+    is_nonlinear = _index_table == META_NONLINEAR_DATASET_INDEX
+    is_classification = _index_table == META_CLASSIFICATION_DATASET_INDEX
+    if hpo_subset and is_nonlinear:
+        required_columns = NONLINEAR_HPO_INDEX_COLUMNS
+    elif hpo_subset and is_classification:
+        required_columns = CLASSIFICATION_HPO_INDEX_COLUMNS
+    else:
+        required_columns = HPO_INDEX_COLUMNS if hpo_subset else RUNTIME_INDEX_COLUMNS
 
     if session is None:
         return _local_index_rows("/tmp/data", splits, split_limits=split_limits)
@@ -221,7 +240,33 @@ def select_meta_dataset_index_rows(
         ]
         if not limit_clauses:
             raise ValueError("hpo_subset=True requires split_limits")
-        sql = f"""
+        if is_nonlinear:
+            sql = f"""
+WITH ranked AS (
+    SELECT {columns_sql},
+           ROW_NUMBER() OVER (
+               PARTITION BY split, prior_regime, COALESCE(feature_regime, 'legacy_gaussian')
+               ORDER BY hpo_bucket, p, n_train, task_id
+           ) AS coverage_rank
+    FROM {_index_table}
+    WHERE split IN ({split_sql})
+),
+ordered AS (
+    SELECT {columns_sql}, coverage_rank,
+           ROW_NUMBER() OVER (
+               PARTITION BY split
+               ORDER BY coverage_rank, hpo_bucket, prior_regime,
+                        COALESCE(feature_regime, 'legacy_gaussian'), p, n_train, task_id
+           ) AS split_rank
+    FROM ranked
+)
+SELECT {columns_sql}
+FROM ordered
+WHERE {" OR ".join(limit_clauses)}
+ORDER BY split, split_rank
+"""
+        else:
+            sql = f"""
 WITH ranked AS (
     SELECT {columns_sql},
            ROW_NUMBER() OVER (
@@ -324,7 +369,7 @@ def materialize_indexed_meta_dataset(
     rows=None,
 ):
     """
-    Materialize selected META_DATASET_INDEX rows into DATA_DIR/<split>/.
+    Materialize selected META_REGRESSION_DATASET_INDEX rows into DATA_DIR/<split>/.
 
     Returns a dict mapping each split to sorted local parquet paths.
     """

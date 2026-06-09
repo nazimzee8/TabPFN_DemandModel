@@ -6,12 +6,15 @@ BENCHMARK_DEP_IMPORT_ERRORS = {}
 
 try:
     from sklearn.neighbors import KNeighborsRegressor
-    from sklearn.linear_model import LinearRegression, Ridge
+    from sklearn.linear_model import LinearRegression, Ridge, HuberRegressor
     from sklearn.ensemble import RandomForestRegressor
     from sklearn.svm import SVR
     from sklearn.neural_network import MLPRegressor
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import StandardScaler, PolynomialFeatures
     from sklearn.pipeline import Pipeline
+    from sklearn.kernel_ridge import KernelRidge
+    from sklearn.feature_selection import SelectKBest, f_regression
+    from sklearn.gaussian_process import GaussianProcessRegressor
 except ImportError as exc:
     BENCHMARK_DEP_IMPORT_ERRORS["sklearn"] = exc
 
@@ -50,6 +53,20 @@ CPU_BASELINE_METHODS = [
     "MLP",
 ]
 
+# Nonlinear-specific baselines — enabled via SYNREG_NONLINEAR_BASELINES=true.
+# PolynomialRidge_D4: skipped per-dataset when p_total > 20 (feature explosion).
+# StepwiseForward_Ridge: skipped per-dataset when p_total > 32.
+# GaussianProcessRegressor: skipped per-dataset when n_total > 200.
+NONLINEAR_CPU_BASELINE_METHODS = [
+    "PolynomialRidge_D2",
+    "PolynomialRidge_D3",
+    "PolynomialRidge_D4",
+    "HuberRegression",
+    "KernelRidge_RBF",
+    "GaussianProcessRegressor",
+    "StepwiseForward_Ridge",
+]
+
 BASELINE_METHOD_DEPS = {
     "XGBoost": ("sklearn", "xgboost"),
     "LightGBM": ("sklearn", "lightgbm"),
@@ -60,6 +77,13 @@ BASELINE_METHOD_DEPS = {
     "Ridge": ("sklearn",),
     "SVR": ("sklearn",),
     "MLP": ("sklearn",),
+    "PolynomialRidge_D2": ("sklearn",),
+    "PolynomialRidge_D3": ("sklearn",),
+    "PolynomialRidge_D4": ("sklearn",),
+    "HuberRegression": ("sklearn",),
+    "KernelRidge_RBF": ("sklearn",),
+    "GaussianProcessRegressor": ("sklearn",),
+    "StepwiseForward_Ridge": ("sklearn",),
 }
 
 
@@ -100,6 +124,7 @@ def make_baseline_model(
     import_errors=None,
     constructors=None,
     dependency_error_builder=None,
+    p_total=None,
 ):
     """Construct one selected sklearn-compatible baseline."""
     import_errors = BENCHMARK_DEP_IMPORT_ERRORS if import_errors is None else import_errors
@@ -157,6 +182,40 @@ def make_baseline_model(
                 max_iter=300,
                 random_state=seed,
             )),
+        ])
+    if method == "PolynomialRidge_D2":
+        return constructors.get("Pipeline", Pipeline)([
+            ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+            ("scaler", constructors.get("StandardScaler", StandardScaler)()),
+            ("ridge", ridge_cls(alpha=1.0)),
+        ])
+    if method == "PolynomialRidge_D3":
+        return constructors.get("Pipeline", Pipeline)([
+            ("poly", PolynomialFeatures(degree=3, include_bias=False)),
+            ("scaler", constructors.get("StandardScaler", StandardScaler)()),
+            ("ridge", ridge_cls(alpha=1.0)),
+        ])
+    if method == "PolynomialRidge_D4":
+        return constructors.get("Pipeline", Pipeline)([
+            ("poly", PolynomialFeatures(degree=4, include_bias=False)),
+            ("scaler", constructors.get("StandardScaler", StandardScaler)()),
+            ("ridge", ridge_cls(alpha=1.0)),
+        ])
+    if method == "HuberRegression":
+        return constructors.get("HuberRegressor", HuberRegressor)(epsilon=1.35, max_iter=200)
+    if method == "KernelRidge_RBF":
+        return constructors.get("KernelRidge", KernelRidge)(alpha=1.0, kernel="rbf")
+    if method == "GaussianProcessRegressor":
+        return constructors.get("GaussianProcessRegressor", GaussianProcessRegressor)(
+            n_restarts_optimizer=0, normalize_y=True, random_state=seed
+        )
+    if method == "StepwiseForward_Ridge":
+        # k = top sqrt(p_total) features, capped at 16; falls back to "all" when p_total unknown
+        _p = int(p_total) if p_total is not None else None
+        k = max(1, min(int(_p ** 0.5), 16)) if _p is not None and _p > 0 else "all"
+        return constructors.get("Pipeline", Pipeline)([
+            ("selector", SelectKBest(f_regression, k=k)),
+            ("ridge", ridge_cls(alpha=1.0)),
         ])
     raise AssertionError(f"Unhandled CPU baseline method: {method}")
 

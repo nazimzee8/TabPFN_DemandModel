@@ -69,7 +69,7 @@ def _section_teardown(warehouse: str) -> str:
         "DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;\n"
         "DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;\n"
         "-- Stages\n"
-        "DROP STAGE IF EXISTS META_DATASET_STAGE;\n"
+        "DROP STAGE IF EXISTS META_REGRESSION_DATASET_STAGE;\n"
         "DROP STAGE IF EXISTS MODEL_STAGE;\n"
         "DROP STAGE IF EXISTS EVALUATION_RESULTS_STAGE;\n"
         "DROP STAGE IF EXISTS MLJOB_PAYLOAD_STAGE;\n"
@@ -87,7 +87,7 @@ def _section_teardown(warehouse: str) -> str:
 
 def _section2_stages() -> str:
     stages = [
-        "META_DATASET_STAGE",
+        "META_REGRESSION_DATASET_STAGE",
         "MODEL_STAGE",
         "EVALUATION_RESULTS_STAGE",
         "MLJOB_PAYLOAD_STAGE",
@@ -104,9 +104,9 @@ def _section2_stages() -> str:
 
 def _section3_index_table() -> str:
     return (
-        _section_header("Section 3 — META_DATASET_INDEX table") +
-        "DROP TABLE IF EXISTS META_DATASET_INDEX;\n"
-        "CREATE TRANSIENT TABLE META_DATASET_INDEX (\n"
+        _section_header("Section 3 — META_REGRESSION_DATASET_INDEX table") +
+        "DROP TABLE IF EXISTS META_REGRESSION_DATASET_INDEX;\n"
+        "CREATE TRANSIENT TABLE META_REGRESSION_DATASET_INDEX (\n"
         "  split        STRING NOT NULL,\n"
         "  task_id      STRING NOT NULL,\n"
         "  stage_path   STRING NOT NULL,\n"
@@ -148,15 +148,15 @@ def _section6_upload_data() -> str:
     test_put  = _put_path(DATA_TEST  / "*.parquet")
     return (
         _section_header("Section 6 — Upload synthetic datasets") +
-        "REMOVE @META_DATASET_STAGE/train/;\n"
-        "REMOVE @META_DATASET_STAGE/val/;\n"
-        "REMOVE @META_DATASET_STAGE/test/;\n"
+        "REMOVE @META_REGRESSION_DATASET_STAGE/train/;\n"
+        "REMOVE @META_REGRESSION_DATASET_STAGE/val/;\n"
+        "REMOVE @META_REGRESSION_DATASET_STAGE/test/;\n"
         f"PUT {train_put}\n"
-        f"    @META_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
         f"PUT {val_put}\n"
-        f"    @META_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
         f"PUT {test_put}\n"
-        f"    @META_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
     )
 
 
@@ -164,14 +164,14 @@ def _section10_verify() -> str:
     return (
         _section_header("Section 10 — Verification") +
         "LIST @MODEL_STAGE/scripts/ PATTERN='.*[.]py';\n"
-        "LIST @META_DATASET_STAGE/train/ PATTERN='.*[.]parquet';\n"
-        "LIST @META_DATASET_STAGE/val/   PATTERN='.*[.]parquet';\n"
-        "LIST @META_DATASET_STAGE/test/  PATTERN='.*[.]parquet';\n"
+        "LIST @META_REGRESSION_DATASET_STAGE/train/ PATTERN='.*[.]parquet';\n"
+        "LIST @META_REGRESSION_DATASET_STAGE/val/   PATTERN='.*[.]parquet';\n"
+        "LIST @META_REGRESSION_DATASET_STAGE/test/  PATTERN='.*[.]parquet';\n"
         "-- NOTE: The table below will return 0 rows until you run\n"
         "--   CALL build_meta_dataset_index();\n"
         "-- manually in Snowflake after this script completes.\n"
         "SELECT split, COUNT(*) AS task_count\n"
-        "FROM META_DATASET_INDEX\n"
+        "FROM META_REGRESSION_DATASET_INDEX\n"
         "GROUP BY split\n"
         "ORDER BY split;\n"
         "-- Expected after build_meta_dataset_index(): train=800, val=100, test=100\n"

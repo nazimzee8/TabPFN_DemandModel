@@ -23,8 +23,11 @@ import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
+SRC_DIR = os.path.join(REPO_ROOT, "src")
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
 
 # Pre-stub snowflake.ml so the module-level "from snowflake.ml.jobs import
 # submit_from_stage" in the submission scripts succeeds locally.
@@ -43,6 +46,23 @@ import run_training_job      # noqa: E402
 import run_model_training_job  # noqa: E402
 import run_hpo_job           # noqa: E402
 import run_pretrain_job      # noqa: E402
+
+
+def _ensure_module(name):
+    """Re-import a module if it was removed from sys.modules by another test."""
+    if name not in sys.modules:
+        importlib.import_module(name)
+    return sys.modules[name]
+
+
+@pytest.fixture(autouse=True)
+def _restore_submission_modules():
+    """Ensure all 4 submission modules are in sys.modules before each test."""
+    global run_training_job, run_model_training_job, run_hpo_job, run_pretrain_job
+    run_training_job = _ensure_module("run_training_job")
+    run_model_training_job = _ensure_module("run_model_training_job")
+    run_hpo_job = _ensure_module("run_hpo_job")
+    run_pretrain_job = _ensure_module("run_pretrain_job")
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +141,10 @@ def _make_session_for_pipeline(tmp_dir: str, best_config: dict | None = None):
 
 class TestRunTrainingJobConstant:
     def test_default_is_combined(self, monkeypatch):
-        """DEFAULT_TRAINING_DATA_FAMILY defaults to synthetic_regression_combined."""
+        """DEFAULT_TRAINING_DATA_FAMILY defaults to synthetic_linear_regression."""
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_training_job)
-        assert run_training_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_combined"
+        assert run_training_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_linear_regression"
         importlib.reload(run_training_job)
 
     def test_env_var_override(self, monkeypatch):
@@ -154,7 +174,7 @@ class TestRunTrainingJobConstant:
 # ---------------------------------------------------------------------------
 
 class TestRunPipelinePropagation:
-    def _collect_jobs(self, monkeypatch, training_data_family="synthetic_regression_combined"):
+    def _collect_jobs(self, monkeypatch, training_data_family="synthetic_linear_regression"):
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_training_job)
         run_training_job.DEFAULT_TRAINING_DATA_FAMILY = training_data_family
@@ -187,12 +207,12 @@ class TestRunPipelinePropagation:
             "Expected a single pretrain job with CHECKPOINT_OUTPUT_NAME=pretrain.pt"
         )
         for pretrain in pretrain_jobs:
-            assert pretrain.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+            assert pretrain.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
 
     def test_hpo_job_receives_family(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch)
         hpo = next(j for j in jobs if j.entrypoint == "hpo.py")
-        assert hpo.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        assert hpo.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
 
     def test_final_train_job_receives_family(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch)
@@ -202,7 +222,7 @@ class TestRunPipelinePropagation:
             if j.entrypoint == "train.py"
             and "BEST_CONFIG" in j.env_vars
         )
-        assert final.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        assert final.env_vars["TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
 
     def test_pretrain_and_final_train_use_same_family(self, monkeypatch):
         """Pretrain and final training must share the same TRAINING_DATA_FAMILY."""
@@ -258,7 +278,7 @@ class TestRunPretrainJobFamilyDefaults:
 # ---------------------------------------------------------------------------
 
 class TestRunModelTrainingPropagation:
-    def _collect_jobs(self, monkeypatch, training_data_family="synthetic_regression_combined"):
+    def _collect_jobs(self, monkeypatch, training_data_family="synthetic_linear_regression"):
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_model_training_job)
         run_model_training_job.DEFAULT_TRAINING_DATA_FAMILY = training_data_family
@@ -282,7 +302,7 @@ class TestRunModelTrainingPropagation:
     def test_final_train_receives_combined_by_default(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch)
         assert len(jobs) == 1
-        assert jobs[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        assert jobs[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
 
     def test_override_primary_accepted(self, monkeypatch):
         jobs = self._collect_jobs(monkeypatch, "synthetic_regression_primary")
@@ -333,7 +353,7 @@ class TestRunHpoJobPropagation:
         monkeypatch.delenv("HPO_TRAINING_DATA_FAMILY", raising=False)
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         importlib.reload(run_hpo_job)
-        assert run_hpo_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_regression_combined"
+        assert run_hpo_job.DEFAULT_TRAINING_DATA_FAMILY == "synthetic_linear_regression"
         importlib.reload(run_hpo_job)
 
     def test_hpo_specific_env_overrides_shared_training_family(self, monkeypatch):
@@ -369,7 +389,8 @@ class TestRunHpoJobPropagation:
             run_hpo_job.run_hpo_pipeline()
 
         assert len(submitted) == 1
-        assert submitted[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_regression_combined"
+        assert submitted[0].env_vars["TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
+        assert submitted[0].env_vars["HPO_TRAINING_DATA_FAMILY"] == "synthetic_linear_regression"
         importlib.reload(run_hpo_job)
 
     def test_hpo_job_has_model_family_not_deepset_model_family(self, monkeypatch):

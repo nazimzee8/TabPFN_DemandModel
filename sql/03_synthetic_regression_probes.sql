@@ -201,11 +201,11 @@ CREATE OR REPLACE PROCEDURE run_synthetic_regression_combined_autogluon_capacity
 -- Ray distributed mode (AUTOGLUON_CLUSTER_SHARDS > 0):
 --   Submits one autogluon_worker_access_probe.py job per cluster shard, each with
 --   target_instances=AUTOGLUON_WORKERS_PER_SHARD. The Ray driver loads metadata
---   from SYNTHETIC_REGRESSION_DATASET_INDEX, builds compact item dicts with
+--   from LINEAR_REGRESSION_DATASET_INDEX, builds compact item dicts with
 --   dataset_access.mode='driver_presigned_url', and sends only those dicts to
 --   workers as Ray task arguments. The driver derives dataset_access.presigned_url
 --   with GET_PRESIGNED_URL. Workers download with urllib and do not create
---   Snowpark sessions or query SYNTHETIC_REGRESSION_DATASET_INDEX.
+--   Snowpark sessions or query LINEAR_REGRESSION_DATASET_INDEX.
 --   No AutoGluon training and no full-suite dataset fan-out.
 --
 -- Single-node shard mode (AUTOGLUON_CLUSTER_SHARDS = 0):

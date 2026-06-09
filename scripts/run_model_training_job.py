@@ -8,7 +8,33 @@ import tempfile
 
 from snowflake.ml.jobs import submit_from_stage
 
-EXPECTED_INDEX_COUNTS = {"train": 800, "val": 100, "test": 100}
+def _derive_split_counts(total: int) -> dict:
+    train = int(0.8 * total)
+    val = int(0.1 * total)
+    test = total - train - val
+    return {"train": train, "val": val, "test": test}
+
+
+_LINEAR_EXPECTED_TOTAL = int(os.getenv("META_DATASET_EXPECTED_TOTAL", "1000"))
+_NONLINEAR_EXPECTED_TOTAL = int(os.getenv("META_NONLINEAR_DATASET_EXPECTED_TOTAL", "1000"))
+_CLASSIFICATION_EXPECTED_TOTAL = int(
+    os.getenv("META_CLASSIFICATION_DATASET_EXPECTED_TOTAL", "1000")
+)
+_NONLINEAR_CLASSIFICATION_EXPECTED_TOTAL = int(
+    os.getenv("META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL", "1000")
+)
+_NONLINEAR_MIXED_REGRESSION_EXPECTED_TOTAL = int(
+    os.getenv("META_NONLINEAR_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL", "1000")
+)
+_NONLINEAR_MIXED_CLASSIFICATION_EXPECTED_TOTAL = int(
+    os.getenv("META_NONLINEAR_MIXED_CLASSIFICATION_DATASET_EXPECTED_TOTAL", "1000")
+)
+EXPECTED_INDEX_COUNTS = _derive_split_counts(_LINEAR_EXPECTED_TOTAL)
+_NONLINEAR_EXPECTED_INDEX_COUNTS = _derive_split_counts(_NONLINEAR_EXPECTED_TOTAL)
+_CLASSIFICATION_EXPECTED_INDEX_COUNTS = _derive_split_counts(
+    _CLASSIFICATION_EXPECTED_TOTAL
+)
+from task_routing import get_training_data_spec
 
 GPU_POOL = "DEEPSET_GPU_POOL"
 MODEL_STAGE = "@MODEL_STAGE"
@@ -18,16 +44,29 @@ TRAIN_NUM_NODES = 10
 LOCAL_TMP_DIR = tempfile.gettempdir()
 
 # Training data family — identifies the synthetic data suite used for this training run.
-# Production synthetic regression evaluation checkpoints use synthetic_regression_combined
+# Production synthetic regression evaluation checkpoints use synthetic_linear_regression
 # (combined suite linear_all_v1, which includes primary + OOD data).
 # Override via TRAINING_DATA_FAMILY env var when launching a different training mode.
 DEFAULT_TRAINING_DATA_FAMILY = os.getenv(
-    "TRAINING_DATA_FAMILY", "synthetic_regression_combined"
+    "TRAINING_DATA_FAMILY", "synthetic_linear_regression"
 )
 
 # MODEL3 architecture selectors — propagated to the training MLJob env_vars.
 DEFAULT_MODEL_FAMILY          = os.getenv("MODEL_FAMILY",          "market_exchangeable_icl")
 DEFAULT_MODEL_DESIGN_PATTERN = os.getenv("MODEL_DESIGN_PATTERN", "inductive_forecasting")
+
+_HPO_SWEEP_MODE_ALIASES = {
+    "ridge_residual": "linear_model",
+    "architecture": "linear_model_architecture",
+    "linear_stats": "linear_model",
+    "nonlinear_meta": "nonlinear_model",
+    "nonlinear_architecture": "nonlinear_model_architecture",
+}
+
+
+def _canonical_hpo_sweep_mode(value: str) -> str:
+    mode = str(value).strip().lower()
+    return _HPO_SWEEP_MODE_ALIASES.get(mode, mode)
 
 
 def _get_session():
@@ -113,15 +152,15 @@ def _detect_prometheus_mmap_failure(logs: str) -> bool:
 
 
 def _validate_meta_dataset_index(session):
-    """Pre-flight check: raises RuntimeError if META_DATASET_INDEX is missing or has wrong counts."""
+    """Pre-flight check: raises RuntimeError if META_REGRESSION_DATASET_INDEX is missing or has wrong counts."""
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_DATASET_INDEX GROUP BY split"
+            "FROM META_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_DATASET_INDEX does not exist or cannot be queried. "
+            "META_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
             "Run CALL build_meta_dataset_index(); first."
         ) from exc
 
@@ -133,11 +172,11 @@ def _validate_meta_dataset_index(session):
     }
     if mismatches:
         raise RuntimeError(
-            f"META_DATASET_INDEX has wrong split counts: {mismatches}. "
+            f"META_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
             "Run CALL build_meta_dataset_index(); to rebuild."
         )
     print(
-        "META_DATASET_INDEX validated: "
+        "META_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
 
@@ -145,11 +184,11 @@ def _validate_meta_dataset_index(session):
     _REQUIRED_COLUMNS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLUMNS} FROM META_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLUMNS} FROM META_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_DATASET_INDEX is missing one or more required columns "
+            f"META_REGRESSION_DATASET_INDEX is missing one or more required columns "
             f"({_REQUIRED_COLUMNS}). "
             "Rebuild with CALL build_meta_dataset_index(); "
             f"Error: {exc}"
@@ -158,17 +197,17 @@ def _validate_meta_dataset_index(session):
     # Stage file accessibility spot-check — catches empty/missing staged data
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(f"LIST @META_REGRESSION_DATASET_STAGE/{_split}/").collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files found in @META_DATASET_STAGE/{_split}/. "
+                    f"No staged files found in @META_REGRESSION_DATASET_STAGE/{_split}/. "
                     "Re-upload training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"META_DATASET_INDEX references @META_DATASET_STAGE/{_split}/ "
+                f"META_REGRESSION_DATASET_INDEX references @META_REGRESSION_DATASET_STAGE/{_split}/ "
                 f"but the stage directory is inaccessible: {exc}. "
                 "Verify stage permissions and re-upload data."
             ) from exc
@@ -178,63 +217,169 @@ _NONLINEAR_TRAINING_FAMILY = "synthetic_regression_nonlinear"
 
 
 def _validate_nonlinear_training_index(session) -> None:
-    """Pre-flight for META_NONLINEAR_DATASET_INDEX + @META_NONLINEAR_DATASET_STAGE."""
+    """Pre-flight for META_NONLINEAR_REGRESSION_DATASET_INDEX + @META_NONLINEAR_REGRESSION_DATASET_STAGE."""
     try:
         rows = session.sql(
             "SELECT split, COUNT(*) AS task_count "
-            "FROM META_NONLINEAR_DATASET_INDEX GROUP BY split"
+            "FROM META_NONLINEAR_REGRESSION_DATASET_INDEX GROUP BY split"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            "META_NONLINEAR_DATASET_INDEX does not exist or cannot be queried. "
+            "META_NONLINEAR_REGRESSION_DATASET_INDEX does not exist or cannot be queried. "
             "Run CALL build_meta_nonlinear_dataset_index(); first."
         ) from exc
     counts = {str(row[0]).lower(): int(row[1]) for row in rows}
     mismatches = {
         split: {"expected": exp, "actual": counts.get(split, 0)}
-        for split, exp in EXPECTED_INDEX_COUNTS.items()
+        for split, exp in _NONLINEAR_EXPECTED_INDEX_COUNTS.items()
         if counts.get(split, 0) != exp
     }
     if mismatches:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX has wrong split counts: {mismatches}. "
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX has wrong split counts: {mismatches}. "
             "Run CALL build_meta_nonlinear_dataset_index(); to rebuild."
         )
     print(
-        "META_NONLINEAR_DATASET_INDEX validated: "
+        "META_NONLINEAR_REGRESSION_DATASET_INDEX validated: "
         + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
     )
     _REQUIRED_COLS = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
     try:
         session.sql(
-            f"SELECT {_REQUIRED_COLS} FROM META_NONLINEAR_DATASET_INDEX LIMIT 1"
+            f"SELECT {_REQUIRED_COLS} FROM META_NONLINEAR_REGRESSION_DATASET_INDEX LIMIT 1"
         ).collect()
     except Exception as exc:
         raise RuntimeError(
-            f"META_NONLINEAR_DATASET_INDEX missing required columns ({_REQUIRED_COLS}): {exc}"
+            f"META_NONLINEAR_REGRESSION_DATASET_INDEX missing required columns ({_REQUIRED_COLS}): {exc}"
         ) from exc
     for _split in ("train", "val"):
         try:
-            _files = session.sql(f"LIST @META_NONLINEAR_DATASET_STAGE/{_split}/").collect()
+            _files = session.sql(f"LIST @META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/").collect()
             if not _files:
                 raise RuntimeError(
-                    f"No staged files in @META_NONLINEAR_DATASET_STAGE/{_split}/. "
+                    f"No staged files in @META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/. "
                     "Re-upload nonlinear training data before starting a GPU job."
                 )
         except RuntimeError:
             raise
         except Exception as exc:
             raise RuntimeError(
-                f"@META_NONLINEAR_DATASET_STAGE/{_split}/ inaccessible: {exc}"
+                f"@META_NONLINEAR_REGRESSION_DATASET_STAGE/{_split}/ inaccessible: {exc}"
             ) from exc
+
+
+def _validate_nonlinear_index_by_spec(session, spec) -> None:
+    """Generic validator for nonlinear training indices — uses spec.index_table / spec.stage.
+
+    Derives expected split counts from the spec's expected_total_env at call time so it works
+    for all four nonlinear families without requiring per-family module-level constants.
+    """
+    table = spec.index_table
+    stage = spec.stage
+    total = int(os.getenv(spec.expected_total_env, "1000"))
+    expected = _derive_split_counts(total)
+
+    try:
+        rows = session.sql(
+            f"SELECT split, COUNT(*) AS task_count FROM {table} GROUP BY split"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} does not exist or cannot be queried. "
+            f"Run the corresponding CALL build_{spec.index_builder.replace('build_', '', 1)}(); "
+            "first."
+        ) from exc
+    counts = {str(row[0]).lower(): int(row[1]) for row in rows}
+    mismatches = {
+        split: {"expected": exp, "actual": counts.get(split, 0)}
+        for split, exp in expected.items()
+        if counts.get(split, 0) != exp
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"{table} has wrong split counts: {mismatches}. "
+            f"Run CALL {spec.index_builder}(<total>); to rebuild."
+        )
+    print(
+        f"{table} validated: "
+        + ", ".join(f"{s}={counts[s]}" for s in ("train", "val", "test"))
+    )
+    # Required columns (classification + mixed families add extra checks)
+    required_cols = "split, task_id, stage_path, p, n_train, hpo_bucket, prior_regime"
+    if spec.is_classification:
+        required_cols += ", num_classes"
+    if "mixed" in spec.family:
+        required_cols += ", categorical_cardinalities"
+    try:
+        session.sql(f"SELECT {required_cols} FROM {table} LIMIT 1").collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} missing required columns ({required_cols}): {exc}"
+        ) from exc
+    for _split in ("train", "val"):
+        try:
+            files = session.sql(f"LIST {stage}/{_split}/").collect()
+            if not files:
+                raise RuntimeError(
+                    f"No staged files found in {stage}/{_split}/. "
+                    "Re-upload training data before starting a GPU job."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"{stage}/{_split}/ inaccessible: {exc}") from exc
 
 
 def _validate_training_index(session, training_data_family: str) -> None:
     """Route to the correct index validation based on training_data_family."""
-    if training_data_family == _NONLINEAR_TRAINING_FAMILY:
-        _validate_nonlinear_training_index(session)
+    from task_routing import NONLINEAR_TRAINING_FAMILY
+    spec = get_training_data_spec(training_data_family)
+    if spec.is_nonlinear:
+        if spec.family == NONLINEAR_TRAINING_FAMILY:
+            # Existing specific validator for the original nonlinear regression family
+            _validate_nonlinear_training_index(session)
+        else:
+            # Generic validator for the three new nonlinear families
+            _validate_nonlinear_index_by_spec(session, spec)
+    elif spec.is_classification:
+        _validate_classification_training_index(session)
     else:
         _validate_meta_dataset_index(session)
+
+
+def _validate_classification_training_index(session) -> None:
+    table = "META_CLASSIFICATION_DATASET_INDEX"
+    stage = "@META_CLASSIFICATION_DATASET_STAGE"
+    try:
+        rows = session.sql(
+            f"SELECT split, COUNT(*) AS task_count FROM {table} GROUP BY split"
+        ).collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} does not exist or cannot be queried."
+        ) from exc
+    counts = {str(row[0]).lower(): int(row[1]) for row in rows}
+    mismatches = {
+        split: {"expected": expected, "actual": counts.get(split, 0)}
+        for split, expected in _CLASSIFICATION_EXPECTED_INDEX_COUNTS.items()
+        if counts.get(split, 0) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"{table} has wrong split counts: {mismatches}.")
+    required = (
+        "split, task_id, stage_path, p, n_train, hpo_bucket, "
+        "prior_regime, num_classes"
+    )
+    try:
+        session.sql(f"SELECT {required} FROM {table} LIMIT 1").collect()
+    except Exception as exc:
+        raise RuntimeError(
+            f"{table} is missing required columns ({required}): {exc}"
+        ) from exc
+    for split in ("train", "val"):
+        files = session.sql(f"LIST {stage}/{split}/").collect()
+        if not files:
+            raise RuntimeError(f"No staged files found in {stage}/{split}/.")
 
 
 def _apply_nonlinear_cold_start_guard() -> None:
@@ -243,7 +388,7 @@ def _apply_nonlinear_cold_start_guard() -> None:
     Called when a nonlinear best_config has no pretrain_checkpoint_stage_path.
     This prevents silent cold-start of nonlinear final training; the intended flow is:
 
-        1. CALL run_pretrain_pipeline_nonlinear(...)  → pretrain_nonlinear_meta.pt
+        1. CALL run_pretrain_pipeline_nonlinear(...)  → pretrain_nonlinear_model.pt
         2. CALL run_hpo_pipeline(... , pretrain_checkpoint_stage_path=...)  → best_config.json
         3. CALL run_model_training(...)
 
@@ -285,16 +430,24 @@ def _run_model_training_impl(
     _validate_training_index(session, training_data_family)
 
     # Pretrain load policy: architecture sweep allows cold-start on mismatch
-    # (d_phi/n_sab_feat may differ from pretrain checkpoint); ridge_residual
+    # (d_phi/n_sab_feat may differ from pretrain checkpoint); linear_model
     # requires exact match because gate-specific checkpoints are built to match.
-    hpo_sweep_mode = best_config.get("hpo_sweep_mode", "ridge_residual")
+    hpo_sweep_mode = _canonical_hpo_sweep_mode(best_config.get("hpo_sweep_mode", "linear_model"))
     is_nonlinear_config = bool(best_config.get("use_latent_ridge_expert", False)) or (
         str(hpo_sweep_mode).startswith("nonlinear_")
     )
     pretrain_policy = (
-        "allow_cold_start_on_arch_mismatch"
-        if hpo_sweep_mode in ("architecture", "nonlinear_meta", "nonlinear_architecture")
-        else "require_match"
+        "load_compatible_backbone"
+        if get_training_data_spec(training_data_family).is_classification
+        else (
+            "allow_cold_start_on_arch_mismatch"
+            if hpo_sweep_mode in (
+            "linear_model_architecture",
+            "nonlinear_model",
+            "nonlinear_model_architecture",
+            )
+            else "require_match"
+        )
     )
 
     # Resolve pretrain checkpoint (strict — no cold-start, no legacy pretrain.pt fallback):
@@ -314,6 +467,8 @@ def _run_model_training_impl(
         )
 
     pretrain_checkpoint_path = ""
+    _spec = get_training_data_spec(training_data_family)
+    is_classification = _spec.is_classification
     if _meta_ckpt:
         _ckpt_filename = _meta_ckpt.rsplit("/", 1)[-1]
         if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", _ckpt_filename):
@@ -332,7 +487,11 @@ def _run_model_training_impl(
     elif is_nonlinear_config:
         _apply_nonlinear_cold_start_guard()
     else:
-        _gate_ckpt_name = f"pretrain_gate{gate_dim}.pt"
+        _gate_ckpt_name = (
+            f"pretrain_classification_gate{gate_dim}.pt"
+            if is_classification
+            else f"pretrain_gate{gate_dim}.pt"
+        )
         _gate_ckpt_path = f"{MODEL_STAGE}/checkpoints/{_gate_ckpt_name}"
         if not _stage_file_exists(session, f"{MODEL_STAGE}/checkpoints/", _gate_ckpt_name):
             raise FileNotFoundError(
@@ -350,17 +509,25 @@ def _run_model_training_impl(
         )
 
     env_vars = {
-        "BEST_CONFIG":               json.dumps(best_config),
-        "TRAIN_NUM_NODES":           str(TRAIN_NUM_NODES),
-        "CHECKPOINT_OUTPUT_NAME":    "best.pt",
-        "HOME":                      "/tmp",
-        "EXPECTED_TRAIN_WORLD_SIZE": str(TRAIN_NUM_NODES * 4),   # 10 × 4 = 40
-        "STRICT_WORLD_SIZE_CHECK":   "true",
-        "MODEL_FAMILY":               model_family,
-        "TRAINING_DATA_FAMILY":       training_data_family,
-        "MODEL_DESIGN_PATTERN":      model_design_pattern,
-        "PRETRAIN_LOAD_POLICY":      pretrain_policy,
-        "PRETRAIN_CHECKPOINT_PATH":  pretrain_checkpoint_path,
+        "BEST_CONFIG":                           json.dumps(best_config),
+        "TRAIN_NUM_NODES":                       str(TRAIN_NUM_NODES),
+        "CHECKPOINT_OUTPUT_NAME":                (
+            "best_classification.pt" if is_classification else "best_regression.pt"
+        ),
+        "HOME":                                  "/tmp",
+        "EXPECTED_TRAIN_WORLD_SIZE":             str(TRAIN_NUM_NODES * 4),   # 10 × 4 = 40
+        "STRICT_WORLD_SIZE_CHECK":               "true",
+        "MODEL_FAMILY":                          model_family,
+        "TRAINING_DATA_FAMILY":                  training_data_family,
+        "MODEL_DESIGN_PATTERN":                  model_design_pattern,
+        "PRETRAIN_LOAD_POLICY":                  pretrain_policy,
+        "PRETRAIN_CHECKPOINT_PATH":              pretrain_checkpoint_path,
+        "META_DATASET_EXPECTED_TOTAL":                           str(_LINEAR_EXPECTED_TOTAL),
+        "META_NONLINEAR_DATASET_EXPECTED_TOTAL":                str(_NONLINEAR_EXPECTED_TOTAL),
+        "META_CLASSIFICATION_DATASET_EXPECTED_TOTAL":           str(_CLASSIFICATION_EXPECTED_TOTAL),
+        "META_NONLINEAR_CLASSIFICATION_DATASET_EXPECTED_TOTAL": str(_NONLINEAR_CLASSIFICATION_EXPECTED_TOTAL),
+        "META_NONLINEAR_MIXED_REGRESSION_DATASET_EXPECTED_TOTAL": str(_NONLINEAR_MIXED_REGRESSION_EXPECTED_TOTAL),
+        "META_NONLINEAR_MIXED_CLASSIFICATION_DATASET_EXPECTED_TOTAL": str(_NONLINEAR_MIXED_CLASSIFICATION_EXPECTED_TOTAL),
     }
     # Topology preflight: EXPECTED_TRAIN_WORLD_SIZE must equal TRAIN_NUM_NODES × 4.
     _expected_ws = int(env_vars["EXPECTED_TRAIN_WORLD_SIZE"])

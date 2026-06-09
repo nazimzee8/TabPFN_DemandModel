@@ -18,7 +18,7 @@
 
 | Stage | Contents |
 |---|---|
-| `@META_DATASET_STAGE` | train/val/test parquet + kaggle/*.npz |
+| `@META_REGRESSION_DATASET_STAGE` | numeric/ + mixed/ subdirs ({train,val,test}/) + kaggle/*.npz |
 | `@MODEL_STAGE/scripts/` | all src/*.py + scripts/*.py |
 | `@MODEL_STAGE/hpo/` | best_config.json, hpo_failure.json |
 | `@MODEL_STAGE/checkpoints/` | best.pt |

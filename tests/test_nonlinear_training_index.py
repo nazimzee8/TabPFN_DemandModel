@@ -42,22 +42,22 @@ class TestResolveIndexTableAndStage:
         """TRAINING_DATA_FAMILY=synthetic_regression_nonlinear routes to nonlinear names."""
         monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
         index_table, stage = self.mod._resolve_index_table_and_stage()
-        assert index_table == "META_NONLINEAR_DATASET_INDEX"
-        assert stage == "@META_NONLINEAR_DATASET_STAGE"
+        assert index_table == "META_NONLINEAR_REGRESSION_DATASET_INDEX"
+        assert stage == "@META_NONLINEAR_REGRESSION_DATASET_STAGE"
 
     def test_linear_family_routes_to_meta_dataset_index(self, monkeypatch):
         """TRAINING_DATA_FAMILY=synthetic_regression_combined routes to the linear names."""
         monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_combined")
         index_table, stage = self.mod._resolve_index_table_and_stage()
-        assert index_table == "META_DATASET_INDEX"
-        assert stage == "@META_DATASET_STAGE"
+        assert index_table == "META_REGRESSION_DATASET_INDEX"
+        assert stage == "@META_REGRESSION_DATASET_STAGE"
 
     def test_unset_family_routes_to_meta_dataset_index(self, monkeypatch):
         """Unset TRAINING_DATA_FAMILY defaults to the linear index and stage."""
         monkeypatch.delenv("TRAINING_DATA_FAMILY", raising=False)
         index_table, stage = self.mod._resolve_index_table_and_stage()
-        assert index_table == "META_DATASET_INDEX"
-        assert stage == "@META_DATASET_STAGE"
+        assert index_table == "META_REGRESSION_DATASET_INDEX"
+        assert stage == "@META_REGRESSION_DATASET_STAGE"
 
     def test_explicit_arg_overrides_env(self, monkeypatch):
         """Explicit training_data_family argument takes precedence over env var."""
@@ -65,11 +65,11 @@ class TestResolveIndexTableAndStage:
         index_table, stage = self.mod._resolve_index_table_and_stage(
             "synthetic_regression_nonlinear"
         )
-        assert index_table == "META_NONLINEAR_DATASET_INDEX"
-        assert stage == "@META_NONLINEAR_DATASET_STAGE"
+        assert index_table == "META_NONLINEAR_REGRESSION_DATASET_INDEX"
+        assert stage == "@META_NONLINEAR_REGRESSION_DATASET_STAGE"
 
     def test_snowflake_io_sql_uses_nonlinear_index_when_env_set(self, monkeypatch):
-        """select_meta_dataset_index_rows builds SQL with META_NONLINEAR_DATASET_INDEX when env set."""
+        """select_meta_dataset_index_rows builds SQL with META_NONLINEAR_REGRESSION_DATASET_INDEX when env set."""
         monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
 
         # Capture the SQL that would be sent to Snowflake
@@ -93,15 +93,15 @@ class TestResolveIndexTableAndStage:
                 pass  # empty result handling may raise; we only care about SQL
 
         assert captured_sql, "No SQL was captured"
-        assert any("META_NONLINEAR_DATASET_INDEX" in sql for sql in captured_sql), (
-            f"Expected META_NONLINEAR_DATASET_INDEX in SQL, got: {captured_sql}"
+        assert any("META_NONLINEAR_REGRESSION_DATASET_INDEX" in sql for sql in captured_sql), (
+            f"Expected META_NONLINEAR_REGRESSION_DATASET_INDEX in SQL, got: {captured_sql}"
         )
         assert not any("META_DATASET_INDEX" == sql.strip() for sql in captured_sql), (
-            "SQL must reference META_NONLINEAR_DATASET_INDEX, not META_DATASET_INDEX"
+            "SQL must reference META_NONLINEAR_REGRESSION_DATASET_INDEX, not META_DATASET_INDEX"
         )
 
     def test_rank_sharded_training_sql_uses_nonlinear_index_when_env_set(self, monkeypatch):
-        """DDP rank sharding must query META_NONLINEAR_DATASET_INDEX for nonlinear training."""
+        """DDP rank sharding must query META_NONLINEAR_REGRESSION_DATASET_INDEX for nonlinear training."""
         monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
         captured_sql = []
 
@@ -125,24 +125,24 @@ class TestResolveIndexTableAndStage:
 
         assert rows[0]["stage_path"] == "train/sample.parquet"
         assert captured_sql, "No SQL was captured"
-        assert any("FROM META_NONLINEAR_DATASET_INDEX" in sql for sql in captured_sql), (
+        assert any("FROM META_NONLINEAR_REGRESSION_DATASET_INDEX" in sql for sql in captured_sql), (
             f"Expected rank-sharded SQL to query nonlinear index, got: {captured_sql}"
         )
 
     def test_stage_file_path_uses_nonlinear_stage_when_env_set(self, monkeypatch):
-        """Materialization must download nonlinear rows from @META_NONLINEAR_DATASET_STAGE."""
+        """Materialization must download nonlinear rows from @META_NONLINEAR_REGRESSION_DATASET_STAGE."""
         monkeypatch.setenv("TRAINING_DATA_FAMILY", "synthetic_regression_nonlinear")
 
         assert (
             self.mod._stage_file_path("train/sample.parquet", split="train")
-            == "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet"
+            == "@META_NONLINEAR_REGRESSION_DATASET_STAGE/train/sample.parquet"
         )
         assert (
             self.mod._stage_file_path(
-                "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet",
+                "@META_NONLINEAR_REGRESSION_DATASET_STAGE/train/sample.parquet",
                 split="train",
             )
-            == "@META_NONLINEAR_DATASET_STAGE/train/sample.parquet"
+            == "@META_NONLINEAR_REGRESSION_DATASET_STAGE/train/sample.parquet"
         )
 
 
@@ -153,49 +153,49 @@ class TestResolveIndexTableAndStage:
 class TestNonlinearIndexDDL:
 
     def test_nonlinear_index_ddl_in_run_training_job_sql(self):
-        """META_NONLINEAR_DATASET_INDEX DDL must be present in sql/run_training_job.sql."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """META_NONLINEAR_REGRESSION_DATASET_INDEX DDL must be present in sql/synthetic_nonlinear_pipeline.sql."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
-        assert "META_NONLINEAR_DATASET_INDEX" in text, (
-            "META_NONLINEAR_DATASET_INDEX DDL not found in sql/run_training_job.sql"
+        assert "META_NONLINEAR_REGRESSION_DATASET_INDEX" in text, (
+            "META_NONLINEAR_REGRESSION_DATASET_INDEX DDL not found in sql/synthetic_nonlinear_pipeline.sql"
         )
         # Must be a CREATE TABLE statement, not just a comment
-        assert "CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_DATASET_INDEX" in text, (
-            "Expected CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_DATASET_INDEX"
+        assert "CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_REGRESSION_DATASET_INDEX" in text, (
+            "Expected CREATE TRANSIENT TABLE IF NOT EXISTS META_NONLINEAR_REGRESSION_DATASET_INDEX"
         )
 
     def test_nonlinear_index_has_correct_columns(self):
-        """META_NONLINEAR_DATASET_INDEX DDL must include all required columns."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """META_NONLINEAR_REGRESSION_DATASET_INDEX DDL must include all required columns."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
         required_columns = ("split", "task_id", "stage_path", "n", "p", "n_train",
                             "n_test", "prior_regime", "hpo_bucket")
         for col in required_columns:
             assert col in text, (
-                f"Column {col!r} not found in META_NONLINEAR_DATASET_INDEX DDL"
+                f"Column {col!r} not found in META_NONLINEAR_REGRESSION_DATASET_INDEX DDL"
             )
 
     def test_nonlinear_stage_ddl_in_stages_sql(self):
-        """META_NONLINEAR_DATASET_STAGE must be created in sql/run_training_job.sql."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """META_NONLINEAR_REGRESSION_DATASET_STAGE must be created in sql/synthetic_nonlinear_pipeline.sql."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
-        assert "META_NONLINEAR_DATASET_STAGE" in text, (
-            "META_NONLINEAR_DATASET_STAGE not found in sql/run_training_job.sql"
+        assert "META_NONLINEAR_REGRESSION_DATASET_STAGE" in text, (
+            "META_NONLINEAR_REGRESSION_DATASET_STAGE not found in sql/synthetic_nonlinear_pipeline.sql"
         )
-        assert "CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE" in text, (
-            "Expected CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE"
+        assert "CREATE STAGE IF NOT EXISTS META_NONLINEAR_REGRESSION_DATASET_STAGE" in text, (
+            "Expected CREATE STAGE IF NOT EXISTS META_NONLINEAR_REGRESSION_DATASET_STAGE"
         )
 
     def test_nonlinear_stage_has_sse_encryption(self):
-        """META_NONLINEAR_DATASET_STAGE must use SNOWFLAKE_SSE encryption."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """META_NONLINEAR_REGRESSION_DATASET_STAGE must use SNOWFLAKE_SSE encryption."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
-        create_key = "CREATE STAGE IF NOT EXISTS META_NONLINEAR_DATASET_STAGE"
+        create_key = "CREATE STAGE IF NOT EXISTS META_NONLINEAR_REGRESSION_DATASET_STAGE"
         idx = text.find(create_key)
         assert idx != -1, f"{create_key!r} not found in run_training_job.sql"
         snippet = text[idx : idx + 200]
         assert "SNOWFLAKE_SSE" in snippet, (
-            "META_NONLINEAR_DATASET_STAGE must use ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')"
+            "META_NONLINEAR_REGRESSION_DATASET_STAGE must use ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')"
         )
 
 
@@ -217,11 +217,11 @@ class TestBuildMetaNonlinearScript:
         """build_meta_nonlinear_dataset_index.py must reference nonlinear stage/index."""
         script = ROOT / "src" / "build_meta_nonlinear_dataset_index.py"
         text = script.read_text()
-        assert "META_NONLINEAR_DATASET_STAGE" in text, (
-            "build_meta_nonlinear_dataset_index.py must reference @META_NONLINEAR_DATASET_STAGE"
+        assert "META_NONLINEAR_REGRESSION_DATASET_STAGE" in text, (
+            "build_meta_nonlinear_dataset_index.py must reference @META_NONLINEAR_REGRESSION_DATASET_STAGE"
         )
-        assert "META_NONLINEAR_DATASET_INDEX" in text, (
-            "build_meta_nonlinear_dataset_index.py must reference META_NONLINEAR_DATASET_INDEX"
+        assert "META_NONLINEAR_REGRESSION_DATASET_INDEX" in text, (
+            "build_meta_nonlinear_dataset_index.py must reference META_NONLINEAR_REGRESSION_DATASET_INDEX"
         )
 
     def test_build_meta_nonlinear_script_has_correct_counts(self):
@@ -260,27 +260,27 @@ class TestBuildMetaNonlinearScript:
 class TestNonlinearPretrain:
 
     def test_nonlinear_pretrain_procedure_in_sql(self):
-        """sql/run_training_job.sql must define run_pretrain_pipeline_nonlinear."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """sql/synthetic_nonlinear_pipeline.sql must define run_pretrain_pipeline_nonlinear."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
         assert "run_pretrain_pipeline_nonlinear" in text, (
             "run_pretrain_pipeline_nonlinear procedure not found in "
-            "sql/run_training_job.sql"
+            "sql/synthetic_nonlinear_pipeline.sql"
         )
         assert "build_meta_nonlinear_dataset_index" in text, (
             "build_meta_nonlinear_dataset_index procedure not found in "
-            "sql/run_training_job.sql"
+            "sql/synthetic_nonlinear_pipeline.sql"
         )
 
     def test_6arg_hpo_overload_in_sql(self):
-        """sql/run_training_job.sql must define 6-arg run_hpo_pipeline with HPO_PRETRAIN_CHECKPOINT_STAGE_PATH."""
-        sql_file = ROOT / "sql" / "run_training_job.sql"
+        """sql/synthetic_nonlinear_pipeline.sql must define 6-arg run_hpo_pipeline with HPO_PRETRAIN_CHECKPOINT_STAGE_PATH."""
+        sql_file = ROOT / "sql" / "synthetic_nonlinear_pipeline.sql"
         text = sql_file.read_text()
         assert "HPO_PRETRAIN_CHECKPOINT_STAGE_PATH" in text, (
-            "6-arg HPO procedure HPO_PRETRAIN_CHECKPOINT_STAGE_PATH not found in sql/run_training_job.sql"
+            "6-arg HPO procedure HPO_PRETRAIN_CHECKPOINT_STAGE_PATH not found in sql/synthetic_nonlinear_pipeline.sql"
         )
         assert "run_hpo_pipeline_model_sweep_with_baseline_and_pretrain" in text, (
-            "Handler run_hpo_pipeline_model_sweep_with_baseline_and_pretrain not found in sql/run_training_job.sql"
+            "Handler run_hpo_pipeline_model_sweep_with_baseline_and_pretrain not found in sql/synthetic_nonlinear_pipeline.sql"
         )
 
 
@@ -366,7 +366,7 @@ class TestRunTrainingJobFamilyRouting:
             mod.run_pipeline()
         msg = str(exc_info.value)
         assert "run_pretrain_pipeline_nonlinear" in msg
-        assert "nonlinear_meta" in msg
+        assert "nonlinear_model" in msg
         assert "run_model_training" in msg
 
     def test_run_pipeline_linear_family_passes_guard(self, monkeypatch):

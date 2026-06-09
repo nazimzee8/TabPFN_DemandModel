@@ -1,0 +1,5 @@
+model_name,expected_calibration_error
+LogisticRegression,0.09194100995956636
+MODEL-ICL-MC,0.059237537073797294
+RandomForestClassifier,0.05979859740119463
+RidgeClassifier,0.07341082708580193

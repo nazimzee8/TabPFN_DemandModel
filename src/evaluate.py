@@ -5,10 +5,10 @@ Evaluate a saved DeepSetICLModel checkpoint:
   1. Permutation-invariance tests (7 synthetic)
   2. Synthetic DGP evaluation: MODEL3-ICL vs OLS, stratified by regime (A/B/C/D)
   3. MC dropout noise assessment on synthetic DGP
-  4. Prepared OpenML + Kaggle regression benchmark: MODEL3-ICL-MC vs 9 baselines
+  4. Prepared OpenML + Kaggle regression benchmark: MODEL-ICL-MC vs 9 baselines
      (prepared manifest datasets, 10 reps, 90/10 split, <=10k samples, <=500 features, 95% CI)
      Datasets are prepared by prepare_benchmark_datasets.py before benchmark shards run.
-     Methods: MODEL3-ICL-MC, XGBoost, LightGBM, CatBoost, RandomForest,
+     Methods: MODEL-ICL-MC, XGBoost, LightGBM, CatBoost, RandomForest,
               KNN, LinearRegression, Ridge, SVR, MLP, AutoGluon
 
 Usage (inside container or locally):
@@ -165,7 +165,7 @@ BENCHMARK_DEEPSET_EMPTY_CACHE = _env_flag("BENCHMARK_DEEPSET_EMPTY_CACHE", "true
 EVAL_RESULTS_STAGE = os.environ.get("EVAL_RESULTS_STAGE", "@EVALUATION_RESULTS_STAGE")
 CHECKPOINT_STAGE = os.environ.get("CHECKPOINT_STAGE", "@MODEL_STAGE/checkpoints/")
 ALL_BENCHMARK_METHODS = [
-    "MODEL3-ICL-MC",
+    "MODEL-ICL-MC",
     "XGBoost",
     "LightGBM",
     "CatBoost",
@@ -200,7 +200,7 @@ BASELINE_METHOD_DEPS = {
     "MLP": ("sklearn",),
 }
 BENCHMARK_METHOD_DEPS = {
-    "MODEL3-ICL-MC": ("sklearn",),
+    "MODEL-ICL-MC": ("sklearn",),
     **BASELINE_METHOD_DEPS,
     "AutoGluon": ("sklearn",),
 }
@@ -258,11 +258,11 @@ BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES = int(
     os.environ.get("BENCHMARK_AUTOGLUON_MIN_TMP_FREE_BYTES", "5368709120")
 )
 BENCHMARK_PREPARED_STAGE = os.environ.get(
-    "BENCHMARK_PREPARED_STAGE", "@META_DATASET_STAGE/benchmark_prepared/"
+    "BENCHMARK_PREPARED_STAGE", "@META_REGRESSION_DATASET_STAGE/benchmark_prepared/"
 )
 BENCHMARK_MANIFEST_STAGE_PATH = os.environ.get(
     "BENCHMARK_MANIFEST_PATH",
-    "@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json",
+    "@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json",
 )
 BENCHMARK_DATASET_INDEX_TABLE = os.environ.get(
     "BENCHMARK_DATASET_INDEX_TABLE", "BENCHMARK_DATASET_INDEX"
@@ -1190,7 +1190,7 @@ def predict_deepset_bounded_context_ensemble(
     device=None,
 ):
     """
-    MODEL3-ICL-MC bounded-context benchmark prediction.
+    MODEL-ICL-MC bounded-context benchmark prediction.
 
     Deterministic train-only contexts each predict the same full processed test
     split; predictions are averaged once before metrics are computed.
@@ -2019,8 +2019,8 @@ def run_prepared_benchmark(
     """
     selected_methods = methods or ALL_BENCHMARK_METHODS
     validate_benchmark_dependencies(selected_methods)
-    if "MODEL3-ICL-MC" in selected_methods and model is None:
-        raise ValueError("MODEL3-ICL-MC benchmark requires a loaded model.")
+    if "MODEL-ICL-MC" in selected_methods and model is None:
+        raise ValueError("MODEL-ICL-MC benchmark requires a loaded model.")
 
     manifest = load_prepared_benchmark_manifest(manifest_stage_path)
     datasets_meta = manifest["datasets"]
@@ -2068,7 +2068,7 @@ def run_prepared_benchmark(
 
     deepset_device = (
         deepset_inference_device()
-        if "MODEL3-ICL-MC" in selected_methods
+        if "MODEL-ICL-MC" in selected_methods
         else None
     )
 
@@ -2116,7 +2116,7 @@ def run_prepared_benchmark(
                     processed_matrix_bytes,
                 )
 
-                if "MODEL3-ICL-MC" in selected_methods:
+                if "MODEL-ICL-MC" in selected_methods:
                     feature_cap = resolve_deepset_feature_cap(model)
                     deepset_feature_meta = {
                         "raw_features": raw_features,
@@ -2128,24 +2128,24 @@ def run_prepared_benchmark(
                     }
                     if cpu_skip_reason:
                         print(
-                            f"  [SKIP MODEL3-ICL-MC] {name}: {cpu_skip_reason}",
+                            f"  [SKIP MODEL-ICL-MC] {name}: {cpu_skip_reason}",
                             flush=True,
                         )
                         all_rows.append(skipped_benchmark_row(
                             nan_row,
-                            "MODEL3-ICL-MC",
+                            "MODEL-ICL-MC",
                             cpu_skip_reason,
                             **deepset_feature_meta,
                         ))
                     elif int(X_train_p.shape[0]) < int(BENCHMARK_DEEPSET_CONTEXT_ENSEMBLES):
                         print(
-                            f"  [FAIL MODEL3-ICL-MC] {name}: fewer train rows than "
+                            f"  [FAIL MODEL-ICL-MC] {name}: fewer train rows than "
                             "non-overlapping DeepSet contexts",
                             flush=True,
                         )
                         all_rows.append({
                             **nan_row,
-                            "method": "MODEL3-ICL-MC",
+                            "method": "MODEL-ICL-MC",
                             **deepset_feature_meta,
                         })
                     else:
@@ -2172,12 +2172,12 @@ def run_prepared_benchmark(
                                 deepset_feature_meta["estimated_gpu_inference_bytes"] = estimated_gpu_bytes
                             if gpu_skip_reason:
                                 print(
-                                    f"  [SKIP MODEL3-ICL-MC] {name}: {gpu_skip_reason}",
+                                    f"  [SKIP MODEL-ICL-MC] {name}: {gpu_skip_reason}",
                                     flush=True,
                                 )
                                 all_rows.append(skipped_benchmark_row(
                                     nan_row,
-                                    "MODEL3-ICL-MC",
+                                    "MODEL-ICL-MC",
                                     gpu_skip_reason,
                                     **deepset_feature_meta,
                                 ))
@@ -2197,23 +2197,23 @@ def run_prepared_benchmark(
                                 )
                                 m     = compute_metrics(y_test, preds)
                                 all_rows.append({"task_id": task_id, "name": name, "rep": seed,
-                                                  "source": source, "method": "MODEL3-ICL-MC",
+                                                  "source": source, "method": "MODEL-ICL-MC",
                                                   **m, **deepset_feature_meta})
                         except torch.cuda.OutOfMemoryError as exc:
                             if BENCHMARK_DEEPSET_EMPTY_CACHE and torch.cuda.is_available():
                                 torch.cuda.empty_cache()
-                            print(f"  [SKIP MODEL3-ICL-MC] {name}: cuda_oom: {exc}", flush=True)
+                            print(f"  [SKIP MODEL-ICL-MC] {name}: cuda_oom: {exc}", flush=True)
                             all_rows.append(skipped_benchmark_row(
                                 nan_row,
-                                "MODEL3-ICL-MC",
+                                "MODEL-ICL-MC",
                                 "cuda_oom",
                                 **deepset_feature_meta,
                             ))
                         except Exception as exc:
-                            print(f"  [FAIL MODEL3-ICL-MC] {name}: {exc}")
+                            print(f"  [FAIL MODEL-ICL-MC] {name}: {exc}")
                             all_rows.append({
                                 **nan_row,
-                                "method": "MODEL3-ICL-MC",
+                                "method": "MODEL-ICL-MC",
                                 **deepset_feature_meta,
                             })
 
@@ -2552,7 +2552,7 @@ def main():
 
         needs_model = (
             args.mode in ("full", "synthetic")
-            or "MODEL3-ICL-MC" in selected_methods
+            or "MODEL-ICL-MC" in selected_methods
         )
         model = load_model(args.model_path) if needs_model else None
 

@@ -224,18 +224,19 @@ def test_hpo_sweep_mode_constant_exists():
     """HPO_SWEEP_MODE constant exists on the hpo module."""
     assert hasattr(hpo, "HPO_SWEEP_MODE")
     assert hpo.HPO_SWEEP_MODE in {
-        "ridge_residual",
-        "architecture",
-        "nonlinear_meta",
+        "linear_model",
+        "linear_model_architecture",
+        "nonlinear_model",
+        "nonlinear_model_architecture",
     }
 
 
-def test_hpo_sweep_mode_defaults_to_ridge_residual(monkeypatch):
-    """HPO_SWEEP_MODE defaults to 'ridge_residual' when env var is not set."""
+def test_hpo_sweep_mode_defaults_to_linear_model(monkeypatch):
+    """HPO_SWEEP_MODE defaults to 'linear_model' when env var is not set."""
     import importlib
     monkeypatch.delenv("HPO_SWEEP_MODE", raising=False)
     importlib.reload(hpo)
-    assert hpo.HPO_SWEEP_MODE == "ridge_residual"
+    assert hpo.HPO_SWEEP_MODE == "linear_model"
     importlib.reload(hpo)
 
 
@@ -255,8 +256,8 @@ def test_build_hpo_search_space_exists():
     assert callable(hpo.build_hpo_search_space)
 
 
-def test_build_hpo_search_space_ridge_residual_keys(monkeypatch):
-    """build_hpo_search_space in ridge_residual mode returns expected keys."""
+def test_build_hpo_search_space_linear_model_keys(monkeypatch):
+    """build_hpo_search_space in linear_model mode returns expected keys."""
     import importlib
     pytest.importorskip("ray")
     import ray.tune as tune
@@ -274,12 +275,15 @@ def test_build_hpo_search_space_ridge_residual_keys(monkeypatch):
         "model_family", "model_design_pattern", "hpo_sweep_mode",
     }
     for key in required_keys:
-        assert key in space, f"Key {key!r} missing from ridge_residual search space"
+        assert key in space, f"Key {key!r} missing from linear_model search space"
 
-    assert space["d_phi"] == hpo.FIXED_D_PHI, "d_phi must be fixed in ridge_residual mode"
-    assert space["n_sab_feat"] == hpo.FIXED_N_SAB_FEAT, "n_sab_feat must be fixed in ridge_residual mode"
-    assert space["use_ridge_expert"] is True
-    assert space["hpo_sweep_mode"] == "ridge_residual"
+    assert space["d_phi"] == hpo.FIXED_D_PHI, "d_phi must be fixed in linear_model mode"
+    assert space["n_sab_feat"] == hpo.FIXED_N_SAB_FEAT, "n_sab_feat must be fixed in linear_model mode"
+    assert space["use_ridge_expert"] is False
+    assert space["use_linear_stats"] is True
+    assert space["use_coefficient_head"] is True
+    assert space["model_arch_version"] == "model4"
+    assert space["hpo_sweep_mode"] == "linear_model"
     importlib.reload(hpo)
 
 
@@ -289,7 +293,7 @@ def test_build_hpo_search_space_architecture_keys(monkeypatch):
     pytest.importorskip("ray")
     import ray.tune as tune
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "linear_model_architecture")
     importlib.reload(hpo)
 
     _baseline = {
@@ -304,7 +308,7 @@ def test_build_hpo_search_space_architecture_keys(monkeypatch):
     # Both must be tune distributions (not fixed ints) in architecture mode
     assert not isinstance(space["d_phi"], int), "d_phi must be a tune distribution in architecture mode"
     assert not isinstance(space["n_sab_feat"], int), "n_sab_feat must be a tune distribution in architecture mode"
-    assert space["hpo_sweep_mode"] == "architecture"
+    assert space["hpo_sweep_mode"] == "linear_model_architecture"
     # use_huber must be fixed from baseline (False here), not a tune distribution
     assert space["use_huber"] is False, "use_huber must be fixed from baseline in architecture mode"
     # lr must equal the baseline value (fixed float, not a tune distribution)
@@ -333,7 +337,7 @@ def test_best_config_includes_expanded_fields():
         "use_huber": False,
         "huber_delta": 1.0,
         "lambda_l1": 0.0,
-        "hpo_sweep_mode": "ridge_residual",
+        "hpo_sweep_mode": "linear_model",
     }
     MODEL_ARCH_VERSION = "model3"
     NUM_TRIALS = 20
@@ -356,7 +360,7 @@ def test_best_config_includes_expanded_fields():
         "model_family":         best_config_raw.get("model_family", hpo.MODEL_FAMILY),
         "model_arch_version":   MODEL_ARCH_VERSION,
         "model_design_pattern": best_config_raw.get("model_design_pattern", "inductive_forecasting"),
-        "hpo_sweep_mode":       best_config_raw.get("hpo_sweep_mode", "ridge_residual"),
+        "hpo_sweep_mode":       best_config_raw.get("hpo_sweep_mode", "linear_model"),
         "_meta": {
             "best_val_mse":               None,
             "num_trials":                 NUM_TRIALS,
@@ -372,7 +376,7 @@ def test_best_config_includes_expanded_fields():
     assert best_config["use_huber"] is False
     assert best_config["huber_delta"] == pytest.approx(1.0)
     assert best_config["lambda_l1"] == pytest.approx(0.0)
-    assert best_config["hpo_sweep_mode"] == "ridge_residual"
+    assert best_config["hpo_sweep_mode"] == "linear_model"
     assert best_config["_meta"]["pretrain_warm_start_policy"] == "fail_on_mismatch"
 
 
@@ -396,7 +400,7 @@ def test_arch_candidates_constants_exist():
 # ---------------------------------------------------------------------------
 
 def _make_baseline_config():
-    """Minimal ridge_residual best_config for architecture sweep tests."""
+    """Minimal linear_model best_config for architecture sweep tests."""
     return {
         "lr": 1e-3,
         "weight_decay": 5e-5,
@@ -413,8 +417,8 @@ def _make_baseline_config():
     }
 
 
-def test_ridge_residual_writes_sweep_specific_filename(monkeypatch):
-    """build_hpo_search_space result for ridge_residual mode has hpo_sweep_mode=='ridge_residual'."""
+def test_linear_model_writes_sweep_specific_filename(monkeypatch):
+    """build_hpo_search_space result for linear_model mode has hpo_sweep_mode=='linear_model'."""
     import importlib
     ray = pytest.importorskip("ray")
     import ray.tune as tune
@@ -423,7 +427,7 @@ def test_ridge_residual_writes_sweep_specific_filename(monkeypatch):
     importlib.reload(hpo)
 
     space = hpo.build_hpo_search_space(tune)
-    assert space["hpo_sweep_mode"] == "ridge_residual"
+    assert space["hpo_sweep_mode"] == "linear_model"
 
     monkeypatch.delenv("HPO_SWEEP_MODE", raising=False)
     importlib.reload(hpo)
@@ -435,7 +439,7 @@ def test_architecture_sweep_requires_baseline_config(monkeypatch):
     ray = pytest.importorskip("ray")
     import ray.tune as tune
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "linear_model_architecture")
     importlib.reload(hpo)
 
     with pytest.raises(ValueError, match="HPO_BASELINE_CONFIG_STAGE_PATH"):
@@ -451,7 +455,7 @@ def test_architecture_sweep_freezes_lr_from_baseline(monkeypatch):
     ray = pytest.importorskip("ray")
     import ray.tune as tune
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "linear_model_architecture")
     importlib.reload(hpo)
 
     baseline = _make_baseline_config()
@@ -470,7 +474,7 @@ def test_architecture_sweep_freezes_ridge_lambda_from_baseline(monkeypatch):
     ray = pytest.importorskip("ray")
     import ray.tune as tune
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "linear_model_architecture")
     importlib.reload(hpo)
 
     baseline = _make_baseline_config()
@@ -489,7 +493,7 @@ def test_merge_sweep_configs_produces_merged_from():
     arch_config = {
         "d_phi": 192,
         "n_sab_feat": 2,
-        "hpo_sweep_mode": "architecture",
+        "hpo_sweep_mode": "linear_model_architecture",
         "_meta": {
             "best_val_mse": 0.38,
             "pretrain_warm_start_policy": "allow_cold_start_on_arch_mismatch",
@@ -499,8 +503,8 @@ def test_merge_sweep_configs_produces_merged_from():
     assert "_meta" in merged
     assert "merged_from" in merged["_meta"]
     merged_from = merged["_meta"]["merged_from"]
-    assert any("best_config_ridge_residual.json" in p for p in merged_from)
-    assert any("best_config_architecture.json" in p for p in merged_from)
+    assert any("best_config_linear_model.json" in p for p in merged_from)
+    assert any("best_config_linear_model_architecture.json" in p for p in merged_from)
 
 
 def test_merge_sweep_configs_overrides_d_phi():
@@ -509,7 +513,7 @@ def test_merge_sweep_configs_overrides_d_phi():
     arch_config = {
         "d_phi": 192,
         "n_sab_feat": 2,
-        "hpo_sweep_mode": "architecture",
+        "hpo_sweep_mode": "linear_model_architecture",
         "_meta": {"best_val_mse": 0.38},
     }
     merged = hpo._merge_sweep_configs(baseline, arch_config)
@@ -522,7 +526,7 @@ def test_merge_sweep_configs_preserves_lr():
     arch_config = {
         "d_phi": 256,
         "n_sab_feat": 1,
-        "hpo_sweep_mode": "architecture",
+        "hpo_sweep_mode": "linear_model_architecture",
         "_meta": {"best_val_mse": 0.40},
     }
     merged = hpo._merge_sweep_configs(baseline, arch_config)
@@ -534,7 +538,7 @@ def test_architecture_cardinality_check_uses_candidates(monkeypatch):
     import importlib
     from unittest.mock import patch, MagicMock
 
-    monkeypatch.setenv("HPO_SWEEP_MODE", "architecture")
+    monkeypatch.setenv("HPO_SWEEP_MODE", "linear_model_architecture")
     importlib.reload(hpo)
 
     with patch.object(hpo, "cardinality_aware_candidates", wraps=hpo.cardinality_aware_candidates) as mock_cac, \
@@ -542,7 +546,7 @@ def test_architecture_cardinality_check_uses_candidates(monkeypatch):
         # Simulate the logic in main() for architecture mode
         max_p = 50
         max_n_train = 200
-        if hpo.HPO_SWEEP_MODE == "architecture":
+        if hpo.HPO_SWEEP_MODE == "linear_model_architecture":
             hpo.cardinality_aware_candidates(
                 "d_phi", hpo.ARCH_D_PHI_CANDIDATES, "max_p", max_p
             )
@@ -573,17 +577,13 @@ def test_gate_hidden_dim_candidates_constant_exists():
     assert set(hpo.GATE_HIDDEN_DIM_CANDIDATES) == {32, 64, 128}
 
 
-def test_gate_hidden_dim_candidates_matches_ridge_residual_search_space():
-    """GATE_HIDDEN_DIM_CANDIDATES matches the tune.choice([...]) values in ridge_residual mode."""
+def test_gate_hidden_dim_candidates_matches_linear_model_search_space():
+    """GATE_HIDDEN_DIM_CANDIDATES matches the tune.choice([...]) values in linear_model mode."""
     pytest.importorskip("ray")
     import ray.tune as tune
 
     space = hpo.build_hpo_search_space(tune)
-    gate_dist = space.get("gate_hidden_dim")
-    # gate_hidden_dim should be a tune distribution (not a fixed int)
-    assert not isinstance(gate_dist, int), (
-        "gate_hidden_dim must be a tune distribution in ridge_residual mode"
-    )
+    assert space.get("gate_hidden_dim") == 64
 
 
 def test_check_pretrain_checkpoints_function_exists():
@@ -640,7 +640,7 @@ def test_architecture_sweep_enabled_in_main():
 
     # Verify the NotImplementedError guard has been removed
     src = inspect.getsource(hpo.main)
-    assert "architecture" in src, "hpo.main() must reference 'architecture' mode"
+    assert "architecture" in src, "hpo.main() must reference 'linear_model_architecture' mode"
     # The NotImplementedError guard must be absent — architecture sweep is now supported
     # Check: if NotImplementedError appears, it must not be for the architecture guard
     if "NotImplementedError" in src:
@@ -648,3 +648,4 @@ def test_architecture_sweep_enabled_in_main():
         assert "architecture HPO sweep is disabled" not in src, (
             "hpo.main() must not have the old NotImplementedError guard for architecture mode"
         )
+

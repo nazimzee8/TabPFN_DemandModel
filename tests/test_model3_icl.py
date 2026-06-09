@@ -54,6 +54,9 @@ def _icl_cfg(n_blocks=2, d_model=64, dropout=0.0, use_ridge=False):
         norm_target=True,
         use_ridge_expert=use_ridge,
         gate_hidden_dim=32,
+        use_linear_stats=False,
+        use_coefficient_head=False,
+        use_lambda_head=False,
     )
 
 
