@@ -13,8 +13,14 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
+SRC_DATA = SRC / "data_generation"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+# Ensure the canonical data_generation subdir is ahead of src/ so that
+# bare `import generate_dgp` / `from dgp_helpers import` resolve to the
+# co-located copy after the stale src/*.py duplicates were removed.
+if str(SRC_DATA) not in sys.path:
+    sys.path.insert(0, str(SRC_DATA))
 
 import generate_dgp as generator  # noqa: E402
 from dgp_helpers import (  # noqa: E402

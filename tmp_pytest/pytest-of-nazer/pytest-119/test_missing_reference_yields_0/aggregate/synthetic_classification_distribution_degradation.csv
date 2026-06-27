@@ -1,2 +1,0 @@
-model_name,accuracy_id,log_loss_id,macro_f1_id
-MODEL-ICL-MC,0.7192240288529493,0.8096571807918103,0.48721890967692616

@@ -10,8 +10,8 @@ the details in each section.
 |---|---|---|---|
 | Pretrain | `train.py` | `CALL run_pretrain_pipeline()` | `@MODEL_STAGE/checkpoints/pretrain.pt` |
 | HPO | `hpo.py` | `CALL run_hpo_pipeline()` | `@MODEL_STAGE/hpo/best_config.json` |
-| Final training | `train.py` | `CALL run_model_training()` | `@MODEL_STAGE/checkpoints/best.pt` |
-| Benchmark prep | `prepare_benchmark_datasets.py` | `CALL prepare_benchmark_datasets()` | `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` |
+| Final training | `train.py` | `CALL run_model_training()` | `@MODEL_STAGE/checkpoints/best_regression.pt` (or `best_classification.pt` / `best_nonlinear_cls.pt`) |
+| Benchmark prep | `prepare_benchmark_datasets.py` | `CALL prepare_benchmark_datasets()` | `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` |
 | Evaluation | `evaluate.py` | `CALL run_evaluation_pipeline()` | `@EVALUATION_RESULTS_STAGE/model_comparison.csv` |
 | Full pipeline | Pretrain → HPO → Final | `CALL run_training_pipeline()` | same as above |
 
@@ -59,8 +59,8 @@ CALL run_evaluation_pipeline();   -- runs prep + shards + aggregate internally
 **Run benchmark prep manually (optional — run_evaluation_pipeline calls it automatically):**
 ```sql
 CALL prepare_benchmark_datasets();
-LIST @META_REGRESSION_DATASET_STAGE/benchmark_prepared/;
-SELECT $1 FROM @META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json (FILE_FORMAT => (TYPE=JSON));
+LIST @META_DATASET_STAGE/benchmark_prepared/;
+SELECT $1 FROM @META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json (FILE_FORMAT => (TYPE=JSON));
 CALL run_evaluation_pipeline();
 ```
 
@@ -72,7 +72,7 @@ CALL run_training_pipeline();
 **Kaggle data download (one-off setup):**
 ```sql
 CALL download_kaggle_to_stage();
-LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
+LIST @META_DATASET_STAGE/kaggle/;
 ```
 
 ---
@@ -91,7 +91,7 @@ LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 | Total DDP world_size | 40 (10 × 4) | derived |
 | num_trials | 40 | `src/hpo.py` |
 | epochs per trial | 30 | `src/hpo.py` |
-| `CHECKPOINT_OUTPUT_NAME` | `pretrain.pt` (Phase 1) or `best.pt` (Phase 3) | env_vars in `run_pretrain_job.py`, `run_training_job.py` |
+| `CHECKPOINT_OUTPUT_NAME` | `pretrain.pt` (Phase 1) or `best_regression.pt`/`best_classification.pt` (Phase 3) | env_vars in `run_pretrain_job.py`, `run_model_training_job.py` |
 | `PRETRAIN_CHECKPOINT_PATH` | `@MODEL_STAGE/checkpoints/pretrain.pt` | env_vars in `run_model_training_job.py`, `run_training_job.py` |
 | `EXPECTED_TRAIN_WORLD_SIZE` | `40` (TRAIN_NUM_NODES × 4) | `run_pretrain_job.py`, `run_model_training_job.py` |
 | `STRICT_WORLD_SIZE_CHECK` | `true` | `run_pretrain_job.py`, `run_model_training_job.py` |
@@ -102,14 +102,12 @@ LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
 
 | Stage | Contents |
 |---|---|
-| `@META_REGRESSION_DATASET_STAGE/train/` | Training parquet files |
-| `@META_REGRESSION_DATASET_STAGE/val/` | Validation parquet files |
-| `@META_REGRESSION_DATASET_STAGE/test/` | Test parquet files |
-| `@META_REGRESSION_DATASET_STAGE/kaggle/` | Kaggle .npz benchmark datasets |
-| `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/` | `benchmark_manifest.json` + prepared `.npz` files for all benchmark datasets |
+| `@META_DATASET_STAGE/{linear\|nonlinear}/{regression\|classification}/{numeric\|mixed}/{train,val,test}/` | Training parquet files (layout from `canonical_meta_subdir`) |
+| `@META_DATASET_STAGE/kaggle/` | Kaggle .npz benchmark datasets |
+| `@META_DATASET_STAGE/benchmark_prepared/` | `benchmark_manifest.json` + prepared `.npz` files for all benchmark datasets |
 | `@MODEL_STAGE/scripts/` | All `src/*.py` + `scripts/*.py` (job entrypoints) |
 | `@MODEL_STAGE/hpo/` | `best_config.json` (or `hpo_failure.json`) |
-| `@MODEL_STAGE/checkpoints/` | `best.pt` |
+| `@MODEL_STAGE/checkpoints/` | `best_regression.pt` / `best_classification.pt` / `best_nonlinear_cls.pt` |
 | `@EVALUATION_RESULTS_STAGE/synthetic/` | `test_report.csv`, `mc_report.csv` |
 | `@EVALUATION_RESULTS_STAGE/benchmark_parts/` | Per-method detailed CSVs |
 | `@EVALUATION_RESULTS_STAGE/` | `model_comparison.csv` (canonical output) |
@@ -218,7 +216,7 @@ GET @EVALUATION_RESULTS_STAGE 'file://C:/Documents/TabPFN_DemandModel/results/';
 |---|---|---|
 | `RuntimeError: 517003` | `scale_cluster()` called inside MLJob | Removed from `hpo.py`; never add it back. Set `target_instances` at submission time. |
 | `CUDA out of memory` | Batch too large or model too wide | Reduce `d_phi`/`d_rho`, lower `max_concurrent_trials` to 1, or switch to GPU_NV_L. |
-| `FileNotFoundError: DATA_DIR` | Stage materialization failed | Check for rank-sharded row errors. `LIST @META_REGRESSION_DATASET_STAGE/train/`. Verify `META_REGRESSION_DATASET_INDEX` is populated. |
+| `FileNotFoundError: DATA_DIR` | Stage materialization failed | Check for rank-sharded row errors. `LIST @META_DATASET_STAGE/linear/regression/numeric/train/`. Verify `META_REGRESSION_DATASET_INDEX` is populated. |
 | `RuntimeError: World-size mismatch: expected 40 but ... reports N` | `STRICT_WORLD_SIZE_CHECK=true` and actual world_size ≠ 40 | Verify `target_instances` in `submit_from_stage()` equals `num_nodes` in `PyTorchScalingConfig` (both must be 10). Check pool has all nodes healthy. |
 | `ValueError: RANK expected, but not set` | `submit_from_stage(target_instances=N)` without `PyTorchDistributor` does not set `RANK` | Use `BENCHMARK_NUM_SHARDS` + `BENCHMARK_SHARD_INDEX` for CPU benchmarks. |
 | `NameError: train_job` | `submit_from_stage(...)` result not assigned | Assign: `train_job = submit_from_stage(...)`. |

@@ -25,7 +25,7 @@ USE WAREHOUSE COMPUTE_WH;
 -- ------------------------------------------------------------------
 -- Section 2 — Stages (idempotent)
 -- ------------------------------------------------------------------
-CREATE STAGE IF NOT EXISTS META_REGRESSION_DATASET_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
+CREATE STAGE IF NOT EXISTS META_DATASET_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS MODEL_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS EVALUATION_RESULTS_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 CREATE STAGE IF NOT EXISTS MLJOB_PAYLOAD_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
@@ -34,18 +34,31 @@ CREATE STAGE IF NOT EXISTS EPOCH_STAGE  ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE');
 
 -- ------------------------------------------------------------------
 -- Section 3 — META_REGRESSION_DATASET_INDEX table
+-- 20-col schema must match sql/linear_regression_numeric_pipeline.sql and
+-- build_meta_dataset_index.py _write_index schema (enforced by DESCRIBE guard).
 -- ------------------------------------------------------------------
 DROP TABLE IF EXISTS META_REGRESSION_DATASET_INDEX;
 CREATE TRANSIENT TABLE META_REGRESSION_DATASET_INDEX (
-  split        STRING NOT NULL,
-  task_id      STRING NOT NULL,
-  stage_path   STRING NOT NULL,
-  n            NUMBER,
-  p            NUMBER,
-  n_train      NUMBER,
-  n_test       NUMBER,
-  prior_regime STRING,
-  hpo_bucket   NUMBER
+  split                    STRING NOT NULL,
+  task_id                  STRING NOT NULL,
+  stage_path               STRING NOT NULL,   -- linear/regression/numeric/{split}/{task_id}.parquet
+  n                        NUMBER,
+  p                        NUMBER,
+  n_train                  NUMBER,
+  n_test                   NUMBER,
+  prior_regime             STRING,
+  hpo_bucket               NUMBER,
+  p_signal                 NUMBER,
+  p_noise                  NUMBER,
+  p_total                  NUMBER,
+  active_s                 NUMBER,
+  sparsity_ratio           FLOAT,
+  covariance_type          STRING,
+  rho                      FLOAT,
+  target_noise_scale       FLOAT,
+  feature_noise_level      FLOAT,
+  has_noise_features       BOOLEAN,
+  has_feature_noise        BOOLEAN
 )
 DATA_RETENTION_TIME_IN_DAYS = 0
 CLUSTER BY (split, hpo_bucket, prior_regime, p, n_train);
@@ -64,20 +77,55 @@ PUT file://C:/Documents/TabPFN_DemandModel/src/*.py
     @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 PUT file://C:/Documents/TabPFN_DemandModel/scripts/*.py
     @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- scripts/ subdirectories
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/evaluation/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/generation/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/jobs/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/preparation/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/maintenance/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/probes/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/ray/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/scripts/ood_regression/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- src/ subdirectories
+PUT file://C:/Documents/TabPFN_DemandModel/src/model/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/dataset_index/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/evaluation/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/correctness/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/data_generation/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/epoch_calibration/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/src/snowflake_io/*.py
+    @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 
 
 -- ------------------------------------------------------------------
 -- Section 6 — Upload synthetic datasets
+-- Files must land under linear/regression/numeric/{split}/ so build_meta_dataset_index.py
+-- (which LISTs @META_DATASET_STAGE/linear/regression/numeric/{split}/) and
+-- snowflake_io.py (which materializes via canonical_meta_subdir()) can find them.
 -- ------------------------------------------------------------------
-REMOVE @META_REGRESSION_DATASET_STAGE/train/;
-REMOVE @META_REGRESSION_DATASET_STAGE/val/;
-REMOVE @META_REGRESSION_DATASET_STAGE/test/;
-PUT file://C:/Documents/TabPFN_DemandModel/data/train/*.parquet
-    @META_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/val/*.parquet
-    @META_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
-PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet
-    @META_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+REMOVE @META_DATASET_STAGE/linear/regression/numeric/train/;
+REMOVE @META_DATASET_STAGE/linear/regression/numeric/val/;
+REMOVE @META_DATASET_STAGE/linear/regression/numeric/test/;
+PUT file://C:/Documents/TabPFN_DemandModel/data/linear/regression/numeric/train/*.parquet
+    @META_DATASET_STAGE/linear/regression/numeric/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/linear/regression/numeric/val/*.parquet
+    @META_DATASET_STAGE/linear/regression/numeric/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+PUT file://C:/Documents/TabPFN_DemandModel/data/linear/regression/numeric/test/*.parquet
+    @META_DATASET_STAGE/linear/regression/numeric/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 
 
 -- ------------------------------------------------------------------
@@ -88,18 +136,18 @@ PUT file://C:/Documents/TabPFN_DemandModel/data/test/*.parquet
 --   a) Copy .npz files to data/kaggle/ and re-run preload.py, OR
 --   b) After running this script, call:
 --        CALL download_kaggle_to_stage();
---        LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
+--        LIST @META_DATASET_STAGE/kaggle/;
 --
--- REMOVE @META_REGRESSION_DATASET_STAGE/kaggle/;
+-- REMOVE @META_DATASET_STAGE/kaggle/;
 -- PUT file://C:/Documents/TabPFN_DemandModel/data/kaggle/*.npz
---     @META_REGRESSION_DATASET_STAGE/kaggle/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+--     @META_DATASET_STAGE/kaggle/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
 
 
 -- ------------------------------------------------------------------
 -- Section 8 — Stored procedures
 -- ------------------------------------------------------------------
 -- download_kaggle_to_stage() is a setup job that fetches Kaggle competition
--- data and uploads it to @META_REGRESSION_DATASET_STAGE/kaggle/. Run after scripts are
+-- data and uploads it to @META_DATASET_STAGE/kaggle/. Run after scripts are
 -- staged and before the first benchmark that needs Kaggle data.
 CREATE OR REPLACE PROCEDURE download_kaggle_to_stage()
   RETURNS STRING
@@ -109,7 +157,7 @@ CREATE OR REPLACE PROCEDURE download_kaggle_to_stage()
   IMPORTS = ('@MODEL_STAGE/scripts/run_training_job.py')
   HANDLER = 'run_training_job.run_kaggle_download';
 
--- build_meta_dataset_index() lists @META_REGRESSION_DATASET_STAGE/{train,val,test}/,
+-- build_meta_dataset_index() lists @META_DATASET_STAGE/linear/regression/numeric/{train,val,test}/,
 -- reads scalar parquet metadata, truncates/rebuilds META_REGRESSION_DATASET_INDEX,
 -- and validates 800/100/100 split counts.
 CREATE OR REPLACE PROCEDURE build_meta_dataset_index()
@@ -185,10 +233,10 @@ CREATE OR REPLACE PROCEDURE run_train_epoch_test()
   HANDLER = 'run_epoch_tests.run_train_epoch_test';
 
 -- prepare_benchmark_datasets() fetches OpenML/Kaggle benchmark datasets once,
--- stages them to @META_REGRESSION_DATASET_STAGE/benchmark_prepared/, and writes
+-- stages them to @META_DATASET_STAGE/benchmark_prepared/, and writes
 -- benchmark_manifest.json. Run before run_evaluation_pipeline(), or let
 -- run_evaluation_pipeline() call it automatically.
--- @META_REGRESSION_DATASET_STAGE/benchmark_prepared/ is created by this procedure.
+-- @META_DATASET_STAGE/benchmark_prepared/ is created by this procedure.
 -- It contains benchmark_manifest.json and prepared .npz files for all benchmark datasets.
 -- Benchmark shard jobs read from this prefix; they do not call OpenML directly.
 -- To rebuild: set BENCHMARK_FORCE_REBUILD=true env var before calling this procedure.
@@ -329,7 +377,7 @@ CREATE OR REPLACE PROCEDURE run_evaluation_aggregation(
 
 
 -- ------------------------------------------------------------------
--- Section 9 — Rebuild META_REGRESSION_DATASET_INDEX
+-- Section 9 — Rebuild META_REGRESSION_DATASET_INDEX (reads from @META_DATASET_STAGE/linear/regression/numeric/)
 -- ------------------------------------------------------------------
 -- Requires staged parquet (Section 6) to already be uploaded.
 CALL build_meta_dataset_index();
@@ -339,9 +387,9 @@ CALL build_meta_dataset_index();
 -- Section 10 — Verification
 -- ------------------------------------------------------------------
 LIST @MODEL_STAGE/scripts/ PATTERN='.*[.]py';
-LIST @META_REGRESSION_DATASET_STAGE/train/ PATTERN='.*[.]parquet';
-LIST @META_REGRESSION_DATASET_STAGE/val/   PATTERN='.*[.]parquet';
-LIST @META_REGRESSION_DATASET_STAGE/test/  PATTERN='.*[.]parquet';
+LIST @META_DATASET_STAGE/linear/regression/numeric/train/ PATTERN='.*[.]parquet';
+LIST @META_DATASET_STAGE/linear/regression/numeric/val/   PATTERN='.*[.]parquet';
+LIST @META_DATASET_STAGE/linear/regression/numeric/test/  PATTERN='.*[.]parquet';
 SELECT split, COUNT(*) AS task_count
 FROM META_REGRESSION_DATASET_INDEX
 GROUP BY split

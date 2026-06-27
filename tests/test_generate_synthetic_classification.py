@@ -23,8 +23,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "generate_synthetic_classification.py"
 SRC = ROOT / "src"
+SRC_DATA = SRC / "data_generation"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+# Ensure the canonical data_generation subdir is ahead of src/ so that
+# bare `from dgp_helpers import` resolves to the co-located copy after
+# the stale src/*.py duplicates were removed.
+if str(SRC_DATA) not in sys.path:
+    sys.path.insert(0, str(SRC_DATA))
 
 from dgp_helpers import _REGRESSION_ONLY_FIELDS  # noqa: E402
 

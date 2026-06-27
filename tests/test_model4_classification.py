@@ -173,7 +173,7 @@ def test_training_data_family_routes_classification_explicitly():
     spec = get_training_data_spec("synthetic_linear_classification")
     assert spec.task_objective == "inductive_classification"
     assert spec.index_table == "META_CLASSIFICATION_DATASET_INDEX"
-    assert spec.stage == "@META_CLASSIFICATION_DATASET_STAGE"
+    assert spec.stage == "@META_DATASET_STAGE"
     assert spec.hpo_metric == "val_cross_entropy"
 
 

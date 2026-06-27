@@ -13,7 +13,7 @@ Do not delete or rename this file.
 | `skills/linear-evaluation-pipeline/SKILL.md` | Before implementing any change to the **linear evaluation pipeline**: eval-suite prep (`prepare_synthetic_regression.py`, `prepare_synthetic_classification.py`), evaluation scripts (`evaluate_linear_regression.py`, `evaluate_linear_classification.py`), or linear evaluation orchestration procedures. Cross-ref `nonlinear-evaluation-pipeline` for the nonlinear fork. |
 | `skills/nonlinear-synthetic-data/SKILL.md` | Before implementing any change to the **nonlinear training pipeline**: `generate_nonlinear_dgp.py` (4 families via `main_nonlinear_training()`), nonlinear eval generators (`generate_nonlinear_regression.py`, `generate_nonlinear_classification.py`), or nonlinear index tables (`META_NONLINEAR_*`). |
 | `skills/nonlinear-evaluation-pipeline/SKILL.md` | Before implementing any change to the **nonlinear evaluation pipeline**: nonlinear prep scripts (`prepare_nonlinear_regression.py`, `prepare_nonlinear_classification.py`), evaluation forks (`evaluate_nonlinear_regression.py`, `evaluate_nonlinear_classification.py`), or nonlinear orchestrators (`run_nonlinear_regression_evaluation.py`, `run_nonlinear_classification_evaluation.py`). |
-| `skills/machine-learning-pipeline/SKILL.md` | Before implementing any change to the **ML model, training loop, HPO, or checkpoint management**: `src/model.py`, `src/train.py`, `src/hpo.py`, checkpoint format, `val_mse` / `val_cross_entropy` HPO metrics. |
+| `skills/machine-learning-pipeline/SKILL.md` | Before implementing any change to the **ML model, training loop, HPO, or checkpoint management**: `src/model/model.py`, `src/model/train.py`, `src/model/hpo.py`, checkpoint format, `val_mse` / `val_cross_entropy` HPO metrics. |
 
 ---
 
@@ -39,7 +39,7 @@ src/                    Core Python modules (model, train, evaluate, snowflake_i
 scripts/                MLJob submission scripts and orchestration procedures
 scripts/ood_regression/ OOD data generation and indexing scripts (staged flat to @MODEL_STAGE/scripts/)
 tests/                  pytest test suite (mocks Snowflake; no live connections)
-docs/                   Reference documentation (Snowflake_Training.md, regression_evaluation.md)
+docs/                   Reference documentation (regression_evaluation.md, MODEL5_LBACNP.md, MODEL_REVISION.md, cursor_dataset_generation.md, CUDA_GRAPHS.md)
 sql/                    SQL DDL, training job SQL, result retrieval helpers
 data/                   Local output of generate_synthetic_regression.py and generate_ood_eval_data.py
 results/                Local downloaded evaluation artifacts
@@ -51,7 +51,7 @@ results/                Local downloaded evaluation artifacts
 
 - **Python 3.11** — Snowflake managed runtime image `2.5.0-py311`
 - **Snowflake Snowpark + SPCS MLJob API** — `submit_from_stage`, `PyTorchDistributor`
-- **PyTorch** — MODEL3-ICL model; checkpoint v4 format
+- **PyTorch** — MODEL4-ICL model (default `model_arch_version="model4"`); checkpoint format versions 4–8 by family
 - **Ray Tune** — HPO: 20 trials, 5 nodes, 4 concurrent/node (= 20 one-GPU trial slots)
 - **scikit-learn, XGBoost, LightGBM** — preinstalled in `2.5.0-py311`
 - **CatBoost `1.2.10`** — NOT preinstalled; pip-installed per baseline shard job via `TABPFN_PYPI_EAI`
@@ -62,7 +62,7 @@ results/                Local downloaded evaluation artifacts
 
 | Pool | Nodes | GPU | Purpose |
 |------|-------|-----|---------|
-| `DEEPSET_GPU_POOL` | MAX=10, GPU_NV_M | 4×A10G/node | Training, HPO, MODEL3-ICL eval shards |
+| `DEEPSET_GPU_POOL` | MAX=10, GPU_NV_M | 4×A10G/node | Training, HPO, MODEL4-ICL eval shards |
 | `DEEPSET_CPU_POOL` | MAX=6, CPU_X64_M | — | Prep, baseline shards (6), aggregation |
 | `AUTOGLUON_CPU_POOL` | MAX=6, CPU_X64_M | — | AutoGluon cluster shards (6×4 workers, `ray_work_items` mode) |
 
@@ -76,9 +76,7 @@ results/                Local downloaded evaluation artifacts
 
 | Stage | Contents |
 |-------|----------|
-| `@META_REGRESSION_DATASET_STAGE` | Benchmark metadata index + prepared `.npz` splits (`benchmark_prepared/`) |
-| `@META_NONLINEAR_REGRESSION_DATASET_STAGE` | Nonlinear regression training parquet |
-| `@META_CLASSIFICATION_DATASET_STAGE` | Linear classification training parquet |
+| `@META_DATASET_STAGE` | All training parquet datasets — layout `{linear\|nonlinear}/{regression\|classification}/{numeric\|mixed}/{train,val,test}/`; also `kaggle/` and `benchmark_prepared/`. Python constant `META_DATASET_STAGE = "@META_DATASET_STAGE"` in `src/model/constants.py`. |
 | `@MODEL_STAGE/scripts/` | All runnable MLJob code from `src/*.py` and `scripts/*.py` (flat, no subdirectories) |
 | `@MODEL_STAGE/hpo/` | `best_config_linear_model.json` (sweep 1), `best_config_linear_model_architecture.json` (sweep 2), `best_config.json` (merged final); `hpo_failure.json` on failure |
 | `@MODEL_STAGE/checkpoints/` | `pretrain_gate32.pt`, `pretrain_gate64.pt`, `pretrain_gate128.pt` (one per gate candidate), `best_regression.pt` (v4 format) |
@@ -99,7 +97,7 @@ results/                Local downloaded evaluation artifacts
 - Never embed suite IDs, version strings, or method names in stage subdirectory paths (exception:
   `{suite_id}` in `SYNREG_RESULTS_STAGE`, which is an env var value, not a hardcoded string).
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands — causes silent read failures.
-- `@META_REGRESSION_DATASET_STAGE` must never be read or written by any OOD script.
+- `@META_DATASET_STAGE` must never be read or written by any OOD script.
 - `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
 ---
@@ -108,7 +106,7 @@ results/                Local downloaded evaluation artifacts
 
 ### Step 1 — Metadata index (`build_meta_dataset_index.py`)
 
-- Reads Kaggle/OpenML parquet files from `@META_REGRESSION_DATASET_STAGE`
+- Reads Kaggle/OpenML parquet files from `@META_DATASET_STAGE`
 - Validates split counts: `train=800`, `val=100`, `test=100`
 - Writes `META_REGRESSION_DATASET_INDEX` Snowflake table
 - Rebuild with `CALL build_meta_dataset_index();` whenever training parquet is restaged
@@ -116,7 +114,7 @@ results/                Local downloaded evaluation artifacts
 ### Step 2 — Benchmark preparation (`prepare_benchmark_datasets.py`)
 
 - Reads `META_REGRESSION_DATASET_INDEX`; fetches raw OpenML/Kaggle datasets
-- Normalises features, writes `.npz` splits to `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/`
+- Normalises features, writes `.npz` splits to `@META_DATASET_STAGE/benchmark_prepared/`
 - Writes `benchmark_manifest.json`; idempotent (skips if valid manifest present)
 - Use `BENCHMARK_FORCE_REBUILD=true` to force a full reprepare
 
@@ -202,7 +200,7 @@ See `MODEL4.md` for the normative specification.
 - **Output**: mean prediction across 5×8=40 forward passes
 - Selection is train-only: fit on `(X_train, y_train)`, applied to both train and holdout
 - Baselines and AutoGluon receive full un-capped feature matrices
-- Reference: `src/model.py`, `scripts/evaluate_linear_regression.py`
+- Reference: `src/model/model.py`, `scripts/evaluation/evaluate_linear_regression.py`
 
 **MODEL4 architecture (new default, `model_arch_version="model4"`):**
 
@@ -262,16 +260,22 @@ Three-phase pipeline, each submitted as an MLJob:
 All three procedures use the same API for regression and classification.
 `TRAINING_DATA_FAMILY` is the task switch:
 
-| Value | Index / stage | HPO metric | Final checkpoint |
-|---|---|---|---|
-| `synthetic_linear_regression` | `META_REGRESSION_DATASET_INDEX` / `@META_REGRESSION_DATASET_STAGE` | `val_mse` | `best_regression.pt` |
-| `synthetic_regression_nonlinear` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` / `@META_NONLINEAR_REGRESSION_DATASET_STAGE` | `val_mse` | nonlinear checkpoint |
-| `synthetic_linear_classification` | `META_CLASSIFICATION_DATASET_INDEX` / `@META_CLASSIFICATION_DATASET_STAGE` | `val_cross_entropy` | `best_classification.pt` |
+| Value | Index | Stage subdir | HPO metric | Final checkpoint |
+|---|---|---|---|---|
+| `synthetic_linear_regression` | `META_REGRESSION_DATASET_INDEX` | `@META_DATASET_STAGE/linear/regression/numeric` | `val_mse` | `best_regression.pt` |
+| `synthetic_nonlinear_regression` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` | `@META_DATASET_STAGE/nonlinear/regression/numeric` | `val_mse` | `best_regression.pt` |
+| `synthetic_linear_classification` | `META_CLASSIFICATION_DATASET_INDEX` | `@META_DATASET_STAGE/linear/classification/numeric` | `val_cross_entropy` | `best_classification.pt` |
+| `synthetic_linear_regression_mixed_categorical` | `META_MIXED_REGRESSION_DATASET_INDEX` | `@META_DATASET_STAGE/linear/regression/mixed` | `val_mse` | `best_regression.pt` |
+| `synthetic_linear_classification_mixed_categorical` | `META_MIXED_CATEGORICAL_DATASET_INDEX` | `@META_DATASET_STAGE/linear/classification/mixed` | `val_cross_entropy` | `best_classification.pt` |
+| `synthetic_nonlinear_classification` | `META_NONLINEAR_CLASSIFICATION_DATASET_INDEX` | `@META_DATASET_STAGE/nonlinear/classification/numeric` | `val_cross_entropy` | `best_nonlinear_cls.pt` |
+| `synthetic_nonlinear_regression_mixed_categorical` | `META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX` | `@META_DATASET_STAGE/nonlinear/regression/mixed` | `val_mse` | `best_regression.pt` |
+| `synthetic_nonlinear_classification_mixed_categorical` | `META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX` | `@META_DATASET_STAGE/nonlinear/classification/mixed` | `val_cross_entropy` | `best_nonlinear_cls.pt` |
 
-The zero-argument index builders read `META_DATASET_EXPECTED_TOTAL`,
-`META_NONLINEAR_DATASET_EXPECTED_TOTAL`, and
-`META_CLASSIFICATION_DATASET_EXPECTED_TOTAL`, respectively. Each value must
-equal the exact number of parquet datasets across that stage's train/val/test prefixes.
+All families share `META_DATASET_STAGE = "@META_DATASET_STAGE"` (Python constant in `src/model/constants.py`).
+Stage subdirs are produced by `canonical_meta_subdir(family, split)` in `src/model/task_routing.py`.
+
+The zero-argument index builders read the corresponding `META_*_DATASET_EXPECTED_TOTAL` env var.
+Each value must equal the exact number of parquet datasets across that subdir's train/val/test splits.
 
 The combined evaluation procedure has a three-argument overload whose final
 argument is `TRAINING_DATA_FAMILY`. Classification uses
@@ -612,13 +616,14 @@ CALL run_synthetic_nonlinear_aggregation('2.5.0-py311');
   for the original Poisson/Gaussian behavior, `--balanced` for deterministic
   target-family x feature-regime coverage, and `--allow_underdetermined` to include
   `low_n_high_p`.
-- **Nonlinear training stage/index:** `@META_NONLINEAR_REGRESSION_DATASET_STAGE` / `META_NONLINEAR_REGRESSION_DATASET_INDEX`.
-  Routed by `TRAINING_DATA_FAMILY=synthetic_regression_nonlinear` in `snowflake_io.py::_resolve_index_table_and_stage()`.
-  Index built by `CALL build_meta_nonlinear_dataset_index()` (script: `src/build_meta_nonlinear_dataset_index.py`).
+- **Nonlinear training stage/index:** `@META_DATASET_STAGE/nonlinear/regression/numeric/` / `META_NONLINEAR_REGRESSION_DATASET_INDEX`.
+  Routed by `TRAINING_DATA_FAMILY=synthetic_nonlinear_regression` via `task_routing.get_training_data_spec()`.
+  Index built by `CALL build_meta_nonlinear_dataset_index()` (script: `src/dataset_index/build_meta_nonlinear_regression_dataset_index.py`).
+  Local data dir mirrors the stage subdir: `data/nonlinear/regression/numeric/{train,val,test}/`.
   The index preserves the legacy runtime columns and adds nonlinear curriculum metadata
   including `profile`, `feature_regime`, signal/noise feature counts, covariance,
   target/feature noise, and sample-complexity bucket.
-  Leaving `TRAINING_DATA_FAMILY` unset or non-nonlinear always uses `META_REGRESSION_DATASET_INDEX` / `@META_REGRESSION_DATASET_STAGE`.
+  Leaving `TRAINING_DATA_FAMILY` unset or non-nonlinear always uses `META_REGRESSION_DATASET_INDEX` / `@META_DATASET_STAGE/linear/regression/numeric/`.
 - **Nonlinear pretrain checkpoint:** `pretrain_nonlinear_model.pt` (vs `pretrain_gate{32,64,128}.pt` for linear).
   Created by `CALL run_pretrain_pipeline_nonlinear(...)`. Uses `use_latent_ridge_expert=True, latent_ridge_dim=64`.
 - **Nonlinear HPO:** 6-arg `run_hpo_pipeline` overload adds `HPO_PRETRAIN_CHECKPOINT_STAGE_PATH` parameter.
@@ -1004,9 +1009,9 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 ### Data safety
 
-- Never materialise full benchmark datasets locally inside an MLJob; use `@META_REGRESSION_DATASET_STAGE` paths.
+- Never materialise full benchmark datasets locally inside an MLJob; use `@META_DATASET_STAGE` paths.
 - Never use `AUTO_COMPRESS=TRUE` for PUT commands (causes silent read failures).
-- OOD scripts never touch `@META_REGRESSION_DATASET_STAGE`; only `@EVALUATION_DATASET_STAGE`.
+- OOD scripts never touch `@META_DATASET_STAGE`; only `@EVALUATION_DATASET_STAGE`.
 - `data/ood_regression/` is the local directory; `@EVALUATION_DATASET_STAGE/ood_parity/` is the stage prefix.
 - `@EVALUATION_DATASET_STAGE` must never hold production training parquet.
 
@@ -1138,7 +1143,8 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 - Never save `ModelConfig` objects directly in PyTorch checkpoints (breaks `weights_only=True`).
 - Always serialize `cfg` as `dataclasses.asdict(model.cfg)`. Checkpoint format version
-  is always `4` for MODEL3. Use `checkpoint_format_version = 4`.
+  depends on training family: 4 = linear regression, 5 = linear classification, 6 = mixed
+  regression, 7 = mixed classification, 8 = LBACNP. (MODEL3 checkpoints always use version 4.)
 - Consumers must normalise `ckpt["cfg"]` dict back to `ModelConfig` before comparing fields.
 - `weights_only=False` can execute arbitrary code — only for internally trusted checkpoints;
   never for third-party checkpoints.
@@ -1163,7 +1169,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
   MLJobs can import them from `@MODEL_STAGE/scripts/`.
 - Current synthetic-evaluation upload reference after evaluator/helper changes:
   ```sql
-  PUT file://C:/Documents/TabPFN_DemandModel/scripts/evaluate_linear_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+  PUT file://C:/Documents/TabPFN_DemandModel/scripts/evaluation/evaluate_linear_regression.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/deepset_inference.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/baseline_models.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
   PUT file://C:/Documents/TabPFN_DemandModel/src/autogluon_models.py @MODEL_STAGE/scripts/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
@@ -1202,7 +1208,7 @@ SnowSQL GET commands must use `PARALLEL = 4` (never `PARALLEL = 0`).
 
 - `401 Unauthorized` → recreate `KAGGLE_API_SECRET` with correct username/token.
 - `403 Forbidden` → accept competition rules at kaggle.com while logged in as the API token's account.
-- Always run `CALL download_kaggle_to_stage();` then `LIST @META_REGRESSION_DATASET_STAGE/kaggle/;` to verify.
+- Always run `CALL download_kaggle_to_stage();` then `LIST @META_DATASET_STAGE/kaggle/;` to verify.
 
 ## Guardrail: Query Collapse and Early Feature Compression
 

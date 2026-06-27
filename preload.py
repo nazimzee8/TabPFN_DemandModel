@@ -28,9 +28,9 @@ DATABASE    = "TABPFN_DB"
 SCHEMA      = "TABPFN_SCHEMA"
 SRC_DIR     = BASE_DIR / "src"
 SCRIPTS_DIR = BASE_DIR / "scripts"
-DATA_TRAIN  = BASE_DIR / "data" / "train"
-DATA_VAL    = BASE_DIR / "data" / "val"
-DATA_TEST   = BASE_DIR / "data" / "test"
+DATA_TRAIN  = BASE_DIR / "data" / "linear" / "regression" / "numeric" / "train"
+DATA_VAL    = BASE_DIR / "data" / "linear" / "regression" / "numeric" / "val"
+DATA_TEST   = BASE_DIR / "data" / "linear" / "regression" / "numeric" / "test"
 
 # Forward-slash paths for SnowSQL PUT commands (correct on Windows too)
 def _put_path(p: Path) -> str:
@@ -69,7 +69,7 @@ def _section_teardown(warehouse: str) -> str:
         "DROP COMPUTE POOL IF EXISTS DEEPSET_CPU_POOL;\n"
         "DROP COMPUTE POOL IF EXISTS AUTOGLUON_CPU_POOL;\n"
         "-- Stages\n"
-        "DROP STAGE IF EXISTS META_REGRESSION_DATASET_STAGE;\n"
+        "DROP STAGE IF EXISTS META_DATASET_STAGE;\n"
         "DROP STAGE IF EXISTS MODEL_STAGE;\n"
         "DROP STAGE IF EXISTS EVALUATION_RESULTS_STAGE;\n"
         "DROP STAGE IF EXISTS MLJOB_PAYLOAD_STAGE;\n"
@@ -87,7 +87,7 @@ def _section_teardown(warehouse: str) -> str:
 
 def _section2_stages() -> str:
     stages = [
-        "META_REGRESSION_DATASET_STAGE",
+        "META_DATASET_STAGE",
         "MODEL_STAGE",
         "EVALUATION_RESULTS_STAGE",
         "MLJOB_PAYLOAD_STAGE",
@@ -148,15 +148,15 @@ def _section6_upload_data() -> str:
     test_put  = _put_path(DATA_TEST  / "*.parquet")
     return (
         _section_header("Section 6 — Upload synthetic datasets") +
-        "REMOVE @META_REGRESSION_DATASET_STAGE/train/;\n"
-        "REMOVE @META_REGRESSION_DATASET_STAGE/val/;\n"
-        "REMOVE @META_REGRESSION_DATASET_STAGE/test/;\n"
+        "REMOVE @META_DATASET_STAGE/linear/regression/numeric/train/;\n"
+        "REMOVE @META_DATASET_STAGE/linear/regression/numeric/val/;\n"
+        "REMOVE @META_DATASET_STAGE/linear/regression/numeric/test/;\n"
         f"PUT {train_put}\n"
-        f"    @META_REGRESSION_DATASET_STAGE/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_DATASET_STAGE/linear/regression/numeric/train/ AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
         f"PUT {val_put}\n"
-        f"    @META_REGRESSION_DATASET_STAGE/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_DATASET_STAGE/linear/regression/numeric/val/   AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
         f"PUT {test_put}\n"
-        f"    @META_REGRESSION_DATASET_STAGE/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
+        f"    @META_DATASET_STAGE/linear/regression/numeric/test/  AUTO_COMPRESS=FALSE OVERWRITE=TRUE;\n"
     )
 
 
@@ -164,9 +164,9 @@ def _section10_verify() -> str:
     return (
         _section_header("Section 10 — Verification") +
         "LIST @MODEL_STAGE/scripts/ PATTERN='.*[.]py';\n"
-        "LIST @META_REGRESSION_DATASET_STAGE/train/ PATTERN='.*[.]parquet';\n"
-        "LIST @META_REGRESSION_DATASET_STAGE/val/   PATTERN='.*[.]parquet';\n"
-        "LIST @META_REGRESSION_DATASET_STAGE/test/  PATTERN='.*[.]parquet';\n"
+        "LIST @META_DATASET_STAGE/linear/regression/numeric/train/ PATTERN='.*[.]parquet';\n"
+        "LIST @META_DATASET_STAGE/linear/regression/numeric/val/   PATTERN='.*[.]parquet';\n"
+        "LIST @META_DATASET_STAGE/linear/regression/numeric/test/  PATTERN='.*[.]parquet';\n"
         "-- NOTE: The table below will return 0 rows until you run\n"
         "--   CALL build_meta_dataset_index();\n"
         "-- manually in Snowflake after this script completes.\n"

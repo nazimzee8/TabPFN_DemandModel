@@ -14,7 +14,7 @@ Safety invariants
 * Shared table LINEAR_REGRESSION_DATASET_INDEX is NEVER DROPped.
   _truncate_ood_index() uses DELETE WHERE suite_id = OOD_SUITE_ID only.
 * Production suite rows (suite_id != OOD_SUITE_ID) are never touched.
-* OOD data lives on @EVALUATION_DATASET_STAGE; @META_REGRESSION_DATASET_STAGE is untouched.
+* OOD data lives on @EVALUATION_DATASET_STAGE; @META_DATASET_STAGE is untouched.
 * create_synreg_index_table() is always called before _truncate_ood_index()
   to ensure the table exists before any DELETE.
 

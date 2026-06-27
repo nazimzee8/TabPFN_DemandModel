@@ -20,8 +20,14 @@ import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC = os.path.join(ROOT, "src")
+SRC_DATA = os.path.join(SRC, "data_generation")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
+# Also ensure the canonical data_generation subdir is ahead of src/ so that
+# bare `import dgp_helpers` / `import generate_nonlinear_dgp` resolve to the
+# co-located copy after the stale src/*.py duplicates were removed.
+if SRC_DATA not in sys.path:
+    sys.path.insert(0, SRC_DATA)
 
 import generate_nonlinear_dgp as gen
 

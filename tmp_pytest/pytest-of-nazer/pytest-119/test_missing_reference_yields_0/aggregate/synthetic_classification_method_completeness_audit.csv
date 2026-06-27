@@ -1,2 +1,0 @@
-model_name,expected_task_count,successful_task_count,failed_or_skipped_rows,completion_rate
-MODEL-ICL-MC,5,5,0,1.0

@@ -325,10 +325,10 @@ class TestIndexSafety:
         assert ood_prep.OOD_SUITE_ID != production_default
 
     def test_ood_stage_prefix_uses_eval_stage(self):
-        """OOD data must reference @EVALUATION_DATASET_STAGE, never @META_REGRESSION_DATASET_STAGE."""
+        """OOD data must reference @EVALUATION_DATASET_STAGE, never @META_DATASET_STAGE."""
         import prepare_ood_regression as ood_prep
         assert "@EVALUATION_DATASET_STAGE" in ood_prep.EVAL_STAGE_PREFIX
-        assert "@META_REGRESSION_DATASET_STAGE" not in ood_prep.EVAL_STAGE_PREFIX
+        assert "@META_DATASET_STAGE" not in ood_prep.EVAL_STAGE_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +634,7 @@ class TestCachePathCollision:
 
     def test_primary_path_works(self):
         name = evsr._stage_path_to_local_name(
-            "@EVALUATION_DATASET_STAGE/primary/dataset_0042.parquet"
+            "@EVALUATION_DATASET_STAGE/linear/regression/numeric/primary/dataset_0042.parquet"
         )
         assert "dataset_0042" in name
 

@@ -1,5 +1,0 @@
-model_name,log_loss_id
-LogisticRegression,0.7484813157293218
-RandomForestClassifier,0.6694889294308768
-RidgeClassifier,0.7356259847760807
-tabpfn_deepset,0.8096571807918103

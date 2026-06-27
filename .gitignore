@@ -1,0 +1,59 @@
+# =============================================================================
+# TabPFN_DemandModel — .gitignore
+# =============================================================================
+
+# --- Python build / cache artifacts ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# --- Test artifacts ---
+.pytest_cache/
+tmp_pytest/
+.tox/
+.nox/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# --- Runtime / debug dumps ---
+debug/
+logs/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Environment ---
+.env
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Large/regenerable outputs ---
+*.zip
+*.tar.gz
+
+# --- Model checkpoints and binary artifacts ---
+# models/best.pt is intentionally committed; add specific paths here to exclude
+# new checkpoints that shouldn't be tracked.
+# models/experiment_*.pt
+
+# --- Snowflake query results / temp exports ---
+staging/*.csv

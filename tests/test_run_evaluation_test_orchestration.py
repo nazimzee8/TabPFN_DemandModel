@@ -99,7 +99,7 @@ class _FakeSession:
             return _FakeSql(
                 [
                     (
-                        "@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json",
+                        "@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json",
                     )
                 ]
             )

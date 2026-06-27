@@ -2,10 +2,10 @@
 
 ## Snowflake Stage Ownership
 
-- `@META_REGRESSION_DATASET_STAGE`: train/val/test synthetic parquet datasets and staged benchmark datasets.
+- `@META_DATASET_STAGE`: all training parquet datasets, layout `{linear|nonlinear}/{regression|classification}/{numeric|mixed}/{train,val,test}/`; also `kaggle/` and `benchmark_prepared/`.
 - `@MODEL_STAGE/scripts/`: all runnable MLJob code from `src/*.py` and `scripts/*.py`.
 - `@MODEL_STAGE/hpo/`: `best_config.json` on HPO success and `hpo_failure.json` on Python-started HPO failure.
-- `@MODEL_STAGE/checkpoints/`: model checkpoints, especially `best.pt`.
+- `@MODEL_STAGE/checkpoints/`: model checkpoints — `best_regression.pt` (linear/nonlinear reg), `best_classification.pt` (linear/mixed cls), `best_nonlinear_cls.pt` (nonlinear cls).
 - `@EVALUATION_RESULTS_STAGE`: all evaluation reports, per-method benchmark parts, and comparison CSVs.
 - `@EPOCH_STAGE`: output-only epoch calibration artifacts (`hpo_timing.json`, `train_timing.json`, and error JSONs).
 - `@MLJOB_PAYLOAD_STAGE`: MLJob payload stage managed by `submit_from_stage`.
@@ -15,7 +15,7 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 
 ## Snowflake-Only Training Guardrails
 
-- Never download or materialize `@META_REGRESSION_DATASET_STAGE` to the local workstation.
+- Never download or materialize `@META_DATASET_STAGE` to the local workstation.
 - MLJobs may materialize staged parquet only inside Snowflake container-local `/tmp/data`.
 - Use `auto_compress=False` for JSON, checkpoint, CSV, and NPZ stage uploads.
 - Pass Snowflake secrets into MLJob containers through `spec_overrides`; do not fetch secret values inside scripts.
@@ -121,7 +121,7 @@ Canonical benchmark outputs: `@EVALUATION_RESULTS_STAGE/model_comparison.csv` an
 
 ```sql
 CALL download_kaggle_to_stage();
-LIST @META_REGRESSION_DATASET_STAGE/kaggle/;
+LIST @META_DATASET_STAGE/kaggle/;
 ```
 
 ## HPO / Ray Tune Guardrails
@@ -375,8 +375,8 @@ diagnostics are broken.
   exists.
 - `prepare_benchmark_datasets.py` is the only production code path that may fetch
   OpenML datasets or normalize raw staged Kaggle data. It writes
-  `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
-  `.npz` files under `@META_REGRESSION_DATASET_STAGE/benchmark_prepared/{openml,kaggle}/`.
+  `@META_DATASET_STAGE/benchmark_prepared/benchmark_manifest.json` and prepared
+  `.npz` files under `@META_DATASET_STAGE/benchmark_prepared/{openml,kaggle}/`.
 - Benchmark shard jobs consume prepared staged datasets only. They read
   `benchmark_manifest.json`, partition manifest entries by
   `BENCHMARK_NUM_SHARDS` and `BENCHMARK_SHARD_INDEX`, and only then download the

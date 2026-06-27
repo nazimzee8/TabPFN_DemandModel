@@ -1564,7 +1564,7 @@ class TestCombinedSplitPhase:
             "feature_noise_level": 0,
             "target_noise_scale": 1.0,
             "training_size_anchor": False,
-            "stage_path": "@EVALUATION_DATASET_STAGE/primary/dataset_0001.parquet",
+            "stage_path": "@EVALUATION_DATASET_STAGE/linear/regression/numeric/primary/dataset_0001.parquet",
             "X": "x" * 10000,
             "unexpected_payload": "y" * 10000,
         }

@@ -1,5 +1,0 @@
-model_name,expected_calibration_error
-LogisticRegression,0.10124020830908441
-RandomForestClassifier,0.06129736878049564
-RidgeClassifier,0.07290598486118106
-tabpfn_deepset,0.06866688386851691

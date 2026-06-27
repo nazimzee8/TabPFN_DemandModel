@@ -1,2 +1,0 @@
-model_name,log_loss_mean_rank,log_loss_median_rank,log_loss_strict_win_rate,log_loss_tie_aware_win_rate,log_loss_top_3_rate,log_loss_task_count,log_loss_valid_metric_task_count,log_loss_completion_rate,accuracy_mean_rank,accuracy_median_rank,accuracy_strict_win_rate,accuracy_tie_aware_win_rate,accuracy_top_3_rate,accuracy_task_count,accuracy_valid_metric_task_count,accuracy_completion_rate
-MODEL-ICL-MC,1.0,1.0,1.0,1.0,1.0,5,5,1.0,1.0,1.0,1.0,1.0,1.0,5,5,1.0

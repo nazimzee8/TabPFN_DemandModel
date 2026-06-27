@@ -28,15 +28,15 @@ reflects the current state of the codebase.
 
 | Concern | Authoritative file(s) |
 |---|---|
-| Family routing | `src/task_routing.py` — `_FAMILY_SPECS`, `get_training_data_spec`, `allowed_training_data_families` |
-| Family + constant names | `src/constants.py` — `MIXED_CAT_REGRESSION_TRAINING_FAMILY`, `MIXED_CAT_CLASSIFICATION_TRAINING_FAMILY` |
+| Family routing | `src/model/task_routing.py` — `_FAMILY_SPECS`, `get_training_data_spec`, `allowed_training_data_families` |
+| Family + constant names | `src/model/constants.py` — `MIXED_CAT_REGRESSION_TRAINING_FAMILY`, `MIXED_CAT_CLASSIFICATION_TRAINING_FAMILY` |
 | Training data generation (linear, categorical) | `src/generate_dgp.py` + `src/dgp_helpers.py` |
 | Training data generation (nonlinear) | `src/generate_nonlinear_dgp.py` |
 | Eval-suite generation (linear) | `scripts/generate_synthetic_regression.py`, `scripts/generate_synthetic_classification.py` |
 | Eval-suite generation (nonlinear) | `scripts/generate_nonlinear_regression.py`, `scripts/generate_nonlinear_classification.py` |
-| Training entry | `src/train.py` |
+| Training entry | `src/model/train.py` |
 | Pretrain orchestrator | `scripts/run_pretrain_job.py` |
-| HPO orchestrator | `scripts/run_hpo_job.py` + `src/hpo.py` |
+| HPO orchestrator | `scripts/run_hpo_job.py` + `src/model/hpo.py` |
 | Final-training orchestrator | `scripts/run_model_training_job.py` |
 | Eval prep | `scripts/prepare_synthetic_regression.py`, `scripts/prepare_synthetic_classification.py` |
 | Eval run (linear) | `scripts/evaluate_linear_regression.py`, `scripts/evaluate_linear_classification.py` |
@@ -61,7 +61,7 @@ It dispatches on `--task_family`:
 | `linear_regression_mixed_categorical` | regression | Yes |
 | `linear_classification_mixed_categorical` | classification | Yes |
 
-The constant names for the two mixed families live in `src/constants.py`:
+The constant names for the two mixed families live in `src/model/constants.py`:
 `MIXED_CAT_REGRESSION_TRAINING_FAMILY = "synthetic_linear_regression_mixed_categorical"` and
 `MIXED_CAT_CLASSIFICATION_TRAINING_FAMILY = "synthetic_linear_classification_mixed_categorical"`.
 
@@ -124,42 +124,52 @@ Do not create separate `generate_synthetic_regression_categorical.py` /
 `TRAINING_DATA_FAMILY` is the single environment variable that routes every stage of the training
 pipeline. It is validated against `allowed_training_data_families()` in `src/task_routing.py`.
 
-Full family table (from `_FAMILY_SPECS` in `src/task_routing.py`):
+Full family table (from `_FAMILY_SPECS` in `src/model/task_routing.py`):
 
-Stage paths use `numeric/` or `mixed/` subdirectories — see the Stage subdir convention below.
+All 8 canonical families share `stage = @META_DATASET_STAGE`. The stage subdir
+(`{linear|nonlinear}/{regression|classification}/{numeric|mixed}`) fully encodes the family.
 
-| Family | `task_objective` | Index table | Stage (subdir) | HPO metric |
+| Family | `task_objective` | Index table | Stage subdir | HPO metric |
 |---|---|---|---|---|
-| `synthetic_linear_regression` (default) | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `@META_REGRESSION_DATASET_STAGE` (`numeric/`) | `val_mse` |
-| `synthetic_regression_primary` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `@META_REGRESSION_DATASET_STAGE` (`numeric/`) | `val_mse` |
-| `synthetic_regression_ood` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `@META_REGRESSION_DATASET_STAGE` (`numeric/`) | `val_mse` |
-| `market_mental_model` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `@META_REGRESSION_DATASET_STAGE` (`numeric/`) | `val_mse` |
-| `synthetic_regression_nonlinear` | `inductive_regression` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` | `@META_NONLINEAR_REGRESSION_DATASET_STAGE` (`numeric/`) | `val_mse` |
-| `synthetic_nonlinear_classification` | `inductive_classification` | `META_NONLINEAR_CLASSIFICATION_DATASET_INDEX` | `@META_NONLINEAR_CLASSIFICATION_DATASET_STAGE` (`numeric/`) | `val_cross_entropy` |
-| `synthetic_nonlinear_regression_mixed_categorical` | `inductive_regression` | `META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX` | `@META_NONLINEAR_REGRESSION_DATASET_STAGE` (`mixed/`) | `val_mse` |
-| `synthetic_nonlinear_classification_mixed_categorical` | `inductive_classification` | `META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX` | `@META_NONLINEAR_CLASSIFICATION_DATASET_STAGE` (`mixed/`) | `val_cross_entropy` |
-| `synthetic_linear_classification` | `inductive_classification` | `META_CLASSIFICATION_DATASET_INDEX` | `@META_CLASSIFICATION_DATASET_STAGE` (`numeric/`) | `val_cross_entropy` |
-| `synthetic_linear_regression_mixed_categorical` | `inductive_regression` | `META_MIXED_REGRESSION_DATASET_INDEX` | `@META_REGRESSION_DATASET_STAGE` (`mixed/`) | `val_mse` |
-| `synthetic_linear_classification_mixed_categorical` | `inductive_classification` | `META_MIXED_CATEGORICAL_DATASET_INDEX` | `@META_CLASSIFICATION_DATASET_STAGE` (`mixed/`) | `val_cross_entropy` |
+| `synthetic_linear_regression` (default) | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `linear/regression/numeric` | `val_mse` |
+| `synthetic_regression_primary` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `linear/regression/numeric` | `val_mse` |
+| `synthetic_regression_ood` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `linear/regression/numeric` | `val_mse` |
+| `market_mental_model` | `inductive_regression` | `META_REGRESSION_DATASET_INDEX` | `linear/regression/numeric` | `val_mse` |
+| `synthetic_nonlinear_regression` | `inductive_regression` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` | `nonlinear/regression/numeric` | `val_mse` |
+| `synthetic_nonlinear_classification` | `inductive_classification` | `META_NONLINEAR_CLASSIFICATION_DATASET_INDEX` | `nonlinear/classification/numeric` | `val_cross_entropy` |
+| `synthetic_nonlinear_regression_mixed_categorical` | `inductive_regression` | `META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX` | `nonlinear/regression/mixed` | `val_mse` |
+| `synthetic_nonlinear_classification_mixed_categorical` | `inductive_classification` | `META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX` | `nonlinear/classification/mixed` | `val_cross_entropy` |
+| `synthetic_linear_classification` | `inductive_classification` | `META_CLASSIFICATION_DATASET_INDEX` | `linear/classification/numeric` | `val_cross_entropy` |
+| `synthetic_linear_regression_mixed_categorical` | `inductive_regression` | `META_MIXED_REGRESSION_DATASET_INDEX` | `linear/regression/mixed` | `val_mse` |
+| `synthetic_linear_classification_mixed_categorical` | `inductive_classification` | `META_MIXED_CATEGORICAL_DATASET_INDEX` | `linear/classification/mixed` | `val_cross_entropy` |
 
-#### Stage subdir convention
+Back-compat alias: `synthetic_regression_nonlinear` maps to the nonlinear-regression spec
+(`task_routing.py:122`). The canonical family name is `synthetic_nonlinear_regression`.
 
-Each training stage contains two subdirectories: `numeric/` for numeric-only families and
-`mixed/` for mixed-categorical families. The split layout under each is `{train,val,test}/`.
+#### Stage path convention
+
+All training families share `@META_DATASET_STAGE`. The full path is
+`@META_DATASET_STAGE/{subdir}/{split}/{task_id}.parquet` where `{subdir}` = `data_subdir`
+(the three-segment canonical derived from linearity/objective/feature-type). Helper functions
+`canonical_meta_subdir(family, split)` and `canonical_eval_subdir(family)` in
+`src/model/task_routing.py` are the single source of truth.
 
 Example for linear regression:
 ```
-@META_REGRESSION_DATASET_STAGE/numeric/train/{task_id}.parquet
-@META_REGRESSION_DATASET_STAGE/numeric/val/{task_id}.parquet
-@META_REGRESSION_DATASET_STAGE/numeric/test/{task_id}.parquet
-@META_REGRESSION_DATASET_STAGE/mixed/train/{task_id}.parquet
-@META_REGRESSION_DATASET_STAGE/mixed/val/{task_id}.parquet
-@META_REGRESSION_DATASET_STAGE/mixed/test/{task_id}.parquet
+@META_DATASET_STAGE/linear/regression/numeric/train/{task_id}.parquet
+@META_DATASET_STAGE/linear/regression/numeric/val/{task_id}.parquet
+@META_DATASET_STAGE/linear/regression/numeric/test/{task_id}.parquet
 ```
 
-`src/generate_dgp.py` writes to this layout via `_split_directories(out_dir, subdir="numeric")`
-(numeric families) or `_split_directories(out_dir, subdir="mixed")` (mixed families). The builder
-scripts (`src/build_meta_*_dataset_index.py`) LIST and GET from the matching subdir paths.
+Example for nonlinear mixed-categorical classification:
+```
+@META_DATASET_STAGE/nonlinear/classification/mixed/train/{task_id}.parquet
+@META_DATASET_STAGE/nonlinear/classification/mixed/val/{task_id}.parquet
+@META_DATASET_STAGE/nonlinear/classification/mixed/test/{task_id}.parquet
+```
+
+The index builder scripts (`src/dataset_index/build_meta_*_dataset_index.py`) LIST and GET
+from the matching subdir paths in `@META_DATASET_STAGE`.
 
 `is_nonlinear` for a `TrainingDataSpec` is true when its `family` is in `_NONLINEAR_FAMILIES`
 (a frozenset in `task_routing.py` containing all 4 nonlinear family strings).
@@ -247,11 +257,12 @@ introduce `USE_CATEGORICAL`, `WITH_CATEGORICAL`, `*_CAT`, or any other variant. 
 
 ### What the flag does in prep scripts
 
-When `SYNREG_IS_MIXED_CATEGORICAL=true`, `prepare_synthetic_regression.py` dispatches to
-`_prepare_mixed_regression()` (line ~1780), which reads from
-`@EVALUATION_DATASET_STAGE/mixed_regression_prepared/{suite_id}/` and writes a separate index
-table that includes extra columns (`p_num`, `p_cat`, `categorical_cardinalities`, etc.).
-The classification analogue is `_prepare_mixed_classification()`.
+When `SYNREG_IS_MIXED_CATEGORICAL=true`, `prepare_linear_regression.py` dispatches to
+`_prepare_mixed_regression()`, which reads from
+`@EVALUATION_DATASET_STAGE/linear/regression/mixed/{suite_id}/` and writes to
+`LINEAR_MIXED_REGRESSION_DATASET_INDEX` (includes extra columns: `p_num`, `p_cat`,
+`categorical_cardinalities`, etc.).
+The classification analogue is `_prepare_mixed_classification()` in `prepare_linear_classification.py`.
 
 ### SQL procedures and orchestrators
 
@@ -259,17 +270,20 @@ The `SYNREG_IS_MIXED_CATEGORICAL` / `SYNCLS_IS_MIXED_CATEGORICAL` flags are read
 evaluator scripts and are now injected into the MLJob `env_vars` by the orchestrators. The wiring
 points are:
 
-**Regression** (`scripts/run_synthetic_regression_evaluation.py`):
+**Regression** (`scripts/evaluation/run_linear_regression_evaluation.py`):
 - `_synreg_shard_env()` — includes `"SYNREG_IS_MIXED_CATEGORICAL": os.getenv("SYNREG_IS_MIXED_CATEGORICAL", "false")` in the base env dict so it propagates to all phases including `deepset`.
-- `run_synthetic_regression_prep()` env_vars — same flag so the prep job builds the correct (mixed or standard) index table.
+- `run_linear_regression_prep()` env_vars — same flag so the prep job builds the correct (mixed or standard) index table.
 
-**Classification** (`scripts/run_synthetic_classification_evaluation.py`):
+**Classification** (`scripts/evaluation/run_linear_classification_evaluation.py`):
 - `_classification_shard_env()` — includes `"SYNCLS_IS_MIXED_CATEGORICAL": os.getenv("SYNCLS_IS_MIXED_CATEGORICAL", "false")`.
-- `run_synthetic_classification_linear_prep()` env_vars — same flag.
+- `run_linear_classification_prep()` env_vars — same flag.
 
-Each SQL procedure DDL (`sql/04_synthetic_regression_evaluation_pipeline.sql` and its
-classification counterpart) exposes the flag as a runtime parameter and passes it through to
-the Python handler so it reaches `_synreg_shard_env` / `_classification_shard_env`.
+Each SQL procedure DDL (`sql/linear_regression_{numeric,mixed}_pipeline.sql` and the
+classification counterparts) exposes `IS_MIXED_CATEGORICAL BOOLEAN` as the **first** proc parameter.
+Numeric procs pass `FALSE`; mixed procs pass `TRUE`. Both bind the same shared Python handler
+(`run_linear_regression_evaluation.run_linear_regression_prep`, etc.). The handler calls
+`_set_regression_linear_env(suite_id, is_mixed_categorical=<arg>)` which sets
+`SYNREG_IS_MIXED_CATEGORICAL`, `SYNREG_INDEX_TABLE`, and the results-stage path internally.
 
 ### Nonlinear mixed-categorical eval wiring
 
@@ -278,18 +292,20 @@ by the linear orchestrators (because `_synreg_shard_env` / `_classification_shar
 their caller's env, not a fresh `os.getenv` from the orchestrator process itself). The orchestrator
 injects both env vars explicitly on every SPCS job:
 
-**Regression** (`scripts/run_nonlinear_regression_evaluation.py`):
+**Regression** (`scripts/evaluation/run_nonlinear_regression_evaluation.py`):
 - `_NONLINEAR_MIXED_INDEX_ENV = {"SYNREG_INDEX_TABLE": "NONLINEAR_REGRESSION_MIXED_DATASET_INDEX", "SYNREG_IS_MIXED_CATEGORICAL": "true"}`
 - Core phase handlers accept `is_mixed_categorical: bool = False`; when `True`, suite params are
   fetched from `_nonlinear_regression_suite_params(True)`.
-- SQL procs: `run_synthetic_nonlinear_mixed_regression_{prep,deepset_evaluation,baseline_evaluation,autogluon_spcs_evaluation,aggregation}`
-  in `sql/synthetic_nonlinear_pipeline.sql`.
+- SQL procs: `run_nonlinear_regression_{prep,deepset_evaluation,baseline_evaluation,autogluon_evaluation,aggregation}`
+  with `IS_MIXED_CATEGORICAL BOOLEAN` as trailing param; mixed pipeline passes `TRUE`.
+  Files: `sql/nonlinear_regression_{numeric,mixed}_pipeline.sql`.
 
-**Classification** (`scripts/run_nonlinear_classification_evaluation.py`):
+**Classification** (`scripts/evaluation/run_nonlinear_classification_evaluation.py`):
 - `_NONLINEAR_MIXED_CLS_INDEX_ENV = {"SYNCLS_INDEX_TABLE": "NONLINEAR_MIXED_CLASSIFICATION_DATASET_INDEX", "SYNCLS_IS_MIXED_CATEGORICAL": "true"}`
 - Core phase handlers accept `is_mixed_categorical: bool = False`.
-- SQL procs: `run_nonlinear_mixed_classification_{prep,deepset_evaluation,baseline_evaluation,autogluon_evaluation,aggregation}`
-  in `sql/synthetic_nonlinear_classification_pipeline.sql`.
+- SQL procs: `run_nonlinear_classification_{prep,deepset_evaluation,baseline_evaluation,autogluon_evaluation,aggregation}`
+  with `IS_MIXED_CATEGORICAL BOOLEAN` as trailing param.
+  Files: `sql/nonlinear_classification_{numeric,mixed}_pipeline.sql`.
 
 Prep scripts read `SYNREG_INDEX_TABLE` / `SYNCLS_INDEX_TABLE` (with fallback to standard table) so
 the same `prepare_nonlinear_regression.py` / `prepare_nonlinear_classification.py` script writes to

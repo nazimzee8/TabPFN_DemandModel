@@ -935,20 +935,21 @@ per-dataset entries:
 - **`main()`** — evaluation-format parquet (420 datasets, 6 families × 7 regimes). Used to populate
   `@EVALUATION_DATASET_STAGE`. Unchanged.
 - **`main_nonlinear_training()`** — training-format parquet with 80/10/10 splits written to
-  `train/`, `val/`, `test/` subdirectories. Used to populate the `@META_NONLINEAR_*` training stages.
-  Invoked with `--task_family <family>` selecting one of the four nonlinear families.
+  `train/`, `val/`, `test/` subdirectories. Used to populate `@META_DATASET_STAGE` under the
+  canonical subdir for each family. Invoked with `--task_family <family>` selecting one of
+  the four nonlinear families.
 
-### Task families and their training stages
+### Task families and their training stage subdirs
 
-| `--task_family` | Training stage | Training index table |
+| `--task_family` | Stage + subdir | Training index table |
 |---|---|---|
-| `synthetic_nonlinear_regression` | `@META_NONLINEAR_REGRESSION_DATASET_STAGE` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` |
-| `synthetic_nonlinear_classification` | `@META_NONLINEAR_CLASSIFICATION_DATASET_STAGE` | `META_NONLINEAR_CLASSIFICATION_DATASET_INDEX` |
-| `synthetic_nonlinear_regression_mixed_categorical` | `@META_NONLINEAR_REGRESSION_DATASET_STAGE/mixed` | `META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX` |
-| `synthetic_nonlinear_classification_mixed_categorical` | `@META_NONLINEAR_CLASSIFICATION_DATASET_STAGE/mixed` | `META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX` |
+| `synthetic_nonlinear_regression` | `@META_DATASET_STAGE/nonlinear/regression/numeric/{split}/` | `META_NONLINEAR_REGRESSION_DATASET_INDEX` |
+| `synthetic_nonlinear_classification` | `@META_DATASET_STAGE/nonlinear/classification/numeric/{split}/` | `META_NONLINEAR_CLASSIFICATION_DATASET_INDEX` |
+| `synthetic_nonlinear_regression_mixed_categorical` | `@META_DATASET_STAGE/nonlinear/regression/mixed/{split}/` | `META_NONLINEAR_MIXED_REGRESSION_DATASET_INDEX` |
+| `synthetic_nonlinear_classification_mixed_categorical` | `@META_DATASET_STAGE/nonlinear/classification/mixed/{split}/` | `META_NONLINEAR_MIXED_CATEGORICAL_DATASET_INDEX` |
 
-All four stages are defined in `sql/synthetic_nonlinear_pipeline.sql`. All four training index
-tables are `TRANSIENT TABLE`s in the same file with `DATA_RETENTION_TIME_IN_DAYS = 0`.
+All four training index tables are `TRANSIENT TABLE`s defined in `sql/synthetic_nonlinear_pipeline.sql`
+with `DATA_RETENTION_TIME_IN_DAYS = 0`.
 
 ### Index builders
 
@@ -959,9 +960,10 @@ that store `categorical_cardinalities` as a VARIANT column).
 
 | Index builder entrypoint | Family |
 |---|---|
-| `src/build_meta_nonlinear_classification_dataset_index.py` | `synthetic_nonlinear_classification` |
-| `src/build_meta_nonlinear_mixed_regression_dataset_index.py` | `synthetic_nonlinear_regression_mixed_categorical` |
-| `src/build_meta_nonlinear_mixed_classification_dataset_index.py` | `synthetic_nonlinear_classification_mixed_categorical` |
+| `src/dataset_index/build_meta_nonlinear_regression_dataset_index.py` | `synthetic_nonlinear_regression` |
+| `src/dataset_index/build_meta_nonlinear_classification_dataset_index.py` | `synthetic_nonlinear_classification` |
+| `src/dataset_index/build_meta_nonlinear_mixed_regression_dataset_index.py` | `synthetic_nonlinear_regression_mixed_categorical` |
+| `src/dataset_index/build_meta_nonlinear_mixed_classification_dataset_index.py` | `synthetic_nonlinear_classification_mixed_categorical` |
 
 SQL build procedures (0-arg and `(EXPECTED_TOTAL INTEGER)` overloads for each) are defined in
 `sql/synthetic_nonlinear_pipeline.sql`. The run-time handlers are in `scripts/run_training_job.py`.

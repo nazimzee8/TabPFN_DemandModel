@@ -1,5 +1,0 @@
-model_name,expected_task_count,successful_task_count,failed_or_skipped_rows,completion_rate
-LogisticRegression,7,7,0,1.0
-RandomForestClassifier,7,7,0,1.0
-RidgeClassifier,7,7,0,1.0
-tabpfn_deepset,7,7,0,1.0

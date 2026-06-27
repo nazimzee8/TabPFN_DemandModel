@@ -181,7 +181,7 @@ def test_force_rebuild_reindexes(monkeypatch, tmp_path):
 
     session = _FakeSession(
         index_row_count=50,  # existing rows
-        stage_files=[f"@EVALUATION_DATASET_STAGE/synthetic_classification_prepared/test_suite/{parquet_name}"],
+        stage_files=[f"@EVALUATION_DATASET_STAGE/linear/classification/numeric/test_suite/{parquet_name}"],
     )
 
     monkeypatch.setattr(prep, "SYNCLS_FORCE_REBUILD", True)
@@ -191,7 +191,7 @@ def test_force_rebuild_reindexes(monkeypatch, tmp_path):
     # Patch _list_stage_parquets to return our fake file
     monkeypatch.setattr(
         prep, "_list_stage_parquets",
-        lambda session, prefix: [f"@EVALUATION_DATASET_STAGE/synthetic_classification_prepared/test_suite/{parquet_name}"]
+        lambda session, prefix: [f"@EVALUATION_DATASET_STAGE/linear/classification/numeric/test_suite/{parquet_name}"]
     )
     # Patch _download_parquet to use our pre-written file
     monkeypatch.setattr(

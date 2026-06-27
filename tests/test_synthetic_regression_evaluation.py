@@ -496,7 +496,7 @@ class TestLoadSyntheticRegressionIndexKeyNormalization:
             "SUITE_FAMILY": "primary",
             "DATASET_ID": 0,
             "DATASET_SEED": 42,
-            "STAGE_PATH": "@EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet",
+            "STAGE_PATH": "@EVALUATION_DATASET_STAGE/linear/regression/numeric/primary/dataset_0000.parquet",
             "PRIOR_REGIME": "A",
             "SPLIT_SEEDS": "[0, 1, 2]",   # JSON string — common Snowflake serialisation
             "N_TOTAL": 500,
@@ -562,7 +562,7 @@ class TestLoadSyntheticRegressionIndexKeyNormalization:
         assert result[0]["split_seeds"] == [0]
 
     def test_stage_path_value_preserved(self):
-        expected = "@EVALUATION_DATASET_STAGE/primary/dataset_0000.parquet"
+        expected = "@EVALUATION_DATASET_STAGE/linear/regression/numeric/primary/dataset_0000.parquet"
         mock_row = self._make_mock_row({"STAGE_PATH": expected})
         mock_sql = MagicMock()
         mock_sql.collect.return_value = [mock_row]

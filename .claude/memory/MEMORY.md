@@ -18,10 +18,10 @@
 
 | Stage | Contents |
 |---|---|
-| `@META_REGRESSION_DATASET_STAGE` | numeric/ + mixed/ subdirs ({train,val,test}/) + kaggle/*.npz |
+| `@META_DATASET_STAGE/{linear\|nonlinear}/{regression\|classification}/{numeric\|mixed}/{train,val,test}/` | Training parquet files (8 families); kaggle/ + benchmark_prepared/ at root |
 | `@MODEL_STAGE/scripts/` | all src/*.py + scripts/*.py |
 | `@MODEL_STAGE/hpo/` | best_config.json, hpo_failure.json |
-| `@MODEL_STAGE/checkpoints/` | best.pt |
+| `@MODEL_STAGE/checkpoints/` | best_regression.pt / best_classification.pt / best_nonlinear_cls.pt |
 | `@EVALUATION_RESULTS_STAGE` | synthetic/, benchmark_parts/, model_comparison.csv |
 | `@EPOCH_STAGE` | src/*.py + hpo_timing.json + train_timing.json |
 | `@MLJOB_PAYLOAD_STAGE` | MLJob payload (managed by submit_from_stage) |
